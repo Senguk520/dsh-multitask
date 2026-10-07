@@ -747,8 +747,6 @@ dsh-multitask/
 ├── cordis.patch.yml                    # 向 profile roster 插入 plugin 行（供 bundle 安装方式用）
 ├── LICENSE                             # MIT
 ├── README.md
-├── test/
-│   └── guard-mode-isolation-regression.mjs   # 减震器「模式隔离」回归校验（含反向验证）
 ├── tools/
 │   └── enable-subagent-model-selection.mjs   # 第二步：打开子代理可选模型
 ├── lib/
@@ -768,16 +766,19 @@ dsh-multitask/
 
 ### 自检
 
-**本包不发测试套件**（见上面的 `files` 清单）。回归校验放在仓库的 `test/` 目录里，不在发布物中。
-当前与减震器直接相关的那一套是**模式隔离回归**：
+**本仓不含测试文件**：按「是测试就不进远端」的规矩，`test/` 整个目录都不跟踪
+（`.gitignore` 里有对应规则），发布物里也没有（见上面的 `files` 清单）。
+回归校验只在本地跑，用例不随仓库分发。
+
+减震器本地那一套是**模式隔离回归**，把用例脚本放在本机 `test/` 下即可：
 
 ```powershell
 node test/guard-mode-isolation-regression.mjs
 ```
 
 它覆盖 13 条用例（归属判据、模式切换的两个方向、子代理不受影响、读不出归属时的取向…），
-并自带**反向验证**：把归属判据改成 `if (false)` 后必须有 6 条变红，否则说明用例是恒真的。
-实测：`13 条断言组，13 通过，0 失败`，判别力已确认。
+并自带**反向验证**：把归属判据改成 `if (false)` 后必须有 6 条变红（T2/T3/T5/T6/T11/T13），
+否则说明用例是恒真的。实测：`13 条断言组，13 通过，0 失败`，判别力已确认。
 脚本从自身位置推导被测模块，所以仓库放在任何路径下（含非 ASCII 路径）都能跑。
 
 > **为什么这些校验刻意不用 `node --test`**：那个运行器会 spawn 子进程并捕获管道输出，
