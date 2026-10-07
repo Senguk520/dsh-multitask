@@ -1,0 +1,13 @@
+# dsh-multitask 的 bundle patch 层。
+#
+# 作为一个 profile bundle 层应用（由本包 package.json 的 `dsh.bundle.patch`
+# 声明），作用只有一个：把 host 插件行插进 profile 的 roster。
+#
+# host 半（`lib/index.js`，exports "."）在激活时把本包自带的 Multitask agent
+# preset 声明给 agent-preset 注册表。声明成功 = 新会话的模式选择器里出现
+# 「Multitask 减震器模式」。
+#
+# 没有浏览器半：本模式不需要自建 UI，它复用 DSH 已有的 preset 选择器。
+- insert:
+    - id: multitask
+      name: 'dsh-multitask'

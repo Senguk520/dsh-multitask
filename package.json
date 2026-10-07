@@ -1,0 +1,67 @@
+{
+  "name": "dsh-multitask",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Multitask 减震器模式（Agent preset）：主对话只做需求理解、任务下发与结果汇总，读文件/跑命令/构建/搜索等污染性工作全部下放子代理。含协调者窄工具面、四类 worker、只读元数据工具 file_info 与子代理并发节流，零 DSH 源码改动。",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./presets/multitask/composition.mjs": "./presets/multitask/composition.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "presets",
+    "tools",
+    "cordis.patch.yml",
+    "install-multitask.ps1",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "agent-preset",
+    "multitask",
+    "subagent",
+    "context-engineering",
+    "shock-absorber"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-api-remotes"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.1",
+    "react": "^18.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  }
+}
