@@ -44,26 +44,26 @@ dsh plugin add dsh-multitask
 > CLI 会直接拒绝：`error: profile "desktop" is managed exclusively by the Electron application`。
 > 这种情况请用应用内的**插件**页面安装，或走下面的源码安装路径。
 
-### 给开发者：从源码 checkout 安装
+### 给开发者：从源码 checkout 运行
 
-改本包源码时用这条，因为工作区里的改动不会经过 npm：
+clone 本仓库、直接跑工作区里的源码时用这条（改动不经过 npm）。在 profile 的
+`cordis.patch.yml` 末尾**追加**一段，用**绝对** `file://` URL 指向你本地的入口：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install-multitask.ps1
+```yaml
+- insert:
+    - id: multitask
+      name: 'file:///你的绝对路径/dsh-multitask/lib/index.js'
 ```
 
-脚本会：从**自身所在目录**推导出 `lib/index.js` 的绝对 `file://` URL（所以它在你自己的
-checkout 路径下就能用，中文路径也没问题）→ 备份 profile 的 `cordis.patch.yml` →
-只**追加**一行（不改动既有内容）→ 用逐字节前缀校验确认原内容完好 → 原子替换。
-重复执行是幂等的。
+两点注意：
 
-卸载：
+- **路径里的空格与 `%` 必须百分号编码**（Windows 上尤其常见）。稳妥做法是让程序替你编码，
+  而不是手写 —— 例如在 PowerShell 里：
+  `(New-Object System.Uri('H:\my repo\dsh-multitask\lib\index.js')).AbsoluteUri`
+  它会产出 `file:///H:/my%20repo/dsh-multitask/lib/index.js` 这种可直接粘进 YAML 的形式。
+- **`?v=N` 是可选的缓存键**（见「改源码后如何生效」）。它只在 `file://` 这种方式下有意义。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install-multitask.ps1 -Uninstall
-```
-
-指定别的 profile：加 `-ProfileDir "C:\path\to\profile"`。
+卸载就是把这整段删掉，然后重启应用。
 
 **装这一行不需要重启。** DSH 的 HMR 服务在 `cordis.patch.yml` 上装了 watcher，改动会被热重载。
 装好后可以在插件列表里看到本行 `fiberPhase: "active"`。
@@ -707,12 +707,18 @@ profile patch 里那份 `subagentModels` 挂在 `dsh-multitask` 那一行的 `co
 
 ## 卸载
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install-multitask.ps1 -Uninstall
+**用包管理器装的**，就交给它：
+
+```
+dsh plugin remove dsh-multitask
 ```
 
-它会删掉 profile patch 里的托管块（连周围空行一起清掉），并在动手前备份。
-preset 会立刻从所有**新**会话的模式选择器里消失（已开跑的会话不受影响）。
+或在 DSH 的**插件**页面里卸载。
+
+**从源码 checkout 装的**（profile patch 里那段 `- insert: - id: multitask`），
+把那一整段手动删掉即可。
+
+两种方式下，preset 都会从所有**新**会话的模式选择器里消失（已开跑的会话不受影响）。
 
 不需要重启：DSH 会热重载这个 patch 文件，行被移除后插件被卸载，并在卸载时注销
 自己那份 preset 声明（见 `lib/index.js` 的 `releaseOwn()` 与 `ctx.effect(() => () => …)`）。
@@ -739,7 +745,6 @@ node .\tools\enable-subagent-model-selection.mjs --revert
 dsh-multitask/
 ├── package.json                        # dsh.bundle.patch → 装载时插入 host 行；dsh.client → 浏览器半
 ├── cordis.patch.yml                    # 向 profile roster 插入 plugin 行（供 bundle 安装方式用）
-├── install-multitask.ps1               # 源码 checkout 的安装/卸载脚本（路径从自身推导）
 ├── LICENSE                             # MIT
 ├── README.md
 ├── test/

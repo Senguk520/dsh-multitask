@@ -15,7 +15,6 @@
     "presets",
     "tools",
     "cordis.patch.yml",
-    "install-multitask.ps1",
     "README.md",
     "LICENSE"
   ],
