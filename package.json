@@ -29,6 +29,14 @@
     "shock-absorber"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Senguk520/dsh-multitask.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Senguk520/dsh-multitask/issues"
+  },
+  "homepage": "https://github.com/Senguk520/dsh-multitask#readme",
   "publishConfig": {
     "access": "public"
   },
