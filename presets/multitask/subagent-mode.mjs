@@ -96,7 +96,7 @@ export const inject = []
  *
  * ⚠️ 必须与 `composition.mjs` 导出的 `PTC_MODE_MARKER` **逐字一致**。
  * 两个文件各自留一份常量而不是互相 import，是为了保持本模块「零 import」的约定；
- * 代价是改一处必须改两处，`verify.mjs` 里有用例比对这两个字符串来挡住不同步。
+ * 代价是改一处必须改两处 —— `test/repo-consistency.mjs` 里有用例比对这两个字符串来挡住不同步。
  */
 const PTC_MODE_MARKER = '[multitask-mode:ptc]'
 

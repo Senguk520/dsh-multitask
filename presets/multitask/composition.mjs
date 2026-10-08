@@ -177,6 +177,19 @@ Two limits bound the shape of a fan-out. Plan the scale of a delegation accordin
 
   Both are refusals BEFORE anything starts: nothing has been spawned, and you get a plain error rather than a subagent id. Either message means the same thing operationally — **wait for existing subagents to finish, or merge several tasks into one brief** — and neither is a silent failure, so never read one as "the delegation is broken" and never retry the same fan-out unchanged.
 
+## When a worker's shell is refused (Windows)
+
+A Windows worker may be unable to run shell commands AT ALL — not because of your brief, its command, or how many workers are running. The refusal is verbatim:
+
+\`Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(<path>)\`
+
+Read it correctly before reacting:
+
+- It is **not** the concurrency limit and **not** a bad command. It reproduces with a SINGLE active subagent, with any command (even \`Get-Location\`), and from any working directory — pointing the command's workdir at the system temp directory still names the same session path, not that directory.
+- The cause sits at host startup, not in your brief: DSH writes a security descriptor onto the session's writable root directories once, as the process starts, before any command runs. So every command in every worker fails identically, and re-briefing cannot change it.
+- **Read-only work is unaffected.** \`read\`, \`grep\`, \`glob\` and \`file_info\` keep working, so content and file-metadata questions still have a route — a read-only worker is a genuine fallback here, not a consolation prize.
+- When a worker reports this, re-plan around the shell instead of around the worker: use read-only tools plus \`write\` / \`edit\` for the parts that are pure file changes, fold the rest into a finding, and report the refusal to the user as a known deployment limitation. Never brief a worker to retry a refused shell command in a loop, and never ask one to repair permissions — that needs one already-approved unrestricted run outside the sandbox, which is the user's decision to make, not yours.
+
 ## Every task brief must carry
 
 - **Goal** — one sentence, and a result someone can judge as done or not done.
@@ -255,6 +268,7 @@ So: do not announce that you are unable to execute, do not ask the coordinator t
 - Ground every claim in what you actually observed. Never report a result you did not obtain.
 - Do not report your own behaviour from memory — report it from the record. Your TOOL SURFACE: workers that listed their tools from memory were measured to omit tools they had just used successfully, so never assert "I have" or "I do not have" a given tool and never state a tool count; describe a capability only from what you actually called successfully in this session, and if you are unsure, say plainly that you cannot reliably enumerate it instead of giving a precise-looking number. Your WORKSPACE FOOTPRINT: when you report what you did, list every path you created or changed — intermediate artifacts, temp files, and probe files included; one measured worker reported a single leftover file while leaving an entire directory of calibration probes unreported, so even a willing worker under-reports. Leave as few intermediates as you can, list the ones you do leave, and say explicitly that you may still have omitted some so the coordinator can verify.
 - Follow the brief's safety rails absolutely — they outrank every other instruction in it, including its own goals. If a rail forbids something the task appears to need, stop and say so.
+- If the shell itself is refused with \`SetNamedSecurityInfoW failed (Win32 5): grantWrite(<path>)\`, that is a DEPLOYMENT-level refusal, not your command and not the brief: it reproduces with any command (even \`Get-Location\`) and from any working directory, because DSH writes a security descriptor onto the session's writable roots at startup. Do not retry it in a loop and do not attempt to repair permissions. Stop, report the refusal verbatim, and note what remains reachable without a shell — \`read\` / \`grep\` / \`glob\` / \`file_info\` for inspection, plus \`write\` / \`edit\` for file changes.
 - Respect the brief's stop conditions. If you hit a blocking situation (missing tool, permission denial, a rail conflict, an unexpected state), STOP and report it verbatim instead of improvising a workaround or guessing.
 - Do not delegate further; you cannot, and you should not try.
 - Prefer verifying over assuming. If you can check something cheaply, check it.
@@ -336,6 +350,7 @@ So: do not announce that you are unable to execute, do not ask the coordinator t
 - Ground every claim in what you actually observed. Never report a result you did not obtain.
 - Do not report your own behaviour from memory — report it from the record. Your TOOL SURFACE: workers that listed their tools from memory were measured to omit tools they had just used successfully, so never assert "I have" or "I do not have" a given tool and never state a tool count; describe a capability only from what you actually called successfully in this session, and if you are unsure, say plainly that you cannot reliably enumerate it instead of giving a precise-looking number. Your WORKSPACE FOOTPRINT: when you report what you did, list every path you created or changed — intermediate artifacts, temp files, and probe files included; one measured worker reported a single leftover file while leaving an entire directory of calibration probes unreported, so even a willing worker under-reports. Leave as few intermediates as you can, list the ones you do leave, and say explicitly that you may still have omitted some so the coordinator can verify.
 - Follow the brief's safety rails absolutely — they outrank every other instruction in it, including its own goals. If a rail forbids something the task appears to need, stop and say so.
+- If the shell itself is refused with \`SetNamedSecurityInfoW failed (Win32 5): grantWrite(<path>)\`, that is a DEPLOYMENT-level refusal, not your command and not the brief: it reproduces with any command (even \`Get-Location\`) and from any working directory, because DSH writes a security descriptor onto the session's writable roots at startup. Do not retry it in a loop and do not attempt to repair permissions. Stop, report the refusal verbatim, and note what remains reachable without a shell — \`read\` / \`grep\` / \`glob\` / \`file_info\` for inspection, plus \`write\` / \`edit\` for file changes.
 - Respect the brief's stop conditions. If you hit a blocking situation (missing tool, permission denial, a rail conflict, an unexpected state), STOP and report it verbatim instead of improvising a workaround or guessing.
 - Do not delegate further; you cannot, and you should not try.
 - Prefer verifying over assuming. If you can check something cheaply, check it.
@@ -432,6 +447,7 @@ Your tool surface has been DELIBERATELY collapsed: \`run_code\` is the only tool
 - Calling any tool other than \`run_code\` directly fails with \`UNKNOWN_TOOL\`. When a call is denied that way, the fix is to move the call inside your program — do not retry it natively, and do not conclude the deployment is broken.
 - Ground every claim in what you actually observed. Never report a result you did not obtain.
 - Do not report your own behaviour from memory — report it from the record. Your TOOL SURFACE: workers that listed their tools from memory were measured to omit tools they had just used successfully, so never assert "I have" or "I do not have" a given tool and never state a tool count; describe a capability only from what you actually called successfully in this session, and if you are unsure, say plainly that you cannot reliably enumerate it instead of giving a precise-looking number. Your WORKSPACE FOOTPRINT: when you report what you did, list every path you created or changed — intermediate artifacts, temp files, and probe files included; one measured worker reported a single leftover file while leaving an entire directory of calibration probes unreported, so even a willing worker under-reports. Leave as few intermediates as you can, list the ones you do leave, and say explicitly that you may still have omitted some so the coordinator can verify.
+- If \`run_code\` itself fails, see the fallback section below before concluding anything. If the SDK's shell capability is refused with \`SetNamedSecurityInfoW failed (Win32 5): grantWrite(<path>)\`, that is a deployment-level refusal, not a bug in your program: it reproduces for any command and from any working directory, so do not loop on it and do not attempt to repair permissions — report it verbatim and continue with what the SDK's read/write routes still reach.
 - Follow the brief's safety rails absolutely — they outrank every other instruction in it, including its own goals. If a rail forbids something the task appears to need, stop and say so.
 - Respect the brief's stop conditions. If you hit a blocking situation (missing SDK capability, a denied operation, an unexpected state), STOP and report it verbatim instead of improvising a workaround or guessing.
 - Do not delegate further; you cannot, and you should not try.
@@ -674,6 +690,20 @@ function noOptions() {
 }
 
 /**
+ * ★ 本模式「同时活跃子代理」的硬天花板：**8**。
+ *
+ * 与 `concurrency-guard.mjs` 的同名常量**刻意各留一份**（本仓库预设模块互不 import 的
+ * 约定），`test/` 下的本地回归会比对两份值与 README 的说法，让「只改了一处」变成
+ * 可见的失败 —— 与 `PTC_MODE_MARKER` 那对常量的处理逐字同构。
+ *
+ * 它是 **DSH 宿主的容量**（宿主 `subagent.maxActiveSubagents` 的默认值），不是本插件的
+ * 预算：本插件只能把部署的上限压得更低，不可能把它放宽。所以这里把本模式配置的上限
+ * 也钉在 8 以内 —— 配置 16 只会得到 8，绝不会让守卫的日志与拒绝文案去承诺一个
+ * 宿主根本不会给的名额（见 README「子代理并发上限」）。
+ */
+export const MAX_ACTIVE_CEILING = 8
+
+/**
  * 把宿主传进来的「子代理并发上限」收敛成 `config.maxActive` 唯一允许的两种形状。
  *
  * ── 这里的收敛**不是**冗余的，它与宿主半那一份分工不同 ────────────────────────
@@ -683,6 +713,12 @@ function noOptions() {
  * **不同的调用方**驱动：静态那个调用点（`definition.plugins` 里的无参
  * `buildPlugins()`，见文件上方）根本不经过宿主半，测试与别处的探针也直接调用本函数。
  * 所以守卫行的 `config` 必须在**这里**就保证合法 —— 不能指望上游一定清洗过。
+ *
+ * ── ★ 合法值也要夹天花板：`min(值, MAX_ACTIVE_CEILING)`────────────────────────
+ *
+ * 超过 8 的配置一律收敛成 8（理由见 `MAX_ACTIVE_CEILING` 与 README）。守卫模块自己
+ * 也会再夹一次（那道防线要挡「绕过本函数的调用方」），这里夹是为了让**行 config
+ * 本身**就不出现一个做不到的数字。
  *
  * ── 返回值是 `undefined` 时**不是**「传一个 undefined 进去」────────────────────
  *
@@ -703,16 +739,20 @@ function noOptions() {
  * **别处的调用方**（手写 YAML、探针、别的 composer）直接调用本函数时才咬人 ——
  * 那正是要防的情形。
  *
+ * ⚠️ 超过 8 的合法值同样**不是**原样采用：结果是 `min(值, MAX_ACTIVE_CEILING)`。
+ * 这与「非法值夹到 1」是**两个不同方向**的收敛（一个防手抖，一个防过剩），
+ * 别把它们读成同一条。
+ *
  * @param maxActiveSubagents - 宿主/调用方给的上限，可为空。
- * @returns 安全整数 `>= 1`，或 `undefined`（不限制）。
+ * @returns 安全整数 `>= 1` 且 `<= MAX_ACTIVE_CEILING`（8），或 `undefined`（不限制）。
  */
 function normalizeMaxActive(maxActiveSubagents) {
   if (maxActiveSubagents === undefined) return undefined
   // 非安全整数 / NaN / Infinity / null / 字符串 / 布尔 / 对象 ⇒ 一律夹到 1。
   // 方向与宿主半 `normalizeMaxActive` **刻意相同**：绝不把它当成「不限制」。
-  return Number.isSafeInteger(maxActiveSubagents) && maxActiveSubagents >= 1
-    ? maxActiveSubagents
-    : 1
+  if (!Number.isSafeInteger(maxActiveSubagents) || maxActiveSubagents < 1) return 1
+  // ★ 天花板：DSH 宿主的容量就是 8，配置更高只会得到一个拿不到的名额。
+  return Math.min(maxActiveSubagents, MAX_ACTIVE_CEILING)
 }
 
 /**
@@ -725,21 +765,27 @@ function normalizeMaxActive(maxActiveSubagents) {
  *
  * 不传参时**与加入本参数之前逐字等价**：四类 worker 全都不带 `agentOptions`，
  * 于是 `resolveChildAgentOptions` 走继承分支，子代理用协调者同款模型。
- * 这一点是硬约束 —— `verify.mjs` 里大量断言都是无参调用本函数。
+ * 这一点是硬约束 —— 本地回归（`test/repo-consistency.mjs` 与既有的 13 条隔离用例）里，
+ * 大量断言都是无参调用本函数。
  *
  * ── 关于可选的 `maxActiveSubagents`（本模式的子代理并发上限）─────────────────
  *
- * 同样的硬约束：不传 / 传 `undefined` / 传 `null` 时，守卫行**不带 `config.maxActive`
+ * 同样的硬约束：不传 / 传 `undefined` 时，守卫行**不带 `config.maxActive`
  * 这个键**，于是 `concurrency-guard.mjs` 立即返回、一个监听器都不注册 ——
  * 与「本功能加入之前」行为上无法区分（零开销、零干预）。
  *
- * ⚠️ 但**非法值不是「不传」**：`0` / `-1` / `NaN` / `'4'` 等一律收敛成 `1`，
+ * ⚠️ 但**非法值不是「不传」**：`0` / `-1` / `NaN` / `'4'` / **`null`** 等一律收敛成 `1`，
  * 也就是「限制到最多 1 个并发」。把非法值当成不限制会比用户意图更宽松，见
  * `normalizeMaxActive` 的注释。
  *
+ * ⚠️ **大于 8 的合法值也会被夹**：收敛结果是 `min(值, MAX_ACTIVE_CEILING)`，
+ * 也就是最多 8。理由见 `MAX_ACTIVE_CEILING`：8 是宿主容量，写更高只是一个
+ * 拿不到的名额。
+ *
  * @param options - 可选的注入项。
  * @param options.modelMap - `类型键 -> { provider, model, reasoningEffort? }`。
- * @param options.maxActiveSubagents - 本模式的子代理并发上限（安全整数 `>= 1`）。
+ * @param options.maxActiveSubagents - 本模式的子代理并发上限（安全整数
+ *   `>= 1`，超过 8 按 8 算）。
  * @returns 供 preset 注册表挂载的插件行数组。
  */
 export function buildPlugins(options) {
@@ -1026,11 +1072,15 @@ export function buildPlugins(options) {
         //
         //   · 键**缺席** ⇒ 守卫模块立即返回、**一个监听器都不注册** ——
         //     与「本功能加入之前」行为上无法区分（这是用户没设过时限的情形）；
-        //   · 键在场且是安全整数 `>= 1` ⇒ 节流生效。
+        //   · 键在场且是安全整数 `>= 1` ⇒ 节流生效，且生效值 = `min(值, 8)`。
         //
         // ⚠️ 非法值（`0` / `-1` / `NaN` / 字符串…）**不会**走到「缺席」那一支：
         // `normalizeMaxActive` 已把它们收敛成 `1`（＝限制到最多 1 个并发）。
         // 把非法值当成不限制会比用户意图更宽松，见该函数的注释。
+        //
+        // ⚠️ 上界是 **8**，不是「用户填几就是几」：8 是 DSH 宿主的容量
+        // （宿主 `subagent.maxActiveSubagents` 的默认值），填 16 也只会得到 8。
+        // 见 `MAX_ACTIVE_CEILING` 与 README「子代理并发上限」。
         //
         // ⚠️ 这里用条件展开而不是写 `maxActive: undefined`：不产生这个键，
         // 与 `workerAgentOptions` 对 `agentOptions` 的取向逐字同构（理由见那里）。
@@ -1117,6 +1167,48 @@ export function buildPlugins(options) {
     {
       id: 'subagent-mode',
       name: local('./subagent-mode.mjs'),
+      config: { enabled: true },
+    },
+
+    // ── ★ 审批闸门：让子代理的**危险操作**能弹到用户面前 ──────────────────────
+    //
+    // 只做三件事，全部围绕一个事实：`dsh-subagent` 把子会话的审批策略**钉死为
+    // `never`**（注释逐字：`policy is pinned to 'never' regardless of the parent's
+    // own policy.`），于是用户**永远收不到**子代理的审批请求：
+    //
+    //   1. **放开策略（B）**：在 `agent/created` 里往子会话追加一条
+    //      `approval/policy = 'ask'`。成立的前提是 `overrideOf()` **取最后一条**
+    //      （它从日志尾部倒序扫描、命中即返回 ⇒ 后写覆盖先写），而 `agent/created`
+    //      必然晚于委派写入 —— 上游 `initializeAgent` 是**先 await setup 再 publish**。
+    //      同时改写子代理那句 `operations that require approval are rejected
+    //      automatically` 的委派上下文，否则模型会自我审查、连请求都不发起。
+    //   2. **第一级分流（C1-b）**：挂 `tools/pre-execute`，用**确定性规则表**判定
+    //      危险命令（工作区内的递归删除、改远端历史、发布外发、提权等），
+    //      安全的直接放行、不打扰用户。
+    //   3. **第二级转呈（C2）**：挂 `approval/request`（**prepend**），把子代理的
+    //      请求改写成一次**面向父会话**的请求 —— 于是它落在主对话里，用上游现成的
+    //      审批面板显示。子代理在侧边栏被隐藏、父行也不聚合子会话的待审状态，
+    //      所以「子会话自己弹窗」在后端与前端都不成立；转呈是唯一可行的路径。
+    //
+    // ── 为什么单开一行 ────────────────────────────────────────────────────────
+    //
+    // 它与别的守卫**管的事情不同**：`subagent-mode` 管呈现、`minimal-guard` 管工具面、
+    // `coordinator-guard` 管协调者的可见工具集，而本行管的是**审批策略与请求路由**。
+    // 混进任何一行都会让那一行的失败后果变得含混（例如 minimal-guard 的失败是安全承诺
+    // 失效、必须响亮告警，而本行的失败最坏是「回到今天的行为」，应当静默降级）。
+    //
+    // ── 门控：只在交互式会话启用 ───────────────────────────────────────────────
+    //
+    // 硬前置：**父会话**的有效策略必须是 `ask`。headless / 无人值守部署靠 `never`
+    // 保证「不会被挂住等一个永远不来的答复」，本行绝不把 `ask` 装到那种环境上。
+    // 父会话策略不是 `ask` 时，子代理保持 `never`，与加入本行之前**逐字等价**。
+    //
+    // 用与减震器 / subagent-mode / minimal-guard 相同的 `local()` 手法引用，
+    // 理由见该函数上方注释：相对名会被解析到 profile 根，且必须把本文件的 `?v=N`
+    // query 传播下去，否则改了本文件也只会从 ESM 旧缓存取回旧模块。
+    {
+      id: 'approval-gate',
+      name: local('./approval-gate.mjs'),
       config: { enabled: true },
     },
 

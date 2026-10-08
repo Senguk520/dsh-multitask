@@ -12,3 +12,6 @@ install-multitask.ps1
 # 用 `git rm --cached` 撤掉跟踪（本地文件保留，`node test/xxx.mjs` 照常能跑）。
 # 需要分享某个用例时走 issue / 临时分支，不要放回仓库。
 test/
+
+# 编辑器目录：Cursor 的本地配置与缓存，只属于这台机器，不随仓库分发。
+.cursor/

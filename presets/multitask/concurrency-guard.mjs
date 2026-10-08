@@ -12,6 +12,24 @@
  * 一点」这件事一无所知。本模块给 Multitask **单开一个更低的上限**，两者同时生效、
  * 取较小值。
  *
+ * ── ★ 上限的天花板就是 8：本模块自己收敛，不把「配置值」当成「能做到的值」────────
+ *
+ * 本模式下**同时活跃**的子代理数，真实上限是 **8** —— 宿主 `maxActiveSubagents` 的
+ * 默认值。实测（真实会话，一条消息里并行下发 10 个）：前 8 个同时 `[running]`，
+ * 第 9、10 个**在启动之前**被宿主拒绝，错误原文逐字：
+ *
+ *     Error: subagent limit reached (active child limit: 8); wait for an existing child to finish or complete this work with the current agents
+ *
+ * 所以 `config.maxActive` 不会被原样采用：`normalizeLimit()` 把它钉在
+ * `min(设定值, MAX_ACTIVE_CEILING)`（常量见下）。配置 16 **不等于**能跑 16 ——
+ * 那只会让本模块的日志与拒绝文案承诺一个宿主根本不会给的名额（前 8 个之后，
+ * 用户看到的是上面那条英文错误，而我们的守卫永远不会触发）。
+ *
+ * 反过来说，「派 10 个全部成功」这个观察**不是**反例：那是**阻塞 / 串行**执行
+ * （一次只在跑 1 个，等它结束再派下一个），活跃数从未超过 1。只有**同一条消息里
+ * 并行下发**才会真的去抢那 8 个名额；串行跑多少个都不会撞上限，也证明不了上限
+ * 被放宽。
+ *
  * ── ⚠️ 这是「软上限」，不是安全边界 ─────────────────────────────────────────
  *
  * 必须把这句话写在最前面，因为很容易把它读成比实际更强的东西。它的准确性质是：
@@ -157,9 +175,15 @@
  *   3. 「一次性和外部提供方运行**不受此限制**」—— 宿主不把一次性子代理算进名额，
  *      而我们按 `agent/created` 数，**会把一次性子代理也算进去**。也就是说
  *      **我们的软上限比宿主更严**（方向偏紧，是安全的那一侧，但要写明）。
- *   4. 我们的拒绝是一条**工具层错误结果**，与宿主的 `ACTIVATION_LIMIT_REACHED`
- *      硬拒绝**不是同一个错误码**，也不会带上宿主的 `info` 字段。看到错误文本的人
- *      不应当去搜那个错误码。
+ *   4. 我们的拒绝是一条**工具层错误结果**（一条中文文本），与宿主的
+ *      `ACTIVATION_LIMIT_REACHED` 硬拒绝**不是同一个错误码**，也不会带上宿主的
+ *      `info` 字段。宿主那条拒绝的**错误原文**（实测，容量 8）是：
+ *
+ *          Error: subagent limit reached (active child limit: 8); wait for an existing child to finish or complete this work with the current agents
+ *
+ *      看到那条英文错误的人不应当去搜 `ACTIVATION_LIMIT_REACHED`（那是内部错误码，
+ *      不在给用户看的文本里），也不应当把它当成「本守卫坏了」—— 它就是我们这个上限
+ *      之上的那道宿主容量墙，见文件头「天花板就是 8」。
  *
  * 另有一条结构性边界：本模块只数**协调者的直接子代理**（`parentSession` 指向协调者）。
  * 本 composition 把 `maxDepth` 钉死在 1，孙代不可能出现；若哪个部署放宽了深度，
@@ -195,6 +219,23 @@ export const name = 'multitask-concurrency-guard'
 
 /** 工具注册表必须先存在，`agent.ctx.tools.guard()` 才有意义。 */
 export const inject = ['tools']
+
+/**
+ * ★ 本模式「同时活跃子代理」的硬天花板：**8**。
+ *
+ * 这不是本插件的预算，而是 **DSH 宿主的容量**：
+ *
+ *   · 宿主 `subagent.maxActiveSubagents` 的默认值就是 8（其 Config schema 里
+ *     `z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(8).volatile()`）；
+ *   · 名额不足时的拒绝在 `ActivationPool.reserve()` 里抛出，错误原文见文件头。
+ *
+ * 宿主把上限抬到 8 以上是它自己的事；本模块的定位始终是「**更低**的那个上限」，
+ * 所以这里把本模式的活动上限钉在 8 以内 —— 配置 16 也绝不请求 16。
+ *
+ * ⚠️ 本文件与 `composition.mjs` **各自留一份**常量（本仓库预设模块的约定：互不 import），
+ * `test/` 下的本地回归会比对这两份值与 README 的说法，让「只改了一处」变成可见的失败。
+ */
+export const MAX_ACTIVE_CEILING = 8
 
 /**
  * 算作「一次委派」的工具名。
@@ -281,12 +322,21 @@ function isDelegatedChild(agent) {
  * 变成「最多 1 个并发」—— 难看，但安全、而且立刻可见。静默取消限制则什么都不会发生，
  * 直到超发把协调者的上下文撑爆。
  *
+ * ── ★ 合法值再夹一层：`min(值, MAX_ACTIVE_CEILING)`───────────────────────────
+ *
+ * 合法整数也**不是**原样采用：超过天花板（8）的一律按 8 算。理由是那之上的名额
+ * 宿主根本不给（见文件头与 `MAX_ACTIVE_CEILING`）—— 照抄 16 只会让我们自己的日志
+ * 与计数承诺一个不存在的容量，实际却由宿主在 8 那里用另一条英文错误拒绝。
+ * 这一行 `Math.min` 是「本模式最多同时活跃几个」的**唯一**权威收敛点。
+ *
  * @param raw - `config.maxActive` 的原始值。
- * @returns 安全整数 `>= 1`，或 `undefined`（不限制）。
+ * @returns 安全整数 `>= 1` 且 `<= MAX_ACTIVE_CEILING`，或 `undefined`（不限制）。
  */
 function normalizeLimit(raw) {
   if (raw === undefined) return undefined
-  return Number.isSafeInteger(raw) && raw >= 1 ? raw : 1
+  if (!Number.isSafeInteger(raw) || raw < 1) return 1
+  // ★ 天花板：DSH 宿主的默认容量就是 8，配置更高只会请求一个拿不到的名额。
+  return Math.min(raw, MAX_ACTIVE_CEILING)
 }
 
 /**
@@ -399,8 +449,12 @@ export function apply(ctx, config) {
       if (exec.agent !== undefined && exec.agent !== null && exec.agent !== agent) return undefined
 
       if (used() >= limit) {
+        // ⚠️ 文案里必须说清「上限是 8 那一层是谁的」：本守卫只会在**本模式**的上限
+        // 处触发；再往上还有宿主的容量墙（它的错误原文见文件头）。两句都点出来，
+        // 模型才不会把「被本守卫拒绝」误读成「委派功能坏了」，也不会反复重试。
         const message =
-          `本模式（Multitask）的子代理并发上限是 ${limit}，当前已有 ${used()} 个子代理正在运行或正在启动，` +
+          `本模式（Multitask）的子代理并发上限是 ${limit}（本模式的上限不超过 8，` +
+          `8 也是 DSH 宿主自身的容量上限），当前已有 ${used()} 个子代理正在运行或正在启动，` +
           `所以这一次委派没有下发。请先用 list_agents / job_output 收下现有子代理的结果，` +
           `等它们结束后再派新的任务；也可以把若干任务并进同一份任务书里交给一个子代理完成。`
         return message
