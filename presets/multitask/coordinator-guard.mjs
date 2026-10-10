@@ -127,7 +127,7 @@ const PRESET_UNKNOWN = Symbol('dsh-multitask/unknown-preset')
  * 反推（见下方 `sync()`），所以 `write` `edit` `pwsh` `bash`、
  * `web_search` `web_fetch` `read_image`、`ssh_*`、`task_board_*`、
  * `plugin_manager`、`cordis_inspect_*` 被摘除的**唯一依据**就是「它们不在这里」。
- * 它们的具体种类在 README 里作为例子列出，仅用于阅读。
+ * 它们的具体种类在 docs/DESIGN.md 里作为例子列出，仅用于阅读。
  *
  * 不要在这里补第二张「摘除名单」：补进来也没人会读它，只会让后来者误以为
  * 摘除依据是那张表。（此处原本有一个 23 项的 `NOISY_BY_DEFAULT` 常量，

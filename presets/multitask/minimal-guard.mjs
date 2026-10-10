@@ -569,7 +569,7 @@ export function apply(ctx, config) {
    * （`restrict()` 的 restriction 层 + 目录级过滤），两者各有自己的 disposer。
    * 用单值会让后写的那次**静默覆盖**前一次 —— 表现是 `agent/disposed` 之后仍有一条
    * 限制留在 scope 上，而 scope key 被复用时新 agent 会继承一条本该消失的过滤
-   * （README「释放」一节记的正是这个坑）。
+   * （docs/DESIGN.md「释放」一节记的正是这个坑）。
    */
   const live = new WeakMap()
 

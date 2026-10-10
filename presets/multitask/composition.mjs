@@ -37,7 +37,7 @@
  *   - `subagent_ptc`     —— 程序化批量处理。**不配 `toolFilter`**：它的「模式」不是
  *                           靠筛工具实现的，而是由 `subagent-mode.mjs` 对该子代理 scope
  *                           调 `presentAs('ptc')`，把整张工具面**塌缩**成
- *                           `run_code` + 一份生成的 SDK（详见该文件与 README）。
+ *                           `run_code` + 一份生成的 SDK（详见该文件与 docs/DESIGN.md）。
  *   - `subagent_minimal` —— 只读调研 / 快速问答。**两层收窄**：静态
  *                           `toolFilter.deny`（本 composition 自己注册的
  *                           write/edit/pwsh）＋ `minimal-guard.mjs` 的**自适应**收窄
@@ -55,7 +55,7 @@
  * `deployment:persona-prefix` 段落为主来源，那条**两条派单路径都有**。
  * （实测缘由：`snapshotSubagentDescriptor()` 对 one-shot 只留
  * `version`/`mode`/`provider`/`label`，persona 被丢掉；旧实现只读它，
- * 于是**前台派单时两个守卫整体失效** —— 见 README「模式标记是怎么被读到的」。）
+ * 于是**前台派单时两个守卫整体失效** —— 见 docs/DESIGN.md「模式标记是怎么被读到的」。）
  *
  * 现在保持 continuable 的是**另一个**理由：审批闸门的兜底通知
  * （`subagents.sendMessage`）**只对 continuable 子级有效**。前台派单时父会话
@@ -75,7 +75,7 @@
  *      `keep` / `extraDeny` / `guardEnabled` 透传给减震器那一行）。
  *      它在模块加载时读取，所以改动需要重启应用生效。
  *   2. 直接给下面的行加 `disabled: true`（或删掉它）。改 composition.mjs 需配合
- *      递增 profile patch 里的 `?v=N` 才会重新加载，见 README「改源码后如何生效」。
+ *      递增 profile patch 里的 `?v=N` 才会重新加载，见 docs/DESIGN.md「改源码后如何生效」。
  *   3. 只想关掉 PTC **呈现**、但保留 `subagent_ptc` 这个工具本身：
  *      把 `subagent-mode` 那行的 `config.enabled` 改成 `false`。
  *      （关掉后 `subagent_ptc` 仍可用，只是退化成与 `subagent` 同样的原生工具面。）
@@ -84,7 +84,7 @@
  *      ⚠️ 关掉它**没有安全收益**，只是让那个 worker 重新拿到 `ssh_*` / `task_board_*`
  *      一类别的插件装进来的工具 —— 留着它是默认且推荐的状态。
  *
- * 设计要点、已知边界与未确证项见 README 的「多模式子代理」一节。
+ * 设计要点、已知边界与未确证项见 docs/DESIGN.md 的「多模式子代理」一节。
  */
 
 /**

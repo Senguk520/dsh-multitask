@@ -1,0 +1,159 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 发布 dsh-multitask 到 npm
+#
+# 认证走 npm 的「可信发布」（Trusted Publishing / OIDC）：全程没有长期令牌，
+# 不需要在仓库里配 `NPM_TOKEN` 这个 secret，也就不存在令牌泄漏与轮换。
+# 工作流用 GitHub 的 OIDC 身份向 npm 换一个**只对本次运行有效**的短时令牌，
+# npm 还会自动为这个包生成 provenance（构建来源证明，无需 --provenance 开关）。
+#
+# ── 一次性配置（在 npmjs.com 网页上做，做完就不用再管）───────────────────────
+#   1. 打开 https://www.npmjs.com/package/dsh-multitask → Settings
+#   2. 找到 "Trusted Publisher" 一栏 → 点 GitHub Actions
+#   3. 逐字填入（**每项都区分大小写，填错只会在发布那一刻报错**）：
+#        Organization or user : Senguk520
+#        Repository           : dsh-multitask
+#        Workflow filename    : publish.yml    ← 只写文件名，不带 .github/workflows/
+#        Environment name     : （留空 —— 本工作流没有用 environment）
+#   4. "Allowed actions" 里务必勾上 **Allow npm publish**（直接发布）。
+#      只勾 stage publish 的话，本工作流会被拒。
+#   5. 保存后 **2 天内必须成功发布一次**，否则这条配置会自动失效。
+#      失效了不用慌：删掉重建、再成功发一次即可。
+#
+# ── 之后怎么发版 ───────────────────────────────────────────────────────────
+#   1. 改 package.json 的 version（例如 1.0.1）并提交到 main
+#   2. git tag v1.0.1 && git push dsh-multitask v1.0.1
+#
+#   ⚠️ 标签必须打在**含有本文件的提交**上 —— 标签触发的运行只认该标签指向的那次
+#      提交里的工作流。所以先推 main（带上本文件），再打标签。
+#      标签与 package.json 版本不一致时工作流会中止：宁可失败，也不发错版本。
+#
+# ── 哪些文件该进包、哪些不该 ────────────────────────────────────────────────
+#   口径：**入包内容 = package.json 的 `files` ∩ 远程仓库里已跟踪的文件**。
+#
+#   被 `.gitignore` 忽略的东西只活在本机上，一个都不许进包 ——
+#   `install-multitask.ps1`、`test/`、`.cursor/`、`docs/remember.md` 都属于这一类。
+#   `.gitignore` 自己虽在仓库里，但不在 `files` 里，同样不入包。
+#
+#   两条要害（都实测过）：
+#     · `files` 里写**具体文件**（`"docs/DESIGN.md"`），不要写整个目录（`"docs"`）。
+#       实测：写目录会让 npm 把该目录下被忽略的文件一起卷进来 —— 本仓库就出现过
+#       `docs/remember.md` 因此入包。写成具体文件则不会。
+#     · 只从 CI 发布。CI 是干净 checkout，本机那些被忽略的文件根本不存在，
+#       所以「在本机 npm publish」与「走 CI 打出来的包」不是同一个东西。
+#
+#   下面的「核对入包内容」会把这两条变成**硬失败**，而不是一句口头约定。
+#
+# ── 备用方案（想用长期令牌而不是 OIDC）─────────────────────────────────────
+#   在仓库 Secrets 里建 `NPM_TOKEN`（Granular Access Token，勾 Read and write），
+#   并把最后那步改成：
+#       - run: npm publish
+#         env:
+#           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+#   OIDC 配好之后就不必再用它 —— 两条路同时存在时 npm CLI 优先用 OIDC。
+# ─────────────────────────────────────────────────────────────────────────────
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*' # 与仓库既有的 v1.0.0 标签约定一致
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 从 main 分支发布 package.json 里当前的版本（勾上才会真的发）
+        type: boolean
+        default: false
+
+# 发布不能并发：两个标签几乎同时推送时，串行跑，且已经在跑的那次不许被打断。
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC 换令牌必需；缺这一行发布必然 ENEEDAUTH
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # 这两个 action 钉在具体提交上，而不是浮动的 v7：本工作流带 id-token: write，
+      # 能换取一个可发布本包的令牌，所以不能让「上游标签被改指向别处」成为可达路径。
+      # 升级请改提交号并同步更新后面的版本注释（Dependabot 会自己开 PR，见
+      # .github/dependabot.yml）。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24' # OIDC 要求 npm >= 11.5.1，Node 24 自带的版本满足
+          registry-url: 'https://registry.npmjs.org'
+          # 发布环境一律不缓存：缓存投毒能让攻击者拿到本次运行的 OIDC 令牌。
+          # 本包是零依赖，缓存本来也没有收益。
+          package-manager-cache: false
+
+      - name: 核对触发来源与版本号
+        id: meta
+        env:
+          # 经 env 传入，避免把表达式直接插进脚本文本（注入面）。
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          # 用 github.event.inputs 而不是 inputs：前者在标签触发时求值为空字符串，
+          # 后者在非手动触发的工作流里可能直接报 "Unrecognized named-value"。
+          CONFIRM: ${{ github.event.inputs.confirm }}
+        run: |
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "$REF" = "refs/heads/main" ]; then
+            # 手动触发：默认只做打包预览，勾了 confirm 才真的发。
+            if [ "$CONFIRM" != "true" ]; then
+              echo "::error::手动触发需要勾上 confirm 才会发布（当前是 $NAME@$VERSION）。已中止。"
+              exit 1
+            fi
+            echo "::warning::手动触发：直接从 main 分支发布 $NAME@$VERSION"
+          elif [ "${REF#refs/tags/v}" != "$REF" ]; then
+            # 标签触发：标签必须与 package.json 的版本逐字一致。
+            TAG="${REF_NAME#v}"
+            if [ "$TAG" != "$VERSION" ]; then
+              echo "::error::标签 ${REF_NAME} 与 package.json 的 $VERSION 不一致，已中止（避免发错版本）"
+              exit 1
+            fi
+            echo "::notice::标签 ${REF_NAME} 与 package.json 一致，准备发布 $NAME@$VERSION"
+          else
+            # 只认 v* 标签与 main，避免从任意分支把未定稿的版本发出去。
+            echo "::error::只允许从 v* 标签或 main 分支发布（当前 ref：${REF}，事件：${EVENT_NAME}）"
+            exit 1
+          fi
+
+      - name: 有依赖就装上（本包目前零依赖，这一步会跳过）
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "没有 package-lock.json，跳过依赖安装"
+          fi
+
+      - name: 这个版本是否已经发过（重跑同一次运行不报错）
+        id: check
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "::warning::$NAME@$VERSION 已经在 npm 上，跳过发布"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 这一关只在真正要发布时才跑 —— 它跑的是 `npm pack --dry-run`，不连网、不需要令牌。
+      # 同一套核对在本地也能跑：`node .github/scripts/pack-contents.mjs`
+      - name: 核对入包内容（只允许远程仓库里的文件）
+        if: steps.check.outputs.skip != 'true'
+        run: node .github/scripts/pack-contents.mjs
+
+      - name: 发布
+        if: steps.check.outputs.skip != 'true'
+        run: npm publish

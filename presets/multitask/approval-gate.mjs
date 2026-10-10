@@ -190,7 +190,7 @@ export const inject = []
 
 /**
  * 子代理进程内委派的子会话「origin」值（`dsh-subagent` 的 `childSessionMeta` 写入）。
- * 与别的守卫模块各自留一份，是保持「预设模块互不 import」的代价（见 README）。
+ * 与别的守卫模块各自留一份，是保持「预设模块互不 import」的代价（见 docs/DESIGN.md）。
  */
 const SUBAGENT_ORIGIN = 'subagent'
 

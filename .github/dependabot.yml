@@ -1,0 +1,16 @@
+# 让 Dependabot 盯着 .github/workflows/ 里钉住提交号的那两个官方 action。
+#
+# 为什么需要它：发布工作流带 `id-token: write`（能换到一个可发布本包的令牌），
+# 所以那两个 action 是钉在具体提交上而不是浮动标签。钉住之后不会自动跟着上游更新，
+# 这一个文件就是补上那条更新通路 —— 上游修安全问题时会自动开 PR。
+# 不需要它的话，直接删掉本文件即可。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore
+    labels:
+      - dependencies
