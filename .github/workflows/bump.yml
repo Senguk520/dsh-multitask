@@ -1,0 +1,103 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 自动推进 package.json 的版本号
+#
+# 为什么由 CI 独占版本号：多人协作时它是一份**共享状态**。谁在本地手改，谁就跟
+# 别人冲突，而且「我这边的号对不对」得靠每次开工先拉一次才能确定。交给这里统一
+# 推进，协作者就只需要照常推送、照常拉取，不必再碰这个文件。
+#
+# ── 推进规则 ───────────────────────────────────────────────────────────────
+#   · 当前版本**高于** npm 上最高的正式版 ⇒ 原样保留，不推进。
+#     这正是「一个还没发布的号可以跨多次提交复用」：推 10 次代码只会产生 1 次
+#     推进提交，而不是 10 次。同时它也让人可以显式指定版本（例如要发 2.0.0）。
+#   · 否则 ⇒ 取 npm 上**最高正式版**的 patch + 1。
+#     基准取 registry 而不是当前版本，是为了兜住「仓库落后于 registry」的情况。
+#
+#   决策与边界条件都在 `.github/scripts/next-version.mjs` 里，由
+#   `test/next-version-rules.mjs` 的 22 条用例守着（含两条反向验证）。
+#
+# ── 为什么这里不会自己触发自己（死循环）────────────────────────────────────
+#   用内置的 `GITHUB_TOKEN` 推送的提交**不会触发新的工作流运行** —— 这是 GitHub
+#   刻意的设计，专门用来防止「工作流触发工作流」的无限递归。所以本工作流推完
+#   提交就结束了，不会再次进入自己。
+#
+#   ⚠️ 反过来记住这条：**标签也一样**。所以「改完版本号顺手打个标签、让标签去
+#      触发发布」是**不通**的 —— 那个标签产生的事件不会唤起发布工作流。
+#      这也是发布只能手动点的原因（见 publish.yml）。
+#
+# ── 协作者要注意的 ─────────────────────────────────────────────────────────
+#   · 不要手动改 `package.json` 的 version —— 会与本工作流打架。
+#     真要指定版本（例如发 2.0.0），改大即可：规则会尊重「高于已发布最高版」的值。
+#   · 推送到 main 后，bot 可能会在其后追加一条 `chore(release): bump version`
+#     提交，所以**下次推送前先拉一下**，否则本地会比远端旧。
+# ─────────────────────────────────────────────────────────────────────────────
+name: Bump version
+
+on:
+  push:
+    branches:
+      - main
+
+# 两次推送几乎同时到达时串行处理，否则两边会算出同一个号、后推的那个被拒绝。
+# 已经在跑的那次不许被打断。
+concurrency:
+  group: bump-version
+  cancel-in-progress: false
+
+permissions:
+  contents: write # 需要推回 main
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 明确用内置令牌：它推出去的提交不会触发新的工作流（见文件顶部的说明）。
+          # 换成 PAT 会打破那个性质，从而让本工作流自己触发自己。
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false # 本包零依赖；不缓存（发布链路一律不缓存）
+
+      # 发布物是纯 JS，语法错误没有构建步骤会拦住它 —— 在这里花几秒挡一次。
+      # 注意 `node --check` 对 `.js` 也按 ESM 解析（本包 package.json 里 type: module）。
+      - name: 入口文件语法检查
+        run: |
+          for file in lib/index.js lib/client.js presets/multitask/*.mjs; do
+            node --check "$file"
+          done
+          echo "语法检查通过"
+
+      - name: 算出该用的版本号
+        id: next
+        run: |
+          CURRENT="$(node -p "require('./package.json').version")"
+          NEXT="$(node .github/scripts/next-version.mjs)"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          if [ "$CURRENT" = "$NEXT" ]; then
+            echo "::notice::版本号保持 $CURRENT（尚未发布，或已显式指定更高版本）"
+          else
+            echo "::notice::版本号 $CURRENT → $NEXT"
+          fi
+
+      # `--no-git-tag-version`：只改文件，提交与打标签由下面两步自己控制，
+      # 因为提交信息与推送目标都由本工作流决定。npm 会保留原有的缩进与末尾换行。
+      - name: 写回 package.json
+        if: steps.next.outputs.next != steps.next.outputs.current
+        env:
+          NEXT: ${{ steps.next.outputs.next }}
+        run: npm version --no-git-tag-version "$NEXT"
+
+      - name: 提交并推回 main
+        if: steps.next.outputs.next != steps.next.outputs.current
+        env:
+          NEXT: ${{ steps.next.outputs.next }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -am "chore(release): bump version to $NEXT"
+          git push
+          echo "::notice::已把版本号推进到 $NEXT 并推回 main"
