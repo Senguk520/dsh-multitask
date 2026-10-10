@@ -1,6 +1,6 @@
 {
   "name": "dsh-multitask",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "Multitask 减震器模式（Agent preset）：主对话只做需求理解、任务下发与结果汇总，读文件/跑命令/构建/搜索等污染性工作全部下放子代理。含协调者窄工具面、四类 worker、只读元数据工具 file_info 与子代理危险操作的审批闸门，零 DSH 源码改动。",
   "main": "lib/index.js",
