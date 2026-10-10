@@ -76,7 +76,7 @@
  *   · 绝不授 `FullControl` / `Modify`（只授 `TakeOwnership`）；
  *   · 不改目录**所有者**、不动 SACL、不删任何既有 ACE；
  *   · 只在 Windows 上动作；非 `workspace-write` 的会话不动；
- *   · 不碰非本 preset 的会话（与同仓守卫同一条纪律）。
+ *   · 不碰非本 preset 的会话（与同仓守卫同一条纪律）
  *
  * @module dsh-multitask/presets/multitask/workspace-acl
  */
