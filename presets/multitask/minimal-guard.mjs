@@ -239,10 +239,99 @@ function sessionEvents(agent) {
 }
 
 /**
- * 从子代理的 `subagent/descriptor` 事件里取该行配置的 persona。
+ * 承载「本行 persona」的 system prompt 段落名。
  *
- * descriptor 是**唯一**能读到「这一行用了哪份 persona」的地方：它是委派行原样的
- * 快照，而不是子代理的 system prompt（那要等组装，且可能已被 scope 层叠改写）。
+ * 逐字为 `dsh-subagent` 的 `applyChildComposition()` 注册它时用的名字
+ * （上游常量 `PERSONA_PREFIX_SECTION` 的值）。名字漂了不会报错，只会**读不到** ——
+ * 于是退化成「找不到标记 = 什么都不做」这种最难查的坏法。
+ */
+const PERSONA_SECTION_NAME = 'deployment:persona-prefix'
+
+/**
+ * 从子代理**自己的 system prompt 段落**里取该行配置的 persona（**主来源**）。
+ *
+ * 为什么它是主来源：这是**两条委派路径都有**的那一份。`applyChildComposition()`
+ * 在 `setup()` 阶段注册该段落，而 `setup()` 严格早于 `agent/created`
+ * （上游 `initializeAgent` 先 `await setup()`、再 `await publish()`）——
+ * 与 `coordinator-guard` 依赖的时序是同一条。
+ *
+ * 对比 `descriptorPersona()`：那个只在 `backgroundMode: 'continuable'` 行上有效，
+ * 所以**不能**单独用它。只用它会让「只读收窄」在**前台派单**时整体失效 ——
+ * 而前台派单恰好是审批弹窗唯一走得通的路径，于是外在表现会变成
+ * 「前台派单测出来一切正常、默认后台派单时反而没问题，唯独前台那批 worker
+ * 仍然握着 `ssh_exec`」这种极难归因的坏法。
+ *
+ * ⚠️ 读法用的是上游**未文档化**的内部结构（`SystemPrompt` 的公开声明只列了注册方法、
+ * 顺序查询与 `assemble()`；`layers` / `merge()` 都不在其中）。所以这里的原则是：
+ *
+ *   - 全程不抛错，任何一步读不到都返回 undefined，由调用方退到兜底来源；
+ *   - **结构性缺失**（连 `layers.merge` 都不在）记一条带**固定标识**的 warn ——
+ *     那说明上游改了内部结构，本模块对前台派单会开始静默失效，这件事必须可 grep；
+ *   - 段落**不存在**不告警：那是「该行本来就没配 persona」，属于正常情形。
+ *
+ * 不走公开的 `assemble()`：它是 `async`，而且每次会 `structuredClone` 全部工具 schema
+ * （本部署 40+ 个），为读一段文本付这个代价不合适。
+ *
+ * @param agent - 目标子代理。
+ * @param warn - 每进程每原因只报一次的记录器。
+ * @returns persona 文本，或 undefined。
+ */
+function promptSectionPersona(agent, warn) {
+  const service = (() => {
+    try {
+      const direct = agent?.ctx?.systemPrompt
+      if (direct !== undefined && direct !== null) return direct
+      return agent?.ctx?.get?.('systemPrompt')
+    } catch {
+      return undefined
+    }
+  })()
+
+  const layers = service?.layers
+  if (layers === undefined || layers === null || typeof layers.merge !== 'function') {
+    warn(
+      "this deployment's systemPrompt service exposes no readable section layers, so a subagent's own " +
+        'persona section cannot be read; the mode marker falls back to the subagent descriptor, which omits ' +
+        'persona for foreground (one-shot) delegations — those workers are NOT narrowed ' +
+        '[MULTITASK-MODE-MARKER-SOURCE-MISSING reason=no-section-layers]',
+    )
+    return undefined
+  }
+
+  try {
+    // scope 键就是 agent 对象本身：上游 `assembleContextFor()` 传的是 `{ scope: agent }`，
+    // 而 `createScope(loopCtx, this)` 用的键也是这个 agent。
+    // 子代理自己的层在链条最内侧，因此它盖掉全局那份部署级 persona。
+    const sections = layers.merge(agent, (layer) => layer.sections)
+    const section = sections?.get?.(PERSONA_SECTION_NAME)
+    const text = section?.text
+    // `text` 可以是函数（按组装上下文求值）；本行配置的 persona 是纯字符串，
+    // 遇到函数形态说明读到的不是委派行那一份，按「读不到」处理。
+    return typeof text === 'string' && text !== '' ? text : undefined
+  } catch (error) {
+    warn(
+      `reading a subagent's own persona section failed: ${error instanceof Error ? error.message : String(error)} — ` +
+        'the mode marker falls back to the subagent descriptor, which omits persona for foreground ' +
+        '(one-shot) delegations [MULTITASK-MODE-MARKER-SOURCE-MISSING reason=merge-threw]',
+    )
+    return undefined
+  }
+}
+
+/**
+ * 从子代理的 `subagent/descriptor` 事件里取该行配置的 persona（**兜底来源**）。
+ *
+ * descriptor 是「委派行原样的快照」，上游自己的定性是
+ * 「first event is authoritative」，所以它是很干净的一份 —— 但**覆盖面有限**：
+ *
+ *   `snapshotSubagentDescriptor()` 对 `mode === 'one-shot'` 的行只保留
+ *   `version` / `mode` / `provider` / `label`，persona 与 toolFilter **都被丢掉**；
+ *   而且 one-shot 的 descriptor 要到**第一轮 `agent/pre-step`** 才 append
+ *   （`attachDescriptorAppend`），在 `agent/created` 那一刻**根本还不存在**。
+ *
+ * 所以它只对 `continuable` 行有效。本机实测（全部 340 个会话、298 条 descriptor）：
+ * one-shot 的 76 条**无一带 persona**，continuable 的 222 条里 219 条带 ——
+ * 分界线与上面那段字段集完全一致。
  *
  * @param agent - 目标子代理。
  * @returns persona 文本，或 undefined。
@@ -257,17 +346,40 @@ function descriptorPersona(agent) {
 }
 
 /**
+ * 取该子代理所属委派行的 persona —— 主来源优先，descriptor 兜底。
+ *
+ * 两个来源都取自同一个 `request.persona`，内容一致；顺序之所以这样定，是因为
+ * 主来源在**两条派单路径上都存在**，而兜底只在后台那条上存在。
+ *
+ * @param agent - 目标子代理。
+ * @param warn - 每进程每原因只报一次的记录器。
+ * @returns persona 文本，或 undefined。
+ */
+function childPersona(agent, warn) {
+  const fromPrompt = promptSectionPersona(agent, warn)
+  if (typeof fromPrompt === 'string') return fromPrompt
+  return descriptorPersona(agent)
+}
+
+/**
  * 判定该子代理是不是 minimal（只读）worker。
  *
  * 找不到标记 = 不是本模块的对象。这样做的直接后果是：`subagent` / `subagent_fork` /
  * `subagent_ptc` 三条**别的**委派路径完全不受影响 —— 这是「不破坏现有模式」的实现
  * 方式，而不是靠额外判断。
  *
+ * ⚠️ 判「不是」与「读不到 persona」在本模块里**不可区分**，而两者的后果不同：
+ * 前者是「这条行按设计不用收窄」，后者是「本该收窄却没读出来」。这个方向是**安全**的
+ * （不收窄 ≠ 放宽权限：静态 `toolFilter` 仍在，本模块只是没能补上第二层），
+ * 但它意味着「读不到」必须**可观测** —— 所以两个来源的读取路径都带固定标识告警，
+ * 而不是静默返回 undefined。
+ *
  * @param agent - 目标子代理。
+ * @param warn - 每进程每原因只报一次的记录器。
  * @returns 命中 minimal 标记时为 true。
  */
-function isMinimalChild(agent) {
-  const persona = descriptorPersona(agent)
+function isMinimalChild(agent, warn) {
+  const persona = childPersona(agent, warn)
   if (typeof persona !== 'string') return false
   return persona.includes(MINIMAL_MODE_MARKER)
 }
@@ -353,6 +465,83 @@ function restrictableNameSet(tools, agent) {
 }
 
 /**
+ * 既**不可收窄**、又**必须**放行的 harness 内部传输名。
+ *
+ * 它们由上游（不是本 composition）注册在子代理自己的 scope 上，且都不是「工具」
+ * 而是运行时通路：
+ *
+ *   - `run_code` —— PTC 呈现的保留传输名，`restrict()` 明确拒绝它；
+ *   - `structured_output` —— `dsh-subagent` 在配了 `outputSchema` 的委派里注册的
+ *     结构化返回通路（`dsh-subagent-in-process-driver` 的 `childCtx.tools.register`）。
+ *
+ * 把它们从目录里滤掉会让「结构化返回」这类能力失效，而它们本来就只服务于本次委派、
+ * 与「只读」不冲突。
+ */
+const CATALOG_EXEMPT = ['run_code', 'structured_output']
+
+/**
+ * 把**不在允许集里**的工具从组装结果的目录数组里滤掉（目录级过滤）。
+ *
+ * ── 为什么需要它：`restrict()` 有一条**结构上**够不到的地带 ────────────────
+ *
+ * `tools.restrict()` 只认**继承面**的名字：`dsh-tools` 的 `view()` 里，
+ * `inherited` 才进 `restrictableNames`，而**注册在该 agent 自己 scope 上**的名字
+ * 只进 `visible`、**不进** `restrictableNames` —— 写进 deny 会直接抛
+ * `names unknown global tool`。
+ *
+ * 于是凡是「按 agent 单独安装」的工具，本模块的差分逻辑**永远摘不掉**。
+ *
+ * ⚠️ **这里记一段历史，因为它是本层存在的直接来由，而它的触发条件已经消失：**
+ * 当初实测到的正是这一类 —— `subagent` / `subagent_ptc` / `subagent_minimal` 三行设了
+ * `modelSelectionSettings: true`，那个开关会让 `dsh-tool-subagent` 不再全局注册工具、
+ * 而是为每个 agent 单独 `installScoped`（注册到该 agent 自己的 ctx），于是它们进了
+ * minimal worker 的目录却不可收窄。证据吻合：**没设**那个开关的 `subagent_fork`
+ * 被成功摘掉了。实测（`H:\test4` / `H:\test5`，读请求头 `tools` 数组，非 worker 自述）：
+ * minimal worker 的目录恰好是「允许集 10 项 + 这三个」= 13 项。
+ *
+ * **那个开关现在已从四行全部移除**（「AI 临时指派模型」那条能力与本包「模型由用户
+ * 在面板里按 worker 类型决定」相冲突），于是四条委派工具回到全局注册、**由
+ * `restrict()` 正常摘掉**。
+ *
+ * ⚠️ **但这一层不能因此删掉**：它的存在理由是**结构性**的 —— `restrict()` 只认继承面，
+ * 任何第三方插件只要按 agent 单独安装工具，就又会落进这条够不到的地带。
+ * 真实案例消失之后，`test/minimal-guard-catalog.mjs` 用**合成的**外来工具名继续守它
+ * （见那里的 `PER_AGENT_LEAK`）。
+ *
+ * ── 为什么在组装瀑布上做，以及为什么它**不是**安全边界 ──────────────────────
+ *
+ * `assembly.tools` 正是喂给请求的那一份（`dsh-agent-loop` 的
+ * `buildRequest(config, preparedCall, assembly.tools, …)`），也是模型唯一能看到
+ * 工具目录的地方；`approval-gate.mjs` 早就用同一个瀑布改 `assembly.contexts`，
+ * 这里是同一手法的第二个用例。
+ *
+ * ⚠️ **它只改「模型看到什么」，不改「能不能调」。** 真正的执行拦截仍然是
+ * `maxDepth`（minimal worker 的深度是 1，再往下派会撞
+ * `Error: subagent depth 2 exceeds maxDepth 1`）与静态 `toolFilter`。
+ * 把这个过滤当成安全边界是错的 —— 它修的是**一致性**：人格里逐字写着
+ * "Do not delegate further; you cannot, and you should not try"，
+ * 而模型抬头就能看见三个委派工具。
+ *
+ * 纯函数、不改入参：瀑布的返回值就是权威结果。
+ *
+ * @param assembly - 本次组装结果。
+ * @param allowed - 允许集（已并入 `CATALOG_EXEMPT`）。
+ * @param hidden - 可选：把被滤掉的名字记进这个集合（调用方用于记账/日志）。
+ * @returns 滤过的新组装结果；没有可滤项时**原样返回**（避免无谓分配）。
+ */
+function withoutUnlistedTools(assembly, allowed, hidden) {
+  const tools = assembly?.tools
+  if (!Array.isArray(tools)) return assembly
+  const kept = tools.filter((tool) => {
+    if (allowed.has(tool?.name)) return true
+    hidden?.add(tool?.name)
+    return false
+  })
+  if (kept.length === tools.length) return assembly
+  return { ...assembly, tools: kept }
+}
+
+/**
  * 装载只读守卫：把带 `[multitask-mode:minimal]` 标记的子代理 scope 收窄成真只读。
  *
  * @param ctx - preset scope 的插件上下文（限制会挂在目标 agent 自己的 scope 上）。
@@ -373,18 +562,114 @@ export function apply(ctx, config) {
    * 强引用。这也是**幂等**的实现方式 —— 同一 agent 重复触发不会重复施加。
    */
   const narrowed = new WeakSet()
-  /** 每个 agent 的在线限制：agent -> dispose。用于 `agent/disposed` 时卸掉。 */
+  /**
+   * 每个 agent 的在线清理动作：agent -> dispose 数组。
+   *
+   * ⚠️ 必须是**数组**而不是单个 disposer：同一个 worker 上现在有两个独立的动作
+   * （`restrict()` 的 restriction 层 + 目录级过滤），两者各有自己的 disposer。
+   * 用单值会让后写的那次**静默覆盖**前一次 —— 表现是 `agent/disposed` 之后仍有一条
+   * 限制留在 scope 上，而 scope key 被复用时新 agent 会继承一条本该消失的过滤
+   * （README「释放」一节记的正是这个坑）。
+   */
   const live = new WeakMap()
 
-  /** 卸掉一个 worker 的现行限制。 */
+  /** 追加一个清理动作（若已有则并入，绝不相撞）。 */
+  const addCleanup = (agent, dispose) => {
+    if (typeof dispose !== 'function') return
+    const previous = live.get(agent)
+    if (previous === undefined) {
+      live.set(agent, [dispose])
+      return
+    }
+    previous.push(dispose)
+  }
+
+  /** 卸掉一个 worker 的全部现行限制。 */
   const release = (agent) => {
-    const dispose = live.get(agent)
-    if (dispose === undefined) return
+    const disposers = live.get(agent)
+    if (disposers === undefined) return
     live.delete(agent)
+    for (const dispose of disposers) {
+      try {
+        dispose()
+      } catch (error) {
+        warn(`lifting an earlier read-only restriction failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+  }
+
+  /**
+   * 给一个 minimal worker 挂上**目录级过滤**（只改模型看到什么）。
+   *
+   * 为什么它与 `restrict()` 是两件事、且必须并存：`restrict()` 走的是 restriction 层，
+   * 只认**继承面**的名字；而**按 agent 单独安装**的工具注册在该 agent 自己的 scope 上，
+   * **结构上**不可 restrict（写进 deny 会抛 `unknown global tool`）。
+   * 目录过滤补的正是这一块 —— 详见 `withoutUnlistedTools()` 的注释（那里记了它当初
+   * 是被哪个真实案例逼出来的，以及为什么那个案例消失后这层仍需保留）。
+   *
+   * 注册在**子代理自己的 ctx** 上，所以只影响这个 worker 的组装，兄弟与父会话看不到。
+   * 拿到的 disposer 交给 `addCleanup`，`agent/disposed` 时一并卸掉
+   * （与 restriction 的释放走同一条路，避免两套生命周期各自漂移）。
+   *
+   * ⚠️ 失败方向：拿不到 event registry 就**只告警、不抛错**。本模块对外的承诺是
+   * 「任何意外都不得影响会话创建」，而这一层修的是**一致性**（人格与目录对上），
+   * 不是安全边界 —— 真正的拦截仍是 `maxDepth` 与静态 `toolFilter`。
+   *
+   * 第一次真的滤掉东西时记一条 info（每个 worker 一次），列出被滤掉的名字。
+   * 这条日志是**过度过滤的出口**：允许集是白名单，若哪天它误伤了某个 harness
+   * 内部工具，日志里会直接写着那个名字，而不是表现成「那个 worker 莫名其妙少了个能力」。
+   *
+   * @param agent - 目标 minimal worker。
+   * @param allowed - 允许集。
+   * @returns 是否成功挂上（供调用方决定要不要记「已收窄」）。
+   */
+  const engageCatalogFilter = (agent, allowed) => {
+    const childCtx = agent?.ctx
+    if (typeof childCtx?.on !== 'function') {
+      warn(
+        'a read-only worker scope exposes no event registry, so its tool CATALOG could not be filtered; ' +
+          'any tool installed per-agent by another plugin stays visible to that worker, though calling one ' +
+          'may still be refused by maxDepth',
+      )
+      return false
+    }
+    /** 被目录过滤摘掉的名字（只为「首次记账」服务，之后不再累积）。 */
+    const hidden = new Set()
+    /** 是否已经记过一次账（组装是每条请求都跑的路径，不能每次都记）。 */
+    let reported = false
+
     try {
-      dispose()
+      const dispose = childCtx.on('system-prompt/assemble', async (assembly, _context, next) => {
+        // 后置过滤（先 next() 再改返回值）：与 approval-gate 改 contexts 的位置一致，
+        // 是上游 invariant 插件确立的既定后置点。
+        const assembled = await next()
+        const filtered = withoutUnlistedTools(assembled, allowed, reported ? undefined : hidden)
+        // 记账**只在第一次**真的滤掉东西时做一次：组装是每条请求都跑的路径，
+        // 每次都记会刷屏，而这里要的只是「这个 worker 的面被改过、改了哪几个」这个事实。
+        // （用 `reported` 而不是「清空 hidden」：后者会让下次组装重新累积并再次记一行。）
+        if (!reported && filtered !== assembled && hidden.size > 0) {
+          reported = true
+          const names = [...hidden].sort()
+          hidden.clear()
+          ctx.logger?.info?.(
+            `dsh-multitask: read-only worker catalog filtered — hid ${names.length} tool(s) that ` +
+              `tools.restrict() structurally cannot remove: ${names.join(', ')}`,
+          )
+        }
+        return filtered
+      })
+      // `addCleanup` 自己对「不是函数」有防护，所以不需要先判断再存。
+      addCleanup(agent, dispose)
+      if (typeof dispose !== 'function') {
+        warn('the event registry did not return a disposer for the catalog filter; it may outlive its agent')
+      }
+      return true
     } catch (error) {
-      warn(`lifting an earlier read-only restriction failed: ${error instanceof Error ? error.message : String(error)}`)
+      warn(
+        `engaging the read-only CATALOG filter failed: ${error instanceof Error ? error.message : String(error)} — ` +
+          'that worker keeps the un-restrictable tools visible in its catalog',
+      )
+      return false
     }
   }
 
@@ -402,7 +687,7 @@ export function apply(ctx, config) {
 
     // ── 硬前置 2：只认 minimal 标记 ──
     // 没标记的行（subagent / subagent_fork / subagent_ptc）一律不动作。
-    if (!isMinimalChild(agent)) return
+    if (!isMinimalChild(agent, warn)) return
 
     if (narrowed.has(agent)) return
 
@@ -427,35 +712,55 @@ export function apply(ctx, config) {
     }
 
     const restrictable = restrictableNameSet(tools, agent)
+    /** 「允许集」= 保留名单 + harness 内部传输名。目录过滤与 `deny` 都由它推导。 */
+    const allowed = new Set([...keep, ...CATALOG_EXEMPT])
     const deny = []
     const seen = new Set()
     for (const toolName of visible) {
       if (seen.has(toolName)) continue
       seen.add(toolName)
-      // `run_code` 是 PTC 呈现的保留传输名，出现在 allow/deny 里 `restrict()` 一律抛错。
-      if (toolName === 'run_code') continue
-      // 不在 restrictableNames 里的名字（例如自己 scope 注册的 `structured_output`）
-      // 既**不该**也**不能**被摘：写进 deny 会直接抛错。
+      // `run_code` / `structured_output`：harness 内部传输名，出现在 allow/deny 里
+      // `restrict()` 一律抛错，且滤掉它们会让结构化返回这类能力失效。
+      if (CATALOG_EXEMPT.includes(toolName)) continue
+      // 不在 restrictableNames 里的名字（按 agent 单独安装的那些）**不能**被 restrict
+      // —— 写进 deny 会抛 `names unknown global tool`。它们只能靠下面的目录级过滤处理。
       if (restrictable !== undefined && !restrictable.has(toolName)) continue
       if (keep.has(toolName)) continue
       deny.push(toolName)
     }
 
+    // ── 目录级过滤：补上 `restrict()` **结构上**够不到的那一类 ────────────────
+    // 见 `withoutUnlistedTools()` 的注释：按 agent 单独安装的工具不在
+    // `restrictableNames` 里，deny 永远摘不掉它们（实测的三个委派工具就是这一类）。
+    // ⚠️ 必须在下面 `deny.length === 0` 的早退**之前**装 —— 否则「目录里刚好只剩
+    // 这一类」时会被整个跳过，而那正是本轮实测命中的情形。
+    const catalogEngaged = engageCatalogFilter(agent, allowed)
+
     // 差集为空时**不要**调 `restrict()`：`allow`/`deny` 全空会抛
     // `tools.restrict({}) is a no-op`。走到这里说明该 worker 的可见面本来就已经
-    // 只剩允许集了 —— 那正是我们想要的状态，无事可做。
-    if (deny.length === 0) return
+    // 只剩允许集了 —— 那正是我们想要的状态，继承面上无事可做。
+    if (deny.length === 0) {
+      if (catalogEngaged) {
+        narrowed.add(agent)
+        ctx.logger?.info?.(
+          'dsh-multitask: read-only worker catalog filtered — nothing to withhold on the inherited surface',
+        )
+      }
+      return
+    }
 
     try {
       const dispose = tools.restrict({ deny })
       narrowed.add(agent)
-      if (typeof dispose === 'function') {
-        live.set(agent, dispose)
-      } else {
+      // 用 `addCleanup`（数组追加）而不是 `live.set`（整体覆盖）：这个 worker 上
+      // 还挂着上面那次目录过滤的 disposer，覆盖会让它永远不执行。
+      addCleanup(agent, dispose)
+      if (typeof dispose !== 'function') {
         warn('the tool registry did not return a disposer for the read-only restriction; it may outlive its agent')
       }
       ctx.logger?.info?.(
-        `dsh-multitask: read-only worker scope engaged — withheld ${deny.length} tool(s): ${[...deny].sort().join(', ')}`,
+        `dsh-multitask: read-only worker scope engaged — withheld ${deny.length} tool(s): ${[...deny].sort().join(', ')}` +
+          `${catalogEngaged ? ' (plus a catalog-level filter for tools that cannot be restricted)' : ''}`,
       )
     } catch (error) {
       // 走到这里说明 deny 里混进了注册表不认识的名字 —— 也就是上面那次可见面读取

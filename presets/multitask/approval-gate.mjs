@@ -69,7 +69,8 @@
  *
  * **措辞不实** —— 改策略的是插件，不是用户。一条写进会话日志、又被模型当作用户意图读的
  * 假陈述，比少一条提示糟得多。所以本模块只做前者（写事件，**省掉 `source` 字段**：
- * 事件校验只允许 `source: 'delegation'`，省略才表示「非委派继承」），
+ * 带上 `source: 'delegation'` 表示「从父级委派继承而来」，而本模块做的恰恰是**纠正**
+ * 委派的钉死，所以说的是反话；运行期并不校验这个字段，见下方写入处的说明），
  * 并且**不自己 inject 任何消息**。
  *
  * 那模型怎么知道策略变了？**上游自己会说**：`dsh-user-approval` 注册了一段 runtime
@@ -260,12 +261,16 @@ const DANGER_PATTERNS = [
   { id: 'registry-mutation', re: /\breg\s+(?:add|delete|import|restore)\b|\b(?:Set|New|Remove)-ItemProperty\b[^\n]*?HKLM/i },
   { id: 'service-mutation', re: /\bsc\s+(?:create|delete|config)\b|\b(?:New|Remove)-Service\b/i },
   { id: 'scheduled-task', re: /\bschtasks\b|\b(?:New|Register|Unregister|Disable)-ScheduledTask\b/i },
-  // ⚠️ `chmod +x script.sh` 是构建脚本里的日常操作，`chown user:user file.txt` 同理，
-  //     所以这两个只问**递归**与**系统路径**；普通的单文件变更不问。
-  //     `takeown` / `icacls` / `cacls` 一律问（它们的主要用途就是接管系统对象）。
+  // ⚠️ `icacls <路径>` / `cacls <路径>`（**不带任何变更开关**）是只读的 —— 它只是**显示** ACL。
+  //     早期版本对它们一律发问，结果连「读一下这个目录的权限」都要用户点一次允许。
+  //     **这不是理论问题**：本模块自己的验证流程就撞到过它 —— 给子代理的 brief 让它跑
+  //     `icacls .` 汇报权限，于是弹了一次窗，用户不得不为一个只读命令点「允许」。
+  //     所以这里要求**出现变更类开关**才算危险。
+  //     `takeown` 的用途本身就是接管所有权（`/f` 是它的必需参数），所以照旧一律问。
+  //     `chmod` / `chown` 同理：只问递归与系统路径（`chmod +x` 是构建脚本日常）。
   {
     id: 'ownership-change',
-    re: /\b(?:takeown|cacls|icacls)\b|\b(?:chown|chmod)\b[^\n]*?\s-R\b|\b(?:chown|chmod)\b[^\n]*?(?:[a-z]:[\\/](?:Windows|Program Files(?: \(x86\))?)\b|\/(?:etc|usr|bin|sbin|boot|dev|proc|sys)\/)/i,
+    re: /\btakeown\b|\b(?:icacls|cacls)\b[^\n]*?\s\/(?:grant|deny|remove|setowner|reset|restore|inheritance|substitute|g|p|d|e|r)\b|\b(?:chown|chmod)\b[^\n]*?\s-R\b|\b(?:chown|chmod)\b[^\n]*?(?:[a-z]:[\\/](?:Windows|Program Files(?: \(x86\))?)\b|\/(?:etc|usr|bin|sbin|boot|dev|proc|sys)\/)/i,
   },
   // ⚠️ 只在**写**的用法上问：`wmic process list` 是只读查询。
   { id: 'wmi-mutation', re: /\bwmic\b[^\n]*?\b(?:call|create|delete|set)\b/i },
@@ -728,13 +733,31 @@ export function apply(ctx, config) {
     }
 
     try {
-      // ⚠️ **必须省略 `source`**：`approval/policy` 的事件校验只允许 `source: 'delegation'`，
-      // 而这个变更不是委派继承来的（恰恰相反，它是对委派钉死的纠正）。
-      // 省略 `source` 正是「非委派来源」的表达，也是本模块唯一合法的写法。
+      // ── 关于 `source`：省略它是对的，但原来给的那个理由本身是错的 ──────────────
+      //
+      // 曾经写在这里的说法（「只有 `delegation` 这一个取值才是合法的」）**不准确**。
+      // 核实结果：
+      //
+      //   · **运行期不校验 `source`**。`approval/policy` 在运行期唯一的校验是词表检查
+      //     （只比对 `policy ∈ ["ask","never"]`），完全不看 `source`。
+      //   · `'delegation'` 是**迁移期**的取值约束：它写在 `disposition(["policy"],
+      //     ["source"])` 里（`source` 是 optional 位），只由 v0/v1 旧格式的迁移阶段
+      //     （`assertReleasedPayloadSemantics` ← `assertReleasedEventPayload` ←
+      //     `DecodedReleasedV1ToV2Stage.transformEvent`）执行。当前会话格式是 v4，
+      //     这条路径不会走到我们写的事件上。
+      //   · 所以带上 `source: 'delegation'` **不会抛错**（它正是那个被允许的值）。
+      //
+      // 那为什么仍然省略？因为**带上是如实的反面**：`source: 'delegation'` 表示「这个值
+      // 是从父级委派继承来的」，而本模块做的恰恰是**纠正**委派的钉死（父级写的是 `never`，
+      // 我们写 `ask`）。省略 `source` 才是「非委派来源」的如实表达。
       //
       // ⚠️ 这条写入**会落进会话日志**（这是 `overrideOf` 唯一能读到的地方 —— 策略不能写
       // session header，那会抛 `session header uses retired policy baseline fields`）。
       // 用户已明确接受这处持久化写入。
+      //
+      // 另：这条写入**能跨重启存活**，不需要恢复路径。载入期只丢弃「最后一条没有换行的
+      // 不完整记录」（torn tail），与事件是否在回合内无关；而 `approval/policy` 不在任何
+      // 回合包含校验里（只有 `approval/asked` / `approval/decided` 要求回合归属）。
       session.append('approval/policy', { policy: 'ask' })
     } catch (error) {
       noteSkipped(
@@ -760,6 +783,130 @@ export function apply(ctx, config) {
       )
     } catch {
       // 日志通道不可用不能反过来炸掉会话。
+    }
+  }
+
+  /**
+   * 记一次「兜底通知」的结果（发送成功 / 跳过 / 失败）。
+   *
+   * 标识与 `MULTITASK-APPROVAL-RELAY-*` 分开：转呈（首选闭环路径）与通知（兜底）是两件
+   * 不同的事，日志里必须能一眼分清「这次是拿到了用户决定，还是只递了个信」。
+   *
+   * ⚠️ 这三个标识**不**经过 `warn`，只走 info：通知是尽力而为的辅助动作，失败不该以
+   * warning 的形态出现（那会让日志看起来像闸门坏了）。真正的失败事实由
+   * `MULTITASK-APPROVAL-RELAY-FAILED` 承担。
+   *
+   * @param kind - `SENT` / `SKIPPED` / `FAILED`。
+   * @param reason - 跳过 / 失败原因的短名（ASCII kebab-case）；成功时不传。
+   * @param detail - 给人看的补充说明。
+   */
+  const noteNotify = (kind, reason, detail) => {
+    try {
+      ctx.logger?.info?.(
+        `dsh-multitask: MULTITASK-APPROVAL-NOTIFY-${kind}` +
+          `${reason === undefined ? '' : ` reason=${reason}`}` +
+          `${detail === undefined ? '' : ` — ${detail}`}`,
+      )
+    } catch {
+      // 日志通道不可用不能反过来炸掉审批。
+    }
+  }
+
+  /**
+   * 转呈失败时的兜底通知（问题 1 的 (d)）：尽力把「有个决定在等你」送到用户眼前。
+   *
+   * ── 为什么需要它 ─────────────────────────────────────────────────────────────
+   *
+   * 转呈（首选闭环路径）要求父会话**此刻有一个打开的回合**。后台派单 + 回合结束再等回调
+   * 时那个条件不成立，于是请求会落到子会话自己身上 —— 而子会话在侧边栏**被隐藏**
+   * （`session.origin === 'subagent'` 的行不渲染）、页头子代理目录也不显示审批态，
+   * 所以用户**看不到任何提示**。更糟的是它不会失败：客户端的 Gateway 会为任意 agentId
+   * **无条件物化作用域**，于是请求被接住并**无限挂着**（审批路径没有任何超时），
+   * 而子代理的工具调用就此阻塞。这条通知是让用户**知道并找得到**那个请求的唯一手段。
+   *
+   * ── 为什么走 `sendMessage` 而不是别的手段 ─────────────────────────────────────
+   *
+   * `sendMessage` 是上游唯一为「resident continuable child → 直接父会话」准备的通道，
+   * 且它投递时 `wakeup = true` —— 空闲的父会话会**真的开一个回合**，于是这条消息落在
+   * 主对话的对话流里（`user/message` + `source.kind='agent-message'`，带 surface op）。
+   * 用户看得见，不是静默收件箱。
+   *
+   * ── 它**不**是批准（这一点必须写死在实现与文档里）─────────────────────────────
+   *
+   * 消息通道不携带审批结果。用户读完之后仍然要**去那个子会话里作答**，子代理才能拿到
+   * 决定。所以这条通知的作用是「指路」，绝不是「替代同意」——
+   * 文案里明确写了「在你作答之前那次调用保持阻塞，不要绕过」，避免协调者把它读成放行。
+   *
+   * ── 三条硬约束 ───────────────────────────────────────────────────────────────
+   *
+   *   1. **绝不改变返回值**：任何失败都只记日志，调用方仍然退回原路径（fail-closed）；
+   *   2. **不猜**：只有当「直接父会话」正好等于我们要转呈的那个会话时才发 ——
+   *      `sendMessage` 只支持**直接**父/子，多级委派时发不到根，那就干脆不发（记原因）；
+   *   3. **不打扰已取消的请求**：signal 已中止时跳过。
+   *
+   * @param context - 子代理、父会话、工具名、子会话 id 与沿用 signal。
+   * @returns 是否真的发出去了（仅供日志与测试使用，不影响审批结果）。
+   */
+  const notifyRelayFailure = async (context) => {
+    const { agent, parent, toolName, childId, signal, detail } = context
+
+    if (config?.notifyOnRelayFailure === false) {
+      noteNotify('SKIPPED', 'disabled-by-config')
+      return false
+    }
+
+    const subagents = ctx.get('subagents')
+    if (subagents === undefined || subagents === null || typeof subagents.sendMessage !== 'function') {
+      noteNotify('SKIPPED', 'no-subagents-service', 'this deployment composes no message-channel service')
+      return false
+    }
+
+    const parentId = parent?.session?.id ?? parent?.id
+    if (typeof parentId !== 'string' || parentId === '') {
+      noteNotify('SKIPPED', 'no-parent-id')
+      return false
+    }
+
+    // `sendMessage` 只认**直接**父会话。多级委派时（子 → 中间层 → 根）发不到根，
+    // 而发到中间层只会吵醒一个 worker、对用户毫无帮助，所以那种情况直接不发。
+    const immediateParentId = agent?.session?.header?.parentSession
+    if (immediateParentId !== parentId) {
+      noteNotify('SKIPPED', 'not-direct-parent', 'the resolved relaying session is not this subagent\'s direct parent')
+      return false
+    }
+
+    if (signal !== undefined && signal.aborted === true) {
+      noteNotify('SKIPPED', 'signal-aborted')
+      return false
+    }
+
+    const text = [
+      'Multitask approval gate — a decision from you is waiting.',
+      '',
+      `A delegated Subagent (${String(childId).slice(0, 8)}) asked to run "${toolName}", and that request could not be shown in this conversation's composer: the turn that made it is not open right now. The request itself is still pending inside that Subagent's own session.`,
+      '',
+      `  ${childId}`,
+      '',
+      'To decide, open that Subagent\'s session (the Subagents list in this session header, or the id above). The approval prompt with "Allow once" / "Reject" is there.',
+      '',
+      'What it wants to run:',
+      `${detail ?? '(no detail supplied by the asker)'}`,
+      '',
+      'Until you answer it there, that call stays blocked and cannot proceed. Do not retry it or work around it: only your answer releases it.',
+    ].join('\n')
+
+    try {
+      await subagents.sendMessage(agent, parentId, [{ type: 'text', text }], {
+        // ⚠️ `signal` 是**必填**（上游类型就是 `{ readonly signal: AbortSignal }`）。
+        // 沿用原子请求的 signal 是刻意的：那次请求被取消时，这条通知也失去意义。
+        ...signal === undefined ? { signal: new AbortController().signal } : { signal },
+      })
+      noteNotify('SENT', undefined, `the user was told to open "${String(childId)}" and decide there (this notification is NOT an approval)`)
+      return true
+    } catch (error) {
+      // 发不出去不改变任何结果：审批仍然退回原路径（fail-closed）。
+      noteNotify('FAILED', undefined, `could not deliver the fallback notice: ${error instanceof Error ? error.message : String(error)}`)
+      return false
     }
   }
 
@@ -830,12 +977,23 @@ export function apply(ctx, config) {
     ctx.on(
       'approval/request',
       async (request, next) => {
+        // 这几个变量声明在 try **之外**：catch 里的兜底通知要用到它们。
+        // 注意 `relayAttempted` 这个标志 —— 它把「转呈失败」与「这不是本模块的事」
+        // 分开：只有**真的调用过** `approval.request` 之后抛错才算失败，早退路径
+        // （非子代理 / 父会话不是 ask / 服务缺失）绝不该发通知。
+        let agent
+        let parent
+        let toolName = 'unknown'
+        let childId = 'unknown'
+        let original
+        let relayAttempted = false
+
         try {
-          const agent = request?.agent
+          agent = request?.agent
           if (!isDelegatedChild(agent)) return await next()
 
           // 一次走到根：多级委派时不逐级转呈（少一处递归就少一处出错点）。
-          const parent = rootAncestorOf(ctx, agent)
+          parent = rootAncestorOf(ctx, agent)
           if (parent === undefined || parent === agent) return await next()
           if (effectivePolicyOf(ctx, parent.session) !== 'ask') return await next()
 
@@ -844,13 +1002,14 @@ export function apply(ctx, config) {
             return await next()
           }
 
-          const childId = agent?.session?.id ?? agent?.id ?? 'unknown'
-          const toolName = typeof request.toolName === 'string' && request.toolName !== '' ? request.toolName : 'unknown'
-          const original = typeof request.reason === 'string' && request.reason !== '' ? request.reason : undefined
+          childId = agent?.session?.id ?? agent?.id ?? 'unknown'
+          toolName = typeof request.toolName === 'string' && request.toolName !== '' ? request.toolName : 'unknown'
+          original = typeof request.reason === 'string' && request.reason !== '' ? request.reason : undefined
           const attribution = `a delegated Subagent (${String(childId).slice(0, 8)})`
 
           // 向父会话发起一次**新的**审批请求。它会走完整条链路（含上游的转发者），
           // 于是由 `ui-approval` 在主对话里渲染成面板 —— 这正是本模块要的效果。
+          relayAttempted = true
           const outcome = await approval.request({
             agent: parent,
             toolName,
@@ -882,6 +1041,22 @@ export function apply(ctx, config) {
             )
           } catch {
             // 同上。
+          }
+
+          // ── 兜底：告诉用户「有个决定在等你、要打开哪个子会话去作答」─────────────
+          //
+          // 只在**真的尝试过转呈之后**失败时才发：早退路径（上面那些 `return await next()`）
+          // 表示「这不是本模块的事」，那时发通知就是纯粹的噪音。
+          //
+          // ⚠️⚠️ 顺序是**先发通知、再 await 下游**，这不是风格问题：
+          // 转呈失败最常见的后续是「下游把请求发给浏览器、客户端为那个不可见的子会话
+          // 物化作用域并**接住**它」—— 那次 await **永远不返回**（审批路径没有任何超时）。
+          // 若把通知放在 `await next()` 之后，**恰好在最需要它的场景里它永远发不出去**。
+          //
+          // 所以：通知在 await 之前**启动**（`void` —— 不等它，一次 RTT 都不欠），
+          // 而返回值仍然是下游的结果 —— 通知绝不参与审批决定。
+          if (relayAttempted) {
+            void notifyRelayFailure({ agent, parent, toolName, childId, signal: request?.signal, detail: original })
           }
           return await next()
         }

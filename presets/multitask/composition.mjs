@@ -48,15 +48,22 @@
  * 加上原有的 `subagent`（完整工具面，标准）与 `subagent_fork`（继承上下文续作），
  * 协调者现在共有 **4 条委派路径**；按任务类型挑 worker 是本次新增的能力。
  *
- * ── 为什么两条新行都必须 `backgroundMode: 'continuable'` ─────────────────────
+ * ── 为什么两条新行都保持 `backgroundMode: 'continuable'` ─────────────────────
  *
- * `dsh-subagent` 的 `snapshotSubagentDescriptor()` 只在 **continuable 分支**里才把
- * `persona` 与 `toolFilter` 写进 `subagent/descriptor` 事件；one-shot 分支只留
- * `version` / `mode` / `provider` / `label`。
+ * ⚠️ 这个理由**已经换了**，别照旧读：早期版本说「只有 continuable 才读得到模式标记」，
+ * 那**不再成立** —— `subagent-mode.mjs` / `minimal-guard.mjs` 现在以子代理自己的
+ * `deployment:persona-prefix` 段落为主来源，那条**两条派单路径都有**。
+ * （实测缘由：`snapshotSubagentDescriptor()` 对 one-shot 只留
+ * `version`/`mode`/`provider`/`label`，persona 被丢掉；旧实现只读它，
+ * 于是**前台派单时两个守卫整体失效** —— 见 README「模式标记是怎么被读到的」。）
  *
- * 而 `subagent-mode.mjs` 正是靠 descriptor 里的 persona 标记来识别「这个子代理
- * 来自哪一行」—— 所以 one-shot 行上这件事**做不了**（不是配置问题，是快照里
- * 根本没有那个字段）。两条新行因此都是 continuable。
+ * 现在保持 continuable 的是**另一个**理由：审批闸门的兜底通知
+ * （`subagents.sendMessage`）**只对 continuable 子级有效**。前台派单时父会话
+ * 本来就有打开的回合、弹窗走得通；而后台派单时回合会关，转呈失败只能走那条
+ * 消息兜底 —— 若这里改成 one-shot，那条兜底会直接发不出去
+ * （`sendMessage` 对非续接子级拒绝），用户就再也看不到「有决定在等你」。
+ *
+ * 一句话：**continuable 是审批兜底的要求，不是模式标记的要求。**
  *
  * ── 怎么关掉 ─────────────────────────────────────────────────────────────────
  *
@@ -171,11 +178,10 @@ Two limits bound the shape of a fan-out. Plan the scale of a delegation accordin
 
 - **Delegation is one level deep only.** A worker cannot delegate further: it may SEE the delegation tools in its catalog, but every call is refused, verbatim \`Error: subagent depth 2 exceeds maxDepth 1\`. So never brief a worker to "split this up and hand the pieces to other subagents" — that step will fail. If a job needs to be split, YOU split it and fire the pieces flat, in one round, yourself.
 
-- **Concurrency is capped in both directions.** These are two distinct kinds of refusal, do not conflate them:
-  - **A capacity limit** from the host: at most 8 active subagents by default. Exceeding it is refused verbatim \`Error: subagent limit reached (active child limit: 8); wait for an existing child to finish or complete this work with the current agents\`. Keep a single parallel fan-out at or below that number.
-  - **A policy limit** this mode may impose: an optional, LOWER ceiling of its own (\`multitask.maxActiveSubagents\`; unset by default, so it only bites when the user has set one). It refuses with its own message in Chinese, telling you to collect results with \`list_agents\` / \`job_output\` first and either wait for the existing subagents to end or fold several tasks into one brief.
-
-  Both are refusals BEFORE anything starts: nothing has been spawned, and you get a plain error rather than a subagent id. Either message means the same thing operationally — **wait for existing subagents to finish, or merge several tasks into one brief** — and neither is a silent failure, so never read one as "the delegation is broken" and never retry the same fan-out unchanged.
+- **Concurrency is capped by the deployment, and only by the deployment.** There is exactly ONE limit — the host's \`subagent.maxActiveSubagents\` — and the user configures it in Settings (it appears in both "Settings → Multitask" and "Settings → General"; they are the same single value). This mode adds no cap of its own.
+  - The number is whatever the user set; the deployment's default is 8. Exceeding it is refused verbatim \`Error: subagent limit reached (active child limit: <N>); wait for an existing child to finish or complete this work with the current agents\` — read \`<N>\` from the message rather than assuming 8, and keep a single parallel fan-out at or below that number.
+  - It counts **every live Subagent under one main Agent**, not just the ones you started in the same round: a worker that finished its brief but is still alive occupies a slot.
+  - The refusal happens BEFORE anything starts: nothing has been spawned, and you get a plain error rather than a subagent id. It is not a silent failure — so never read it as "the delegation is broken" and never retry the same fan-out unchanged. Instead **wait for existing subagents to finish, or merge several tasks into one brief**.
 
 ## When a worker's shell is refused (Windows)
 
@@ -186,9 +192,11 @@ A Windows worker may be unable to run shell commands AT ALL — not because of y
 Read it correctly before reacting:
 
 - It is **not** the concurrency limit and **not** a bad command. It reproduces with a SINGLE active subagent, with any command (even \`Get-Location\`), and from any working directory — pointing the command's workdir at the system temp directory still names the same session path, not that directory.
-- The cause sits at host startup, not in your brief: DSH writes a security descriptor onto the session's writable root directories once, as the process starts, before any command runs. So every command in every worker fails identically, and re-briefing cannot change it.
+- **The cause is a directory-permission precondition on the workspace folder itself, and it is fixable.** DSH's ACL sandbox has to write a security descriptor onto the session's writable root — one call that writes both the workspace grant and a mandatory integrity label. The label lives in the SACL, so that call additionally needs **WRITE_OWNER**, which the owner's implicit rights do NOT cover (they cover only READ_CONTROL and WRITE_DAC). A folder that grants the user only *Modify* therefore lacks it, and the call fails with Win32 5. This is why a workspace under your user profile works with no setup (it inherits Full control) while a folder created directly under a drive root (inheriting only Modify) does not.
+- **Multitask fixes this automatically at session start — it adds WRITE_OWNER and nothing else.** Do not ask the user for permission to repair it, do not wait for an approval, and do not run any permission command yourself: it is already handled before your first command, one process per workspace. Never widen a folder to *Full control* for this — WRITE_OWNER alone is what the sandbox needs, and Full control would hand over the right to change permissions and take ownership too.
+- If a worker still reports this refusal, the automatic fix did not apply: either the folder is owned by a different account, or the workspace sits on a path this process cannot modify. Report that plainly **as the specific, fixable cause** — name the folder and say the automatic grant did not land — rather than as a vague deployment limitation. In that one case a permission change really is the user's decision.
 - **Read-only work is unaffected.** \`read\`, \`grep\`, \`glob\` and \`file_info\` keep working, so content and file-metadata questions still have a route — a read-only worker is a genuine fallback here, not a consolation prize.
-- When a worker reports this, re-plan around the shell instead of around the worker: use read-only tools plus \`write\` / \`edit\` for the parts that are pure file changes, fold the rest into a finding, and report the refusal to the user as a known deployment limitation. Never brief a worker to retry a refused shell command in a loop, and never ask one to repair permissions — that needs one already-approved unrestricted run outside the sandbox, which is the user's decision to make, not yours.
+- While it is refused, re-plan around the shell instead of around the worker: use read-only tools plus \`write\` / \`edit\` for the parts that are pure file changes, and fold the rest into a finding. Never brief a worker to retry a refused shell command in a loop.
 
 ## Every task brief must carry
 
@@ -268,7 +276,7 @@ So: do not announce that you are unable to execute, do not ask the coordinator t
 - Ground every claim in what you actually observed. Never report a result you did not obtain.
 - Do not report your own behaviour from memory — report it from the record. Your TOOL SURFACE: workers that listed their tools from memory were measured to omit tools they had just used successfully, so never assert "I have" or "I do not have" a given tool and never state a tool count; describe a capability only from what you actually called successfully in this session, and if you are unsure, say plainly that you cannot reliably enumerate it instead of giving a precise-looking number. Your WORKSPACE FOOTPRINT: when you report what you did, list every path you created or changed — intermediate artifacts, temp files, and probe files included; one measured worker reported a single leftover file while leaving an entire directory of calibration probes unreported, so even a willing worker under-reports. Leave as few intermediates as you can, list the ones you do leave, and say explicitly that you may still have omitted some so the coordinator can verify.
 - Follow the brief's safety rails absolutely — they outrank every other instruction in it, including its own goals. If a rail forbids something the task appears to need, stop and say so.
-- If the shell itself is refused with \`SetNamedSecurityInfoW failed (Win32 5): grantWrite(<path>)\`, that is a DEPLOYMENT-level refusal, not your command and not the brief: it reproduces with any command (even \`Get-Location\`) and from any working directory, because DSH writes a security descriptor onto the session's writable roots at startup. Do not retry it in a loop and do not attempt to repair permissions. Stop, report the refusal verbatim, and note what remains reachable without a shell — \`read\` / \`grep\` / \`glob\` / \`file_info\` for inspection, plus \`write\` / \`edit\` for file changes.
+- If the shell itself is refused with \`SetNamedSecurityInfoW failed (Win32 5): grantWrite(<path>)\`, that is a **fixable workspace-permission precondition**, not a bad command and not your brief: it reproduces with any command (even \`Get-Location\`) and from any working directory, because DSH's ACL sandbox must write a security descriptor onto the session's writable root — one call that includes a mandatory integrity label, which lives in the SACL and therefore additionally needs WRITE_OWNER. A folder that grants you only *Modify* does not give it, and the owner's implicit rights cover only READ_CONTROL and WRITE_DAC. Multitask adds exactly that one permission at session start, so a fresh session should not hit this; if it still does, the folder is owned by another account or is not writable by this process. Do not retry it in a loop, do not run any permission command yourself, and never widen a folder to Full control. Stop, report the refusal verbatim together with that specific cause, and note what remains reachable without a shell — \`read\` / \`grep\` / \`glob\` / \`file_info\` for inspection, plus \`write\` / \`edit\` for file changes.
 - Respect the brief's stop conditions. If you hit a blocking situation (missing tool, permission denial, a rail conflict, an unexpected state), STOP and report it verbatim instead of improvising a workaround or guessing.
 - Do not delegate further; you cannot, and you should not try.
 - Prefer verifying over assuming. If you can check something cheaply, check it.
@@ -350,7 +358,7 @@ So: do not announce that you are unable to execute, do not ask the coordinator t
 - Ground every claim in what you actually observed. Never report a result you did not obtain.
 - Do not report your own behaviour from memory — report it from the record. Your TOOL SURFACE: workers that listed their tools from memory were measured to omit tools they had just used successfully, so never assert "I have" or "I do not have" a given tool and never state a tool count; describe a capability only from what you actually called successfully in this session, and if you are unsure, say plainly that you cannot reliably enumerate it instead of giving a precise-looking number. Your WORKSPACE FOOTPRINT: when you report what you did, list every path you created or changed — intermediate artifacts, temp files, and probe files included; one measured worker reported a single leftover file while leaving an entire directory of calibration probes unreported, so even a willing worker under-reports. Leave as few intermediates as you can, list the ones you do leave, and say explicitly that you may still have omitted some so the coordinator can verify.
 - Follow the brief's safety rails absolutely — they outrank every other instruction in it, including its own goals. If a rail forbids something the task appears to need, stop and say so.
-- If the shell itself is refused with \`SetNamedSecurityInfoW failed (Win32 5): grantWrite(<path>)\`, that is a DEPLOYMENT-level refusal, not your command and not the brief: it reproduces with any command (even \`Get-Location\`) and from any working directory, because DSH writes a security descriptor onto the session's writable roots at startup. Do not retry it in a loop and do not attempt to repair permissions. Stop, report the refusal verbatim, and note what remains reachable without a shell — \`read\` / \`grep\` / \`glob\` / \`file_info\` for inspection, plus \`write\` / \`edit\` for file changes.
+- If the shell itself is refused with \`SetNamedSecurityInfoW failed (Win32 5): grantWrite(<path>)\`, that is a **fixable workspace-permission precondition**, not a bad command and not your brief: it reproduces with any command (even \`Get-Location\`) and from any working directory, because DSH's ACL sandbox must write a security descriptor onto the session's writable root — one call that includes a mandatory integrity label, which lives in the SACL and therefore additionally needs WRITE_OWNER. A folder that grants you only *Modify* does not give it, and the owner's implicit rights cover only READ_CONTROL and WRITE_DAC. Multitask adds exactly that one permission at session start, so a fresh session should not hit this; if it still does, the folder is owned by another account or is not writable by this process. Do not retry it in a loop, do not run any permission command yourself, and never widen a folder to Full control. Stop, report the refusal verbatim together with that specific cause, and note what remains reachable without a shell — \`read\` / \`grep\` / \`glob\` / \`file_info\` for inspection, plus \`write\` / \`edit\` for file changes.
 - Respect the brief's stop conditions. If you hit a blocking situation (missing tool, permission denial, a rail conflict, an unexpected state), STOP and report it verbatim instead of improvising a workaround or guessing.
 - Do not delegate further; you cannot, and you should not try.
 - Prefer verifying over assuming. If you can check something cheaply, check it.
@@ -447,7 +455,7 @@ Your tool surface has been DELIBERATELY collapsed: \`run_code\` is the only tool
 - Calling any tool other than \`run_code\` directly fails with \`UNKNOWN_TOOL\`. When a call is denied that way, the fix is to move the call inside your program — do not retry it natively, and do not conclude the deployment is broken.
 - Ground every claim in what you actually observed. Never report a result you did not obtain.
 - Do not report your own behaviour from memory — report it from the record. Your TOOL SURFACE: workers that listed their tools from memory were measured to omit tools they had just used successfully, so never assert "I have" or "I do not have" a given tool and never state a tool count; describe a capability only from what you actually called successfully in this session, and if you are unsure, say plainly that you cannot reliably enumerate it instead of giving a precise-looking number. Your WORKSPACE FOOTPRINT: when you report what you did, list every path you created or changed — intermediate artifacts, temp files, and probe files included; one measured worker reported a single leftover file while leaving an entire directory of calibration probes unreported, so even a willing worker under-reports. Leave as few intermediates as you can, list the ones you do leave, and say explicitly that you may still have omitted some so the coordinator can verify.
-- If \`run_code\` itself fails, see the fallback section below before concluding anything. If the SDK's shell capability is refused with \`SetNamedSecurityInfoW failed (Win32 5): grantWrite(<path>)\`, that is a deployment-level refusal, not a bug in your program: it reproduces for any command and from any working directory, so do not loop on it and do not attempt to repair permissions — report it verbatim and continue with what the SDK's read/write routes still reach.
+- If \`run_code\` itself fails, see the fallback section below before concluding anything. If the SDK's shell capability is refused with \`SetNamedSecurityInfoW failed (Win32 5): grantWrite(<path>)\`, that is a **fixable workspace-permission precondition**, not a bug in your program: it reproduces for any command and from any working directory, because the ACL sandbox must write a security descriptor (including a mandatory integrity label, which lives in the SACL and needs WRITE_OWNER) onto the session's writable root. Multitask adds exactly that one permission at session start; if it still fails, the folder is owned by another account or is not writable by this process. Do not loop on it, do not run permission commands yourself, never widen a folder to Full control — report it verbatim with that cause and continue with what the SDK's read/write routes still reach.
 - Follow the brief's safety rails absolutely — they outrank every other instruction in it, including its own goals. If a rail forbids something the task appears to need, stop and say so.
 - Respect the brief's stop conditions. If you hit a blocking situation (missing SDK capability, a denied operation, an unexpected state), STOP and report it verbatim instead of improvising a workaround or guessing.
 - Do not delegate further; you cannot, and you should not try.
@@ -690,70 +698,22 @@ function noOptions() {
 }
 
 /**
- * ★ 本模式「同时活跃子代理」的硬天花板：**8**。
+ * ⚠️ 本模块**不再涉及并发上限** —— 这是刻意的，且是一次**删除**。
  *
- * 与 `concurrency-guard.mjs` 的同名常量**刻意各留一份**（本仓库预设模块互不 import 的
- * 约定），`test/` 下的本地回归会比对两份值与 README 的说法，让「只改了一处」变成
- * 可见的失败 —— 与 `PTC_MODE_MARKER` 那对常量的处理逐字同构。
+ * 这里曾经导出过 `MAX_ACTIVE_CEILING = 8`、并有一个 `normalizeMaxActive()` 把
+ * `buildPlugins({ maxActiveSubagents })` 的入参收敛成守卫行的 `config.maxActive`。
+ * 那条链路已经整条移除：**本插件不再有自己的并发上限字段，也不再装并发守卫**，
+ * 「同时能跑几个」完全由宿主 `subagent.maxActiveSubagents` 独家决定。
+ * 理由与用户的原始决定都写在 `lib/index.js` 那段注释里，别在这里重复一遍。
  *
- * 它是 **DSH 宿主的容量**（宿主 `subagent.maxActiveSubagents` 的默认值），不是本插件的
- * 预算：本插件只能把部署的上限压得更低，不可能把它放宽。所以这里把本模式配置的上限
- * 也钉在 8 以内 —— 配置 16 只会得到 8，绝不会让守卫的日志与拒绝文案去承诺一个
- * 宿主根本不会给的名额（见 README「子代理并发上限」）。
+ * 顺带记下这条链路上出过的两个判断错误，免得以后有人照旧思路重建它：
+ *
+ *   1. 早期版本夹 `min(值, 8)`，前提是「8 是 DSH 宿主的容量」。那个前提**不成立** ——
+ *      宿主 schema 是 `.min(1).max(Number.MAX_SAFE_INTEGER).default(8)`，8 只是默认值。
+ *   2. 去掉夹子之后，本以为「用户设多少就是多少」，但**实际不是**：宿主那道同名上限
+ *      始终同时生效，而它自己那个字段只决定本插件的守卫要不要装。于是「本模式设不限制」
+ *      的用户依然被宿主的默认 8 卡住 —— 面板在撒谎。**这正是整条链路被删掉的原因。**
  */
-export const MAX_ACTIVE_CEILING = 8
-
-/**
- * 把宿主传进来的「子代理并发上限」收敛成 `config.maxActive` 唯一允许的两种形状。
- *
- * ── 这里的收敛**不是**冗余的，它与宿主半那一份分工不同 ────────────────────────
- *
- * `lib/index.js` 的 `readMaxActive()` 做的是「读 host config 里的 volatile 快照」，
- * 本函数做的是「把 `buildPlugins()` 的入参收敛成守卫行能吃的形状」。两者可能被
- * **不同的调用方**驱动：静态那个调用点（`definition.plugins` 里的无参
- * `buildPlugins()`，见文件上方）根本不经过宿主半，测试与别处的探针也直接调用本函数。
- * 所以守卫行的 `config` 必须在**这里**就保证合法 —— 不能指望上游一定清洗过。
- *
- * ── ★ 合法值也要夹天花板：`min(值, MAX_ACTIVE_CEILING)`────────────────────────
- *
- * 超过 8 的配置一律收敛成 8（理由见 `MAX_ACTIVE_CEILING` 与 README）。守卫模块自己
- * 也会再夹一次（那道防线要挡「绕过本函数的调用方」），这里夹是为了让**行 config
- * 本身**就不出现一个做不到的数字。
- *
- * ── 返回值是 `undefined` 时**不是**「传一个 undefined 进去」────────────────────
- *
- * 调用方用 `...(max !== undefined ? { maxActive: max } : noOptions())` 那种条件展开
- * 来避免产生 `maxActive: undefined` 这个键。这一点是硬约束，与 `workerAgentOptions`
- * 对 `agentOptions` 的取向**逐字同构**：守卫模块的判据是
- * `config.maxActive === undefined ⇒ 不注册任何监听器`，而「键在场但值为 undefined」
- * 与「键缺席」在这个判据下恰好同解 —— 但**只有**在守卫模块自己用 `=== undefined`
- * 判、而不是用 `'maxActive' in config` 判时才成立。为了不把这条契约押在两个文件
- * 恰好写法一致上，这里统一**不产生这个键**。
- *
- * ── ⚠️ 只有 `undefined` 算「没给」，`null` **不算** ──────────────────────────
- *
- * 契约里 `null` 被明确列在**非法值**那一侧（与 `0` / `-1` / `NaN` / 字符串同列），
- * 所以它必须夹到 `1`，绝不能当成「不限制」。这不是咬文嚼字：把非法值当不限制会比
- * 用户意图**更宽松**，而「上限是 1」虽然难看但安全、且立刻可见。
- * 宿主半从不传 `null`（它只传 `undefined` 或一个合法数字），所以这条只在
- * **别处的调用方**（手写 YAML、探针、别的 composer）直接调用本函数时才咬人 ——
- * 那正是要防的情形。
- *
- * ⚠️ 超过 8 的合法值同样**不是**原样采用：结果是 `min(值, MAX_ACTIVE_CEILING)`。
- * 这与「非法值夹到 1」是**两个不同方向**的收敛（一个防手抖，一个防过剩），
- * 别把它们读成同一条。
- *
- * @param maxActiveSubagents - 宿主/调用方给的上限，可为空。
- * @returns 安全整数 `>= 1` 且 `<= MAX_ACTIVE_CEILING`（8），或 `undefined`（不限制）。
- */
-function normalizeMaxActive(maxActiveSubagents) {
-  if (maxActiveSubagents === undefined) return undefined
-  // 非安全整数 / NaN / Infinity / null / 字符串 / 布尔 / 对象 ⇒ 一律夹到 1。
-  // 方向与宿主半 `normalizeMaxActive` **刻意相同**：绝不把它当成「不限制」。
-  if (!Number.isSafeInteger(maxActiveSubagents) || maxActiveSubagents < 1) return 1
-  // ★ 天花板：DSH 宿主的容量就是 8，配置更高只会得到一个拿不到的名额。
-  return Math.min(maxActiveSubagents, MAX_ACTIVE_CEILING)
-}
 
 /**
  * 组装 preset 的行列表。
@@ -768,29 +728,12 @@ function normalizeMaxActive(maxActiveSubagents) {
  * 这一点是硬约束 —— 本地回归（`test/repo-consistency.mjs` 与既有的 13 条隔离用例）里，
  * 大量断言都是无参调用本函数。
  *
- * ── 关于可选的 `maxActiveSubagents`（本模式的子代理并发上限）─────────────────
- *
- * 同样的硬约束：不传 / 传 `undefined` 时，守卫行**不带 `config.maxActive`
- * 这个键**，于是 `concurrency-guard.mjs` 立即返回、一个监听器都不注册 ——
- * 与「本功能加入之前」行为上无法区分（零开销、零干预）。
- *
- * ⚠️ 但**非法值不是「不传」**：`0` / `-1` / `NaN` / `'4'` / **`null`** 等一律收敛成 `1`，
- * 也就是「限制到最多 1 个并发」。把非法值当成不限制会比用户意图更宽松，见
- * `normalizeMaxActive` 的注释。
- *
- * ⚠️ **大于 8 的合法值也会被夹**：收敛结果是 `min(值, MAX_ACTIVE_CEILING)`，
- * 也就是最多 8。理由见 `MAX_ACTIVE_CEILING`：8 是宿主容量，写更高只是一个
- * 拿不到的名额。
- *
  * @param options - 可选的注入项。
  * @param options.modelMap - `类型键 -> { provider, model, reasoningEffort? }`。
- * @param options.maxActiveSubagents - 本模式的子代理并发上限（安全整数
- *   `>= 1`，超过 8 按 8 算）。
  * @returns 供 preset 注册表挂载的插件行数组。
  */
 export function buildPlugins(options) {
   const modelMap = normalizeModelMap(options?.modelMap)
-  const maxActive = normalizeMaxActive(options?.maxActiveSubagents)
   return [
     // ── 身份：协调者人格 + Multitask 工作纪律 ─────────────────────────────────
     {
@@ -890,9 +833,14 @@ export function buildPlugins(options) {
         //   这正是 Cursor 那份记录里「并行下发」的机制基础。
         // - `maxDepth: 1`：只允许「协调者 → worker」两层，worker 不能再往下派，
         //   避免任务无限扩散、也避免上下文层级失控。
-        // - `modelSelectionSettings: true`：公开 provider/model/reasoning_effort
-        //   三个可选字段 + `list_subagent_models`。默认继承协调者同模型，
-        //   但**允许手动指定** —— 按需求不做自动选型。
+        // - **刻意不设 `modelSelectionSettings`**：那个开关会公开
+        //   `provider` / `model` / `reasoning_effort` 三个字段与 `list_subagent_models`，
+        //   让**协调者自己**在某次委派里临时指定模型。本模式不要这个能力 ——
+        //   子代理用哪个模型**由用户在设置面板里按 worker 类型决定**（见下面
+        //   `workerAgentOptions`），不由 AI 在会话里即兴指派。
+        //   ⚠️ 两者是**不同的机制**，别混：`workerAgentOptions` 是用户配置被翻译成
+        //   该行的 `agentOptions`（一个固定值）；`modelSelectionSettings` 是让模型
+        //   在每次调用时填参数。
         // - `persona`：**必须**。子代理加入父级同一份 preset，默认会继承协调者人格
         //   （「你不能改文件、不能跑命令」）—— 而它恰恰要干这些事。
         //   见 WORKER_PERSONA 的注释：这在实测中已导致 worker 自述受限。
@@ -902,7 +850,6 @@ export function buildPlugins(options) {
           config: {
             provider: 'spawn',
             toolName: 'subagent',
-            modelSelectionSettings: true,
             backgroundMode: 'continuable',
             maxDepth: 1,
             persona: WORKER_PERSONA,
@@ -967,15 +914,14 @@ export function buildPlugins(options) {
           // 于是「这一行是 PTC 模式」这件事只由 persona 里的标记表达，交给
           // `subagent-mode.mjs` 在 `agent/created` 时读取并应用呈现。
           //
-          // `modelSelectionSettings` 与主行保持一致：既然要按任务挑 worker，
-          // 也该能顺手为它挑模型（见 README「子代理模型」）。
+          // ⚠️ **不设 `modelSelectionSettings`**（与主行一致）：子代理的模型由用户
+          // 在设置面板里按类型决定，不由协调者在会话里临时指派。见主行那段注释。
           {
             id: 'tool-subagent-ptc',
             name: '@deepseek-ai/dsh-tool-subagent',
             config: {
               provider: 'spawn',
               toolName: 'subagent_ptc',
-              modelSelectionSettings: true,
               backgroundMode: 'continuable',
               maxDepth: 1,
               persona: PTC_WORKER_PERSONA,
@@ -1003,7 +949,12 @@ export function buildPlugins(options) {
             config: {
               provider: 'spawn',
               toolName: 'subagent_minimal',
-              modelSelectionSettings: true,
+              // ⚠️ **不设 `modelSelectionSettings`**（与其余三行一致）。它还有一个
+              // 副作用值得记下：那个开关会让本工具改为**逐 agent 单独安装**（注册到
+              // 子代理自己的 scope 上），而 `tools.restrict()` 只认**继承面**的名字 ——
+              // 于是该工具**结构上不可收窄**，会留在只读 worker 的目录里（实测过：
+              // minimal 的清单因此多出 3 个委派工具）。不设它，工具回到全局注册，
+              // 那条泄漏的**成因**即消失。
               backgroundMode: 'continuable',
               maxDepth: 1,
               persona: MINIMAL_WORKER_PERSONA,
@@ -1043,55 +994,32 @@ export function buildPlugins(options) {
         { id: 'tool-workflow', name: '@deepseek-ai/dsh-tool-workflow' },
         { id: 'tool-ralph', name: '@deepseek-ai/dsh-tool-ralph', disabled: true },
 
-        // ── ★ 子代理并发节流器（本模式的「软上限」）────────────────────────────
+        // ── ★ 并发上限：**本模式不装任何守卫**，完全交给宿主 ──────────────────────
         //
-        // 只做一件事：给**协调者自己**的 agent scope 装一条 `tools.guard()`，
-        // 在它并发派活超过本模式的上限时**拒绝该次委派**（返回一条中文理由）。
-        // 上限由宿主的 `multitask.maxActiveSubagents` 经 `buildPlugins()` 传进来。
+        // 这里曾经有一行 `concurrency-guard`（给协调者的 agent scope 装一条
+        // `tools.guard()`，超过本模式自己的上限时拒绝委派）。它连同
+        // `multitask.maxActiveSubagents` 那个字段一起被**删除**了，原因见
+        // `lib/index.js` 里那段注释，简述：那个字段**是假的** —— 它只决定本插件
+        // 自己的守卫要不要装，而真正决定「同时能跑几个」的是**宿主**
+        // `subagent.maxActiveSubagents`；两套账用不同口径执行同一个数字，于是
+        // 「本模式设不限制」的用户依然被宿主那层卡住。
         //
-        // ⚠️ 它是**软上限**，不是安全边界：`workflow` 那条路径由工作流引擎直连
-        // `ctx.subagents.start()` 起子代理，**绕过工具层**，因此拦不住它
-        // （详见 `concurrency-guard.mjs` 文件头，那里有实证行号）。不要把这一行
-        // 读成「子代理数量绝不会超过 N」的保证。
+        // 用户的决定：「就不需要额外新增一个字段来单独管理 Multitask 的并发子代理上限。
+        // 都统一使用宿主层限制的子代理数。」所以现在**只有一个执行点**，就是宿主。
         //
-        // ── 为什么这一行放在 delegation 组里 ─────────────────────────────────────
+        // 顺带记下这一删换来的两个好处：
         //
-        // 它管的就是这个组里的工具：组内 `tool-subagent*` 那几行注册的委派工具，
-        // 正是它要拦的对象；而上限值也是给**这几条**路径用的。放进同一个组，
-        // 「Multitask 有哪几条委派路径、它们是否被节流」在这一个地方就能读完。
+        //   1. **覆盖更完整**：宿主的名额是在 `ActivationPool.reserve()` 里发的，
+        //      连 `workflow` 由工作流引擎**直连** `ctx.subagents.start()` 起的子代理
+        //      也受它管 —— 而工具层守卫**拦不到**那条路径（它是本模块原先公开承认的
+        //      一个缺口）。
+        //   2. **不会提前拒绝**：守卫的计数口径与宿主不同（它把一次性子代理也算进去、
+        //      释放时机也更早），所以两套同时生效时，谁先拒绝取决于运行时细节 ——
+        //      那会让「面板上写 30」这个承诺变得不可预测。
         //
-        // **时机不依赖行的顺序**：它在 `agent/created` 窗口给协调者装守卫，
-        // 在 `tools/result` / `agent/disposed` 窗口结算与释放，与组内别的行互不相干。
-        //
-        // 用与 `subagent-mode` / `minimal-guard` / `coordinator-guard` 相同的
-        // `local()` 手法引用（那里解释了为什么必须 `file://` 绝对 URL、以及为什么
-        // 必须把本文件的 `?v=N` query 传播下去：相对名会被解析到 profile 根，
-        // 且不传播 query 时改了本文件也只会从 ESM 旧缓存取回旧模块、不报错也不生效）。
-        //
-        // ── `config.maxActive` 键的在场与否就是全部开关 ──────────────────────────
-        //
-        //   · 键**缺席** ⇒ 守卫模块立即返回、**一个监听器都不注册** ——
-        //     与「本功能加入之前」行为上无法区分（这是用户没设过时限的情形）；
-        //   · 键在场且是安全整数 `>= 1` ⇒ 节流生效，且生效值 = `min(值, 8)`。
-        //
-        // ⚠️ 非法值（`0` / `-1` / `NaN` / 字符串…）**不会**走到「缺席」那一支：
-        // `normalizeMaxActive` 已把它们收敛成 `1`（＝限制到最多 1 个并发）。
-        // 把非法值当成不限制会比用户意图更宽松，见该函数的注释。
-        //
-        // ⚠️ 上界是 **8**，不是「用户填几就是几」：8 是 DSH 宿主的容量
-        // （宿主 `subagent.maxActiveSubagents` 的默认值），填 16 也只会得到 8。
-        // 见 `MAX_ACTIVE_CEILING` 与 README「子代理并发上限」。
-        //
-        // ⚠️ 这里用条件展开而不是写 `maxActive: undefined`：不产生这个键，
-        // 与 `workerAgentOptions` 对 `agentOptions` 的取向逐字同构（理由见那里）。
-        {
-          id: 'concurrency-guard',
-          name: local('./concurrency-guard.mjs'),
-          config: {
-            enabled: true,
-            ...(maxActive !== undefined ? { maxActive } : noOptions()),
-          },
-        },
+        // 设置面板里**两处 UI**（「设置 → Multitask」与「设置 → 通用设置」）现在编辑
+        // **同一个字段**（宿主 `subagent` 命名空间的 `maxActiveSubagents`），所以
+        // 改一处另一处立刻跟着变 —— 这正是需求要的效果。
       ],
     },
 
@@ -1277,6 +1205,48 @@ export function buildPlugins(options) {
         presetId: PRESET_ID,
         keep: MULTI_MODE_ENABLED ? ['subagent_ptc', 'subagent_minimal'] : [],
       },
+    },
+
+    // ── ★ 工作区 ACL：让子代理的 shell 在新工作区里开箱即用 ──────────────────
+    //
+    // 只做一件事：会话开始时，检查该会话的工作区目录是否具备 DSH ACL 沙箱所需的
+    // `WRITE_OWNER`；缺了就**只补这一项**（非继承的 `TakeOwnership`），然后停止。
+    //
+    // ── 为什么需要它（以及为什么它必须在这里，而不是靠用户手工修）─────────────
+    //
+    // Windows 上，沙箱给工作区授权时**一次**调用同时写三样东西：能力 SID 的允许 ACE、
+    // Everyone 的 delete-child 拒绝、以及 **Low 完整性标签**。标签住在 SACL 里，
+    // 所以那次调用额外需要 `WRITE_OWNER`，而所有者的隐式权限**只覆盖
+    // `READ_CONTROL` 与 `WRITE_DAC`** —— 于是一个只给自己授了 Modify 的目录
+    // 会让整次调用失败，表现就是子代理的**每一条命令**都报：
+    //
+    //     Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(<工作区>)
+    //
+    // `H:\` 根只给 `Authenticated Users:(M)`，所以在 H 盘下新建的目录**天生**带这个
+    // 缺陷；而用户目录给的是可继承的 `(F)`，其下新建目录天然满足 —— 这解释了
+    // 「同一个插件，某些工作区正常、某些全废」这个实测现象。
+    //
+    // ── 为什么只补 `WRITE_OWNER`（本机实验已定论）─────────────────────────────
+    //
+    //   · Modify-only 目录执行「写完整性标签」⇒ `exit 5`（= 宿主报的 Win32 5）；
+    //   · 只加一条**非继承** `WRITE_OWNER` 之后，同一动作 ⇒ `exit 0`。
+    //
+    // **绝不授 `FullControl`**：那还包含「改权限 + 夺所有权」，远超所需。
+    // （宿主自带的 `diagnose-windows-sandbox-acl` 技能授的正是 FullControl；
+    //  本模块刻意比它克制。）而且 `WRITE_OWNER` 是**所有者给自己的** ——
+    // 目录所有者本来就能随时夺回所有权，所以这条 ACE 不扩大任何人的实际权力。
+    //
+    // ── 与其余守卫的关系 ─────────────────────────────────────────────────────
+    //
+    // 它只碰**工作区目录的 ACL**，与工具面 / 呈现模式 / 审批策略无关，所以单开一行。
+    // 失败取向是「绝不阻塞会话」：最坏退回今天的行为（shell 起不来），而那**不是**
+    // 本模块引入的问题。可关：`config.autoGrantWriteOwner: false`。
+    //
+    // 用与其余行相同的 `local()` 手法引用，理由见该函数上方注释。
+    {
+      id: 'workspace-acl',
+      name: local('./workspace-acl.mjs'),
+      config: { enabled: true },
     },
   ]
 }

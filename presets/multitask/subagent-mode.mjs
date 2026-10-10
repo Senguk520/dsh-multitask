@@ -25,7 +25,7 @@
  *
  * 所以 `subagent_ptc` 那一行**刻意不配 `toolFilter`** —— 塌缩由本模块完成。
  *
- * ── 为什么必须读 `subagent/descriptor`，以及为什么只有 continuable 行能用 ────
+ * ── 怎么认出「这个子代理来自哪一条委派行」──────────────────────────────────────
  *
  * 本模块要回答的第一个问题是：「刚创建的这个子代理，是来自哪一条委派行？」
  *
@@ -33,22 +33,36 @@
  * provider / toolName / modelSelectionSettings / enableRunInBackground /
  * backgroundMode / agentOptions / persona / toolFilter / maxDepth），也**没有**
  * 「这个子代理用了哪一行」的运行时句柄。所以只能靠一个由该行**注入到子代理自身**
- * 的标记来间接识别 —— 而 `persona` 正是唯一符合这个条件的现成载体：
- * 它是委派行上的配置，会被写进子代理自己的 system prompt，同时又被原样快照进
- * 子代理 session 的 `subagent/descriptor` 事件。
+ * 的标记来间接识别 —— 而 `persona` 是唯一符合条件的载体：它是委派行上的配置，
+ * 每个子代理恰好一份，内容随行而不同。
  *
- * ⚠️ **但那个快照只在 continuable 分支里才包含 persona。**
- * `dsh-subagent` 的 `snapshotSubagentDescriptor()` 对 `mode === 'one-shot'` 的行
- * 只保留 `version` / `mode` / `provider` / `label` 四个字段，persona 与 toolFilter
- * **都被丢掉**。也就是说：
+ * ⚠️ **但这份 persona 有两条到达路径，覆盖面不同 —— 这里踩过一个坑，写清楚：**
  *
- *     模式标记能被子代理之外读到的前提 = 该委派行是 backgroundMode: 'continuable'
+ *   1. `subagent/descriptor` 事件的 `data.persona` 字段。
+ *      **只在 `backgroundMode: 'continuable'` 的行上存在。**
+ *      `snapshotSubagentDescriptor()` 对 `mode === 'one-shot'` 的行只保留
+ *      `version` / `mode` / `provider` / `label` 四个字段，persona 与 toolFilter
+ *      **都被丢掉**；而且 one-shot 的 descriptor 要等到**第一轮 `agent/pre-step`**
+ *      才 append（见 `dsh-subagent` 的 `attachDescriptorAppend`），也就是说在
+ *      `agent/created` 那一刻它**根本还不存在**。
  *
- * 这不是本模块的偏好，是上游快照的字段集决定的。所以 composition 里两条新模式行
- * 都是 continuable。（已核实：descriptor 事件在子代理创建窗口内、`setup()` 阶段就
- * append 进 session，早于 `agent/created` —— 见 `dsh-subagent` 的
- * `activations.materialize()`：先 `setup`（append descriptor + applyChildComposition），
- * 再 `announce`（发出 `agent/created`）。）
+ *   2. 子代理**自己的 system prompt 段落** `deployment:persona-prefix`。
+ *      **两条路径都有** —— `applyChildComposition()` 在 `setup()` 阶段注册它
+ *      （只要该行配了 persona），而 `setup()` 严格早于 `agent/created`。
+ *
+ * 所以本模块把 (2) 当**主来源**、(1) 当兜底。反过来写（只读 descriptor）会让本模块
+ * 在**前台派单**（`run_in_background: false`）时整体失效 —— 而那恰好是审批弹窗唯一
+ * 走得通的那条路径，于是外在表现会变成「前台派单测出来一切正常、默认后台派单时
+ * 守卫却一声不响」。
+ *
+ * 本机实测数据（`~/.dsh/sessions` 下全部 340 个会话、298 条 descriptor）：
+ * `one-shot` 的 76 条**没有一条**带 persona，`continuable` 的 222 条里 219 条带 ——
+ * 分界线与上面的字段集完全一致。
+ *
+ * (2) 的读法是上游**未文档化**的内部结构（公开声明只列了注册方法与 `assemble()`），
+ * 所以那里读不到时只告警、绝不抛错，且告警带固定标识
+ * `MULTITASK-MODE-MARKER-SOURCE-MISSING` —— 好让「上游改版导致本模块静默失效」
+ * 这件事能被 grep 到，而不是退化成一个永远不动作的死模块。
  *
  * ── 为什么失败一律静默降级（本模块与 coordinator-guard 的取向相反）──────────
  *
@@ -182,11 +196,97 @@ function sessionEvents(agent) {
 }
 
 /**
- * 从子代理的 `subagent/descriptor` 事件里取该行配置的 persona。
+ * 承载「本行 persona」的 system prompt 段落名。
  *
- * descriptor 是**唯一**能读到「这一行用了哪份 persona」的地方：它不是子代理的
- * system prompt（那要等组装，且可能已被 scope 层叠改写），而是委派行原样的快照。
- * `dsh-subagent` 自己对 descriptor 的定性就是「first event is authoritative」。
+ * 逐字为 `dsh-subagent` 的 `applyChildComposition()` 注册它时用的名字
+ * （上游常量 `PERSONA_PREFIX_SECTION` 的值）。名字漂了不会报错，只会**读不到** ——
+ * 于是退化成「找不到标记 = 什么都不做」这种最难查的坏法。
+ */
+const PERSONA_SECTION_NAME = 'deployment:persona-prefix'
+
+/**
+ * 从子代理**自己的 system prompt 段落**里取该行配置的 persona（**主来源**）。
+ *
+ * 为什么它是主来源：这是**两条委派路径都有**的那一份。`applyChildComposition()`
+ * 在 `setup()` 阶段注册该段落，而 `setup()` 严格早于 `agent/created`
+ * （上游 `initializeAgent` 先 `await setup()`、再 `await publish()`）——
+ * 与 `coordinator-guard` 依赖的时序是同一条。
+ *
+ * 对比 `descriptorPersona()`：那个只在 `backgroundMode: 'continuable'` 行上有效，
+ * 所以**不能**单独用它 —— 只用它会让本模块在**前台派单**时整体失效，而那恰好是
+ * 审批弹窗唯一走得通的路径。
+ *
+ * ⚠️ 读法用的是上游**未文档化**的内部结构（`SystemPrompt` 的公开声明只列了注册方法、
+ * 顺序查询与 `assemble()`；`layers` / `merge()` 都不在其中）。所以这里的原则是：
+ *
+ *   - 全程不抛错，任何一步读不到都返回 undefined，由调用方退到兜底来源；
+ *   - **结构性缺失**（连 `layers.merge` 都不在）记一条带**固定标识**的 warn ——
+ *     那说明上游改了内部结构，本模块对前台派单会开始静默失效，这件事必须可 grep；
+ *   - 段落**不存在**不告警：那是「该行本来就没配 persona」，属于正常情形。
+ *
+ * 不走公开的 `assemble()`：它是 `async`，而且每次会 `structuredClone` 全部工具 schema
+ * （本部署 40+ 个），为读一段文本付这个代价不合适。
+ *
+ * @param agent - 目标子代理。
+ * @param warn - 每进程每原因只报一次的记录器。
+ * @returns persona 文本，或 undefined。
+ */
+function promptSectionPersona(agent, warn) {
+  const service = (() => {
+    try {
+      const direct = agent?.ctx?.systemPrompt
+      if (direct !== undefined && direct !== null) return direct
+      return agent?.ctx?.get?.('systemPrompt')
+    } catch {
+      return undefined
+    }
+  })()
+
+  const layers = service?.layers
+  if (layers === undefined || layers === null || typeof layers.merge !== 'function') {
+    warn(
+      "this deployment's systemPrompt service exposes no readable section layers, so a subagent's own " +
+        'persona section cannot be read; the mode marker falls back to the subagent descriptor, which omits ' +
+        'persona for foreground (one-shot) delegations — those workers keep the native tool surface ' +
+        '[MULTITASK-MODE-MARKER-SOURCE-MISSING reason=no-section-layers]',
+    )
+    return undefined
+  }
+
+  try {
+    // scope 键就是 agent 对象本身：上游 `assembleContextFor()` 传的是 `{ scope: agent }`，
+    // 而 `createScope(loopCtx, this)` 用的键也是这个 agent。
+    // 子代理自己的层在链条最内侧，因此它盖掉全局那份部署级 persona。
+    const sections = layers.merge(agent, (layer) => layer.sections)
+    const section = sections?.get?.(PERSONA_SECTION_NAME)
+    const text = section?.text
+    // `text` 可以是函数（按组装上下文求值）；本行配置的 persona 是纯字符串，
+    // 遇到函数形态说明读到的不是委派行那一份，按「读不到」处理。
+    return typeof text === 'string' && text !== '' ? text : undefined
+  } catch (error) {
+    warn(
+      `reading a subagent's own persona section failed: ${error instanceof Error ? error.message : String(error)} — ` +
+        'the mode marker falls back to the subagent descriptor, which omits persona for foreground ' +
+        '(one-shot) delegations [MULTITASK-MODE-MARKER-SOURCE-MISSING reason=merge-threw]',
+    )
+    return undefined
+  }
+}
+
+/**
+ * 从子代理的 `subagent/descriptor` 事件里取该行配置的 persona（**兜底来源**）。
+ *
+ * descriptor 是「委派行原样的快照」，上游自己的定性是
+ * 「first event is authoritative」，所以它是很干净的一份 —— 但**覆盖面有限**：
+ *
+ *   `snapshotSubagentDescriptor()` 对 `mode === 'one-shot'` 的行只保留
+ *   `version` / `mode` / `provider` / `label`，persona 与 toolFilter **都被丢掉**；
+ *   而且 one-shot 的 descriptor 要到**第一轮 `agent/pre-step`** 才 append
+ *   （`attachDescriptorAppend`），在 `agent/created` 那一刻**根本还不存在**。
+ *
+ * 所以它只对 `continuable` 行有效。本机实测（全部 340 个会话、298 条 descriptor）：
+ * one-shot 的 76 条**无一带 persona**，continuable 的 222 条里 219 条带 ——
+ * 分界线与上面那段字段集完全一致。
  *
  * @param agent - 目标子代理。
  * @returns persona 文本，或 undefined。
@@ -201,6 +301,24 @@ function descriptorPersona(agent) {
 }
 
 /**
+ * 取该子代理所属委派行的 persona —— 主来源优先，descriptor 兜底。
+ *
+ * 两个来源都取自同一个 `request.persona`，内容一致；顺序之所以这样定，是因为
+ * 主来源在**两条派单路径上都存在**，而兜底只在后台那条上存在。找不到任一来源
+ * 都返回 undefined（= 什么都不做），与「这一行没要求非原生呈现」不可区分 ——
+ * 这正是本模块「能力缺失时安静退场」的取向。
+ *
+ * @param agent - 目标子代理。
+ * @param warn - 每进程每原因只报一次的记录器。
+ * @returns persona 文本，或 undefined。
+ */
+function childPersona(agent, warn) {
+  const fromPrompt = promptSectionPersona(agent, warn)
+  if (typeof fromPrompt === 'string') return fromPrompt
+  return descriptorPersona(agent)
+}
+
+/**
  * 判定该子代理应当使用哪种呈现模式。
  *
  * 目前只有一种非原生模式（ptc），但判定写成「返回模式名」而不是「是不是 ptc 的布尔」，
@@ -211,10 +329,11 @@ function descriptorPersona(agent) {
  * 于是它们完全不受影响 —— 这是「不破坏现有单模式行为」的实现方式，而不是靠额外判断。
  *
  * @param agent - 目标子代理。
+ * @param warn - 每进程每原因只报一次的记录器。
  * @returns `'ptc'`，或 undefined（表示保持原生）。
  */
-function modeForChild(agent) {
-  const persona = descriptorPersona(agent)
+function modeForChild(agent, warn) {
+  const persona = childPersona(agent, warn)
   if (typeof persona !== 'string') return undefined
   if (persona.includes(PTC_MODE_MARKER)) return 'ptc'
   return undefined
@@ -310,7 +429,7 @@ export function apply(ctx, config) {
     // ── 硬前置：绝不作用于协调者 ──
     if (!isDelegatedChild(agent)) return
 
-    const mode = modeForChild(agent)
+    const mode = modeForChild(agent, warn)
     // 没有标记 = 这条委派行没要求非原生呈现（`subagent` / `subagent_fork` 就在这一类）。
     if (mode === undefined) return
 

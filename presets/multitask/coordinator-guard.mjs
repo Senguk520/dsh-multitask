@@ -162,8 +162,11 @@ const DEFAULT_KEEP = [
   'send_message',
   'interrupt_agent',
   'list_agents',
-  // 用户要求「允许手动指定子代理模型」——所以保留这条只读的模型发现工具。
-  'list_subagent_models',
+  // ⚠️ 这里**刻意不列 `list_subagent_models`**：那是「让 AI 在某次委派里临时指定
+  // 子代理模型」那条能力的配套发现工具，而本模式**不要**那条能力 ——
+  // 子代理用哪个模型由用户在设置面板里按 worker 类型决定。
+  // 该工具本就不会被注册（要它出现，委派行得设 `modelSelectionSettings: true`，
+  // 而 composition 里四行都不设），所以不列它既正确、也少一处误导。
 
   // ── 结果回收：后台子代理的产出要能取回来 ──
   'job_list',
