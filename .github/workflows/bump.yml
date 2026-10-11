@@ -1,34 +1,51 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# 自动推进 package.json 的版本号
+# 自动递增 package.json 的版本号
 #
-# 为什么由 CI 独占版本号：多人协作时它是一份**共享状态**。谁在本地手改，谁就跟
-# 别人冲突，而且「我这边的号对不对」得靠每次开工先拉一次才能确定。交给这里统一
-# 推进，协作者就只需要照常推送、照常拉取，不必再碰这个文件。
+# 规则只有一条：**每次有提交落到 main，就把 patch 位 +1 并推回 main。**
+# 不查 npm、不比较任何已发布的号 —— 推一次，涨一次。
 #
-# ── 推进规则 ───────────────────────────────────────────────────────────────
-#   · 当前版本**高于** npm 上最高的正式版 ⇒ 原样保留，不推进。
-#     这正是「一个还没发布的号可以跨多次提交复用」：推 10 次代码只会产生 1 次
-#     推进提交，而不是 10 次。同时它也让人可以显式指定版本（例如要发 2.0.0）。
-#   · 否则 ⇒ 取 npm 上**最高正式版**的 patch + 1。
-#     基准取 registry 而不是当前版本，是为了兜住「仓库落后于 registry」的情况。
+# ── 为什么不再拿「npm 上的最高版」当基准（这条工作流先前就是这么写的）────────
+#   旧规则是「当前版本 ≤ npm 上最高正式版时才推进」。它有一处致命的不对称：
+#   版本号必须**先**写进 package.json、**后**才能打标签发布，于是 main 上的版本
+#   正常情况下永远**高于**已发布的那个 —— 判断几乎永不成立，版本号就在两次发布
+#   之间一直冻着：推多少次代码都不动，只有打完标签才自动涨一次。
+#   现在改成无条件 +1：版本号只由「推送」这一个动作驱动，不需要知道 registry 上
+#   有什么，也就不存在那层判断。
 #
-#   决策与边界条件都在 `.github/scripts/next-version.mjs` 里，由
-#   `test/next-version-rules.mjs` 的 22 条用例守着（含两条反向验证）。
+# ── 为什么由 CI 独占版本号 ──────────────────────────────────────────────────
+#   多人协作时它是一份**共享状态**。谁在本地手改，谁就跟别人冲突，而且「我这边的
+#   号对不对」得靠每次开工先拉一次才能确定。交给这里统一推进，协作者就只需要
+#   照常推送、照常拉取，不必再碰这个文件。
+#
+# ── 想要一个指定的版本号（例如发 2.0.0）怎么办 ──────────────────────────────
+#   把提交信息写成以 `chore(release):` 开头 —— 本工作流会跳过这类提交（见下面 job
+#   上的 if）。于是可以自己改 package.json 的 version，再用这个前缀写提交信息推上去。
+#   这个前缀同时是**我们自己那条 bump 提交的记号**，所以它一身两用。
+#
+# ── 为什么文档改动也要涨版本 ────────────────────────────────────────────────
+#   本包把 `README.md` / `README.zh.md` / `docs/DESIGN.md` 都发进 npm 包里
+#   （见 package.json 的 `files`）—— 它们**就是发布物的一部分**，改了就该有个新版本。
+#   所以这里不设 `paths-ignore`。
 #
 # ── 为什么这里不会自己触发自己（死循环）────────────────────────────────────
 #   用内置的 `GITHUB_TOKEN` 推送的提交**不会触发新的工作流运行** —— 这是 GitHub
 #   刻意的设计，专门用来防止「工作流触发工作流」的无限递归。所以本工作流推完
 #   提交就结束了，不会再次进入自己。
 #
+#   job 上那两道 if 是给「将来万一改用 PAT」留的闸门：PAT 推出来的提交**会**触发
+#   工作流，到那时只有「提交信息前缀」那道判断挡得住循环（用 PAT 时 actor 是真人
+#   账号，不是 `github-actions[bot]`）。
+#
 #   ⚠️ 反过来记住这条：**标签也一样**。所以「改完版本号顺手打个标签、让标签去
 #      触发发布」是**不通**的 —— 那个标签产生的事件不会唤起发布工作流。
 #      这也是发布只能手动点的原因（见 publish.yml）。
 #
 # ── 协作者要注意的 ─────────────────────────────────────────────────────────
-#   · 不要手动改 `package.json` 的 version —— 会与本工作流打架。
-#     真要指定版本（例如发 2.0.0），改大即可：规则会尊重「高于已发布最高版」的值。
-#   · 推送到 main 后，bot 可能会在其后追加一条 `chore(release): bump version`
-#     提交，所以**下次推送前先拉一下**，否则本地会比远端旧。
+#   · 不要手动改 `package.json` 的 version —— 会与本工作流打架。除非就是想要一个
+#     指定版本（见上面那条）。
+#   · 每次推送到 main 之后，bot 都会在其后追加一条
+#     `chore(release): bump version to x.y.z` 提交，所以**下次推送前先拉一下**，
+#     否则本地会比远端旧。
 # ─────────────────────────────────────────────────────────────────────────────
 name: Bump version
 
@@ -36,6 +53,9 @@ on:
   push:
     branches:
       - main
+  # 手动触发：某次 push 的 bump 失败后补一次，或首次验证本工作流。
+  # 手动触发时 github.event.head_commit 为空，因此只会撞到下面 actor 那道判断。
+  workflow_dispatch:
 
 # 两次推送几乎同时到达时串行处理，否则两边会算出同一个号、后推的那个被拒绝。
 # 已经在跑的那次不许被打断。
@@ -49,12 +69,24 @@ permissions:
 jobs:
   bump:
     runs-on: ubuntu-latest
+    # 两道防循环判断，缺一不可：
+    #   · actor：内置 `GITHUB_TOKEN` 推出的提交本来就不会再触发工作流，这道是兜底。
+    #   · 提交信息前缀：与仓库既有的 `chore(release):` 约定一致，既挡住我们自己那条
+    #     bump 提交（万一将来改用 PAT），也让「手工指定版本的那次 push」不会被再自动
+    #     加一。`|| ''` 是必需的 —— workflow_dispatch 触发时 head_commit 为 null，
+    #     缺少兜底会让表达式求值报错。
+    if: github.actor != 'github-actions[bot]' && !startsWith(github.event.head_commit.message || '', 'chore(release):')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # 明确落在 main 上：`workflow_dispatch` 允许从别的 ref 手动触发，而本工作流
+          # 只会推回 main。不钉住的话，从别处触发会拿着那个分支的状态去比版本号。
+          ref: main
           # 明确用内置令牌：它推出去的提交不会触发新的工作流（见文件顶部的说明）。
-          # 换成 PAT 会打破那个性质，从而让本工作流自己触发自己。
+          # 换成 PAT 会打破那个性质，从而让本工作流自己触发自己（届时只剩 if 那道前缀判断）。
           token: ${{ secrets.GITHUB_TOKEN }}
+          # 需要完整历史：下面推送被拒时要 rebase 到最新 main，浅克隆做不了。
+          fetch-depth: 0
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -70,34 +102,39 @@ jobs:
           done
           echo "语法检查通过"
 
-      - name: 算出该用的版本号
-        id: next
-        run: |
-          CURRENT="$(node -p "require('./package.json').version")"
-          NEXT="$(node .github/scripts/next-version.mjs)"
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
-          if [ "$CURRENT" = "$NEXT" ]; then
-            echo "::notice::版本号保持 $CURRENT（尚未发布，或已显式指定更高版本）"
-          else
-            echo "::notice::版本号 $CURRENT → $NEXT"
-          fi
-
-      # `--no-git-tag-version`：只改文件，提交与打标签由下面两步自己控制，
-      # 因为提交信息与推送目标都由本工作流决定。npm 会保留原有的缩进与末尾换行。
-      - name: 写回 package.json
-        if: steps.next.outputs.next != steps.next.outputs.current
-        env:
-          NEXT: ${{ steps.next.outputs.next }}
-        run: npm version --no-git-tag-version "$NEXT"
-
-      - name: 提交并推回 main
-        if: steps.next.outputs.next != steps.next.outputs.current
-        env:
-          NEXT: ${{ steps.next.outputs.next }}
+      - name: 递增 patch 位、提交并推回 main
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -am "chore(release): bump version to $NEXT"
-          git push
-          echo "::notice::已把版本号推进到 $NEXT 并推回 main"
+
+          BEFORE="$(node -p "require('./package.json').version")"
+          # `--no-git-tag-version`：只改文件，提交与打标签由本步骤自己控制。
+          # npm 会保留原有的缩进与末尾换行，也会顺带更新 package-lock.json（本包没有）。
+          npm version patch --no-git-tag-version
+          AFTER="$(node -p "require('./package.json').version")"
+          echo "::notice::版本号 $BEFORE → $AFTER"
+
+          # 版本号没动说明 npm 那步没起作用。此时提交等于写下一个不涨的版本号 ——
+          # 而「版本号不涨」正是本工作流要修掉的那个毛病，所以宁可失败暴露出来。
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "::error::npm version patch 之后版本号仍是 $BEFORE，未提交" >&2
+            exit 1
+          fi
+
+          git commit -am "chore(release): bump version to $AFTER"
+
+          # concurrency 只串行化本工作流的运行，挡不住同一时间的人手 push。
+          # 被拒就 rebase 到最新 main 再试，最多三次。
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "::notice::已把版本号推进到 $AFTER 并推回 main"
+              exit 0
+            fi
+            echo "推送被拒（第 ${attempt} 次），rebase 到最新 main 重试"
+            if [ "$attempt" = "3" ]; then
+              echo "::error::三次推送均失败，main 上存在持续竞争" >&2
+              exit 1
+            fi
+            git fetch origin main
+            git rebase origin/main
+          done

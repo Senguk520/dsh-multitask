@@ -20,8 +20,17 @@
 #      失效了不用慌：删掉重建、再成功发一次即可。
 #
 # ── 之后怎么发版 ───────────────────────────────────────────────────────────
-#   1. 改 package.json 的 version（例如 1.0.1）并提交到 main
-#   2. git tag v1.0.1 && git push dsh-multitask v1.0.1
+#   版本号由 `bump.yml` 自动推进（每次推送落到 main 就 patch + 1），所以发版时
+#   **不要去手改 package.json 的 version** —— 自动加一会盖在你的值上。
+#
+#   1. 等 `Bump version` 跑完，先拉一次 main（`git pull`）
+#   2. 拿 main 上**当前**的号打标签并推送：
+#        VERSION="$(node -p "require('./package.json').version")"
+#        git tag "v$VERSION" && git push dsh-multitask "v$VERSION"
+#
+#   想要一个指定的号（例如 2.0.0）时：把 version 改大，并让提交信息以
+#   `chore(release):` 开头再推 —— `bump.yml` 会跳过这类提交、不会再给你加一，
+#   然后照上面第 2 步打标签。
 #
 #   ⚠️ 标签必须打在**含有本文件的提交**上 —— 标签触发的运行只认该标签指向的那次
 #      提交里的工作流。所以先推 main（带上本文件），再打标签。
