@@ -1,123 +1,123 @@
-# dsh-multitask — Multitask 减震器模式
+# dsh-multitask — the Multitask "shock absorber" mode
 
-[English](README.en.md) · [设计与实测记录](docs/DESIGN.md) · MIT License
+[中文](README.zh.md) · [Design notes and measured evidence](docs/DESIGN.md) · MIT License
 
-一个装进 DSH 的工作模式：**主对话只做三件事** —— 理解你的需求、把需求翻译成任务书下发给子代理、汇总子代理的结论。读文件、跑命令、构建、搜索、调试所产生的一切过程性数据，都在**子代理的上下文**里消化，永不进入主对话。主对话的上下文因此长期只留高价值信息。
+A work mode for DSH in which **the main conversation does exactly three things**: understand what you asked for, turn it into task briefs, and report back what the Subagents concluded. Every piece of process data — file contents, command output, build logs, search results, dead ends — is digested inside a **Subagent's context** and never enters the main one. The main conversation therefore holds only high-value information.
 
-这不是靠提示词请求模型「请你自己别动手」，而是**机制**。选中本模式后，主对话（协调者）的工具面被实际收窄：写文件、跑命令、检索这类会带来大量过程数据的工具**不在它的可见面里** —— 调用不了，也就污染不了它的上下文。子代理（worker）相反：它拿到完整工具面，把活干完，只把结论带回来。
+This is a **mechanism**, not a prompt asking the model to behave. Once the mode is selected, the main conversation (the coordinator) genuinely has a narrower tool surface: the tools that would drag in process data — writing files, running commands, searching the web — are **not in its visible set**. It cannot call them, so it cannot pollute its own context. A Subagent (worker) is the opposite: it gets the full tool surface, does the work, and returns only its conclusion.
 
-零运行时依赖，不改动 DSH 源码。
+Zero runtime dependencies. No changes to DSH source.
 
 ---
 
-## 它和别的模式差在哪
+## How it differs from other modes
 
-| | 主对话（协调者） | 子代理（worker） |
+| | Main conversation (coordinator) | Subagent (worker) |
 |---|---|---|
-| 工具面 | 只读核对 + 委派 + 结果回收 + 交互 | 完整（写文件、跑命令、构建、搜索…） |
-| 上下文 | 你的需求 + 任务书 + 结论 | 全部过程数据 |
-| 职责 | 理解、翻译、下发、核对、汇报 | 干活 |
+| Tool surface | read-only checks + delegation + result retrieval + interaction | full (write files, run commands, build, search…) |
+| Context | your request + task briefs + conclusions | all the process data |
+| Job | understand, translate, dispatch, verify, report | do the work |
 
-协调者保留的工具（白名单）：
+What the coordinator keeps (a whitelist):
 
-- **只读核对** —— `read` `grep` `glob` `file_info`
-- **委派** —— `subagent` `subagent_fork` `subagent_ptc` `subagent_minimal`
-- **子代理控制** —— `send_message` `interrupt_agent` `list_agents`
-- **结果回收** —— `job_list` `job_output` `job_kill`
-- **编排** —— `workflow`
-- **交互与自我管理** —— `ask_user_question` `todo_write` `create_goal` `get_goal` `update_goal` `exit_plan_mode` `present` `skill`
+- **Read-only checks** — `read` `grep` `glob` `file_info`
+- **Delegation** — `subagent` `subagent_fork` `subagent_ptc` `subagent_minimal`
+- **Subagent control** — `send_message` `interrupt_agent` `list_agents`
+- **Result retrieval** — `job_list` `job_output` `job_kill`
+- **Orchestration** — `workflow`
+- **Interaction and self-management** — `ask_user_question` `todo_write` `create_goal` `get_goal` `update_goal` `exit_plan_mode` `present` `skill`
 
-不在上表里的工具默认对它关闭，例如 `write` `edit` `pwsh` `web_search` `web_fetch` `read_image`、`ssh_*`、`task_board_*`、`plugin_manager`。判据是**补集**：摘除面 = 当前可见集 − 保留集，所以宿主以后新增任何工具，默认也对协调者关闭，本插件不需要跟着改。
+Anything not on that list is withheld by default — `write`, `edit`, `pwsh`, `web_search`, `web_fetch`, `read_image`, `ssh_*`, `task_board_*`, `plugin_manager`, and so on. The rule is a **complement**: withheld = currently visible − kept. Any tool the host adds later is therefore also withheld from the coordinator by default, with no change needed in this plugin.
 
-只读核对能力是刻意留给协调者的：它要能**独立验证**子代理的结论，而不是盲信回报。
+The read-only tools are kept on purpose: the coordinator is meant to **verify** a Subagent's claims independently instead of trusting them blindly.
 
 ---
 
-## 安装
+## Installation
 
-### 用发布包（推荐）
+### From the published package (recommended)
 
 ```
 dsh plugin add dsh-multitask
 ```
 
-或在 DSH 的**插件**页面里安装。包落在 profile 的 `node_modules` 下，由本包自带的 `cordis.patch.yml` 插入一行裸包名 `dsh-multitask`，不含任何绝对路径，所以在任何机器、任何用户名、任何安装位置都成立。
+Or install it from the in-app **Plugins** page. The package lands in the profile's `node_modules`, and the bundled `cordis.patch.yml` inserts a bare package name (`dsh-multitask`) with no absolute paths — so it works on any machine, any user name, any install location.
 
-> **桌面版（Electron）注意**：应用自有的 `desktop` profile 由应用独占管理，CLI 会直接拒绝（`error: profile "desktop" is managed exclusively by the Electron application`）。这种情况请用应用内的**插件**页面安装，或走下面的源码安装路径。
+> **Desktop (Electron) note.** The app manages its own `desktop` profile exclusively, and the CLI refuses outright: `error: profile "desktop" is managed exclusively by the Electron application`. In that case install from the in-app **Plugins** page, or use the source route below.
 
-### 从源码 checkout 运行
+### From a source checkout
 
-clone 本仓库、直接跑工作区里的源码时，在 profile 的 `cordis.patch.yml` 末尾**追加**一段，用**绝对** `file://` URL 指向本地入口：
+To run the sources in your working tree (edits without going through npm), **append** this block to the profile's `cordis.patch.yml`, pointing at your local entry with an **absolute** `file://` URL:
 
 ```yaml
 - insert:
     - id: multitask
-      name: 'file:///你的绝对路径/dsh-multitask/lib/index.js?v=6'
+      name: 'file:///absolute/path/to/dsh-multitask/lib/index.js?v=6'
 ```
 
-两点注意：
+Two things to watch:
 
-- **路径里的空格与 `%` 必须百分号编码**（Windows 上尤其常见）。稳妥做法是让程序替你编码，而不是手写 —— 例如在 PowerShell 里：`(New-Object System.Uri('H:\my repo\dsh-multitask\lib\index.js')).AbsoluteUri`。
-- **末尾的 `?v=N` 是缓存键**，只在 `file://` 这种方式下有意义（见「开发 → 改源码后如何生效」）。
+- **Spaces and `%` in the path must be percent-encoded** (common on Windows). Let a program encode it rather than typing it by hand — in PowerShell: `(New-Object System.Uri('H:\my repo\dsh-multitask\lib\index.js')).AbsoluteUri`.
+- **The trailing `?v=N` is a cache key**, and it only means anything in this `file://` mode (see Development → "Making source edits take effect").
 
-**新增这一行不需要重启**：DSH 在 `cordis.patch.yml` 上装了 watcher，改动会被热重载。
-
----
-
-## 使用
-
-**新建会话**时，在模式选择器里选 **「Multitask 减震器模式」**，然后正常提需求即可。
-
-> 模式只能在**会话开始前**选择。已经开跑的会话切不进来 —— 这是 DSH 的既有约束（工具面与提示词在首轮就冻结了），不是本插件的限制。
-
-协调者会把你的需求翻译成**自包含**的任务书 —— 子代理看不到这段对话，所以任务书必须带上它需要知道的一切（目标、已核实的现状、项目约定、安全闸、编号任务、条件分支、停止条件、回报格式）。互不依赖的任务会**并行**下发，协调者一边等一边继续做事。
+**Adding this row needs no restart**: DSH watches `cordis.patch.yml` and hot-reloads it.
 
 ---
 
-## 四类子代理
+## Usage
 
-协调者有四条委派路径，差别主要在**工具面**：
+When creating a **new session**, pick **"Multitask 减震器模式"** in the mode selector, then just ask for what you want.
 
-| 委派工具 | 工具面 | 适用任务 |
-|---|---|---|
-| `subagent` | **完整** | 默认。写代码、跑测试、改文件、执行类任务 |
-| `subagent_fork` | **完整** + 继承本对话的**已完成轮次** | 复查、续写 —— 需要「接着这份上下文往下做」时 |
-| `subagent_ptc` | **PTC 塌缩**：只能直呼 `run_code`，其余工具在程序里经生成的 SDK 调用 | 程序化批量处理：海量数据的过滤/聚合/搬运，中转数据不该进上下文 |
-| `subagent_minimal` | **只读**：摘掉写入与执行类工具 | 只读调研、快速问答、核查事实 |
+> The mode can only be chosen **before a session starts**. A session that is already running cannot switch into it — that is an existing DSH constraint (the tool surface and prompt freeze on the first turn), not a limitation of this plugin.
 
-拿不准用 `subagent`。这条判别指引写在协调者人格里，由它按任务自行选择。
-
-**委派深度固定为 1**：协调者 → worker，worker 不能再往下派。需要拆分的任务由协调者拆成扁平的几份任务书。
+The coordinator translates your request into **self-contained** task briefs — a Subagent cannot see this conversation, so a brief must carry everything it needs (goal, verified current state, project conventions, safety rails, numbered tasks, conditional branches, stop conditions, report format). Independent briefs are dispatched **in parallel**, and the coordinator keeps working while they run.
 
 ---
 
-## 设置
+## The four kinds of Subagent
 
-本包装好后，DSH 的设置里会多出这些：
+The coordinator has four delegation paths, and the difference is mainly the **tool surface**:
 
-**「Multitask」页 —— 两张卡**
-
-| 卡片 | 字段 | 作用 |
+| Delegation tool | Tool surface | Best for |
 |---|---|---|
-| 子代理使用的模型 | `multitask.subagentModels[]` | 四类 worker 各自的默认模型。可选「所有子代理使用同一个模型」，也可按类型分别指定；默认是「继承协调者」。只对此后**新建**的会话生效 |
-| 子代理并行数量上限 | `subagent.maxActiveSubagents` | 与「设置 → 通用设置」里那一行**是同一个字段**，改完即刻生效 |
+| `subagent` | **full** | the default — writing code, running tests, editing files, execution work |
+| `subagent_fork` | **full** + the **completed turns** of this conversation | review and continuation — when the work must build on what is already established here |
+| `subagent_ptc` | **PTC-collapsed**: only `run_code` is directly callable; every other tool is reached from inside a program via a generated SDK | programmatic bulk work — filtering, aggregating, or moving large data sets whose intermediate values should never enter the context |
+| `subagent_minimal` | **read-only**: write and execute tools are removed | investigation, quick answers, fact-checking |
 
-**「通用设置」页 —— 两行**（与官方的语言 / 外观 / 开发者工具并排）
+When in doubt, use `subagent`. That guidance lives in the coordinator persona, and the coordinator picks per task.
 
-| 行 | 字段 | 作用范围 |
+**Delegation is one level deep**: coordinator → worker, and a worker cannot delegate further. Jobs that need splitting are split by the coordinator into flat briefs.
+
+---
+
+## Settings
+
+Once installed, DSH's settings gain the following.
+
+**The "Multitask" page — two cards**
+
+| Card | Field | What it does |
 |---|---|---|
-| 最大递归深度 | `subagent.maxDepth` | 宿主平面：对所有模式生效，不只是 Multitask |
-| 子代理并行数量上限 | `subagent.maxActiveSubagents` | 同上，且与 Multitask 页那张卡是同一个值 |
+| Model used by Subagents | `multitask.subagentModels[]` | the default model for each of the four worker kinds. Either "use one model for every Subagent" or per-kind; the default is "inherit coordinator". Applies only to sessions created **afterwards** |
+| Subagent parallelism limit | `subagent.maxActiveSubagents` | **the same field** as the row in Settings → General, and it takes effect immediately |
 
-会话头部还会显示当前正在运行的子代理数量。
+**The "General" page — two rows** (alongside the built-in language / appearance / developer-tools rows)
 
-模型卡的**形态不落盘**，由字段自身推导：四类指向同一条路线即「所有子代理使用同一个模型」，否则即「按类型分别指定」。切换形态本身不产生脏值。
+| Row | Field | Scope |
+|---|---|---|
+| Maximum recursion depth | `subagent.maxDepth` | host-level: applies to every mode, not just Multitask |
+| Subagent parallelism limit | `subagent.maxActiveSubagents` | same; and it is the same value as the card on the Multitask page |
 
-### 子代理并发上限
+The session header also shows how many Subagents are currently running.
 
-**只有一个值**：宿主的 `subagent.maxActiveSubagents`。它在设置里出现在**两处**（「设置 → Multitask」的卡片，与「设置 → 通用设置」的一行），但两处编辑的是**同一个字段** —— 改一处另一处立刻跟着变，改完即刻生效。本插件不另设上限，也没有第二层在截你。
+The model card's **shape is derived, never stored**: all four kinds pointing at one route means "use one model for every Subagent", anything else means per-kind. Switching the shape creates no dirty state.
 
-这个字段的默认值是 **8**：不做任何配置时，8 就是你能拿到的全部。但 8 是宿主的**默认值，不是天花板** —— **写的是多少，上限就是多少**。想跑 N 个，就把它设成 N：设置里两处任选一处，或给宿主那一行加 config：
+### The Subagent parallelism limit
+
+**There is only one value**: the host's `subagent.maxActiveSubagents`. It appears in **two places** in Settings (the card on the Multitask page, and a row in General), but both edit **the same field** — change it in either and the other follows immediately. This plugin adds no cap of its own, and there is no second layer cutting you off.
+
+That field's default is **8**: with no configuration, 8 is all you get. But 8 is a **default, not a ceiling** — **whatever you write is the limit**. To run N, set it to N — in either of the two Settings locations, or by giving the host row a config:
 
 ```yaml
 - id: subagent
@@ -125,190 +125,190 @@ clone 本仓库、直接跑工作区里的源码时，在 profile 的 `cordis.pa
     maxActiveSubagents: 16
 ```
 
-超过上限时，多出来的委派**在启动之前**被丢弃，错误原文逐字为：
+When the limit is exceeded, the extra delegations are dropped **before anything starts**, with this error, verbatim:
 
 ```
 Error: subagent limit reached (active child limit: 8); wait for an existing child to finish or complete this work with the current agents
 ```
 
-这条拒绝来自**宿主**，不是本插件坏了，也不是故障：它是宿主在发名额时抛出的，发生在任何子代理被创建之前 —— 你拿到的是一条普通错误，而不是一个子代理 id。处理办法是**等现有的子代理结束**，或**把若干任务并进一份任务书**交给一个子代理完成；不要原样重试同一批扇出。
+**The refusal is the host's.** It is neither a broken plugin nor a fault: the host raises it while handing out slots, before any Subagent is created — so you get a plain error rather than a Subagent id. The fix is to **wait for existing Subagents to finish**, or **merge several tasks into one brief** for a single Subagent. Do not retry the same fan-out unchanged.
 
-计数口径是「同一主 Agent 下**当前存活**的子代理总数」，不只是同一批发起的：一个已经交完活、但还没退出的 worker **仍然占着名额**。所以「派一批 → 等它们全部结束 → 再派下一批」才是安全的做法。
+The count is "**total live Subagents under one main Agent**", not just the ones you started in the same round: a worker that has finished its brief but has not exited **still occupies a slot**. So the safe pattern is "dispatch a batch → let them all finish → dispatch the next batch".
 
-> ⚠️ **「派 10 个全都成功了」不能证明上限被放宽。** 那是**阻塞 / 串行**执行：一次只在跑 1 个，等它结束再派下一个，**活跃数从未超过 1**。只有**同一条消息里并行下发**才会真的去抢名额。判断并行还是串行，看同一时刻处于 running 的子代理个数，而不是「一共派出去几个」。
+> ⚠️ **"I dispatched 10 and they all succeeded" does not prove the limit was raised.** That is blocking / serial execution: one runs at a time, and the next starts only after the previous ends, so **the live count never exceeded 1**. Only a fan-out **inside a single message** actually competes for slots. To tell parallel from serial, look at how many Subagents are running at one instant, not at how many you dispatched in total.
 
 ---
 
-## 危险操作的审批
+## Approving dangerous operations
 
-在这个模式里干活的全是子代理，而 DSH 默认把子代理的审批请求整条链条关掉（策略钉死为 `never`，模型还会自我审查）。本插件把它接回来，构成**两级闸门**：
+In this mode all the real work is done by Subagents, and DSH turns their approval chain off by default (the policy is pinned to `never`, and the model is additionally told to self-censor). This plugin wires it back up as a **two-level gate**:
 
-| 级别 | 行为 |
+| Level | Behaviour |
 |---|---|
-| 第一级（确定性规则） | 安全的命令**直接执行，不打扰你** —— 无额外模型请求，也不改变沙箱 |
-| 第二级（转呈父会话） | 危险命令**在主对话弹出审批卡**，由你批准或拒绝 —— 复用上游现成的审批面板，不新增 UI |
+| Level 1 (deterministic rules) | safe commands **run directly, without interrupting you** — no extra model request, no change to the sandbox |
+| Level 2 (relay to the parent session) | dangerous commands **raise an approval card in the main conversation** for you to allow or reject — reusing the existing approval panel, with no new UI |
 
-第一级补的是**沙箱表达不了**的那一类：工作区**之内**的破坏性命令（`rm -rf .`、`git reset --hard`、`git clean -fd`）、非文件类危险（`git push --force`、`npm publish`、`curl | bash`、提权、改执行策略）、以及往工作区之外写。漏判一条模式 = 与没有本插件完全一样，所以它只可能**增加**一次询问，不会减少任何保护。
+Level 1 covers what the sandbox cannot express: destructive commands **inside** the workspace (`rm -rf .`, `git reset --hard`, `git clean -fd`), non-file dangers (`git push --force`, `npm publish`, `curl | bash`, privilege escalation, execution-policy changes), and writes outside the workspace. A missed pattern behaves exactly like having no plugin at all, so Level 1 can only **add** a prompt — never remove protection.
 
-**红线**：这一切**只在交互式会话**启用 —— 父会话的审批策略必须是 `ask`。headless / 无人值守部署靠 `never` 保证「不会被挂住等一个永远不来的答复」，本插件在那种环境里一个字都不动。
+**The red line**: all of this is enabled **only in interactive sessions** — the parent session's approval policy must be `ask`. Headless and unattended deployments rely on `never` to guarantee they are never left waiting for an answer that will not come, and this plugin does nothing at all in that environment.
 
-授权是**每次一次性**的：点「允许一次」只放行这一次，再次发同样调用会再次弹窗，没有「永久允许」。
+Authorisation is **one-shot every time**: "Allow once" authorises that call only, and the same call prompts again next time. There is no "always allow".
 
-**后台派单 + 你的回合已结束**时弹窗无处可弹（转呈要求父会话有一个打开的回合）。此时插件会尽力通过消息通道，让主对话出现一条来自该子代理的消息，写明是哪个子会话、想执行什么、去哪里作答。**那是通知，不是批准** —— 消息通道不携带审批结果，闭环仍然要在那个子会话里作答才能完成；在你作答之前，那次调用保持阻塞。
+**With a background dispatch whose turn has ended**, there is nowhere to raise a card (the relay needs the parent session to have an open turn). The plugin then does its best to have a message from that Subagent appear in the main conversation, naming which child session it is, what it wants to run, and where to answer. **That is a notice, not an approval** — the message channel carries no approval result, so the loop still closes only by answering inside that child session; until you do, the call stays blocked.
 
 ---
 
-## 常见问题
+## Common problems
 
-**模式没出现在新会话的选择器里** —— 先确认这一行插件确实装上了（插件列表里能看到，且不是 `disabled`），再重启应用；仍然没有，就在日志里找 `dsh-multitask` 开头的警告，它会说明原因（注册表不在、composition 校验不过、id 被更早的模块实例占用等）。
+**The mode does not appear in the new-session selector.** First confirm the plugin row is actually installed (visible in the plugins list, and not `disabled`), then restart the app. If it is still missing, look in the log for warnings beginning with `dsh-multitask` — they name the cause (registry absent, composition invalid, id held by an earlier module instance, and so on).
 
-**子代理执行任何命令都失败**，报错逐字为：
+**A Subagent fails to run any command at all**, with this error, verbatim:
 
 ```
-Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(<工作区路径>)
+Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(<workspace path>)
 ```
 
-这不是并发的问题（只有一个子代理在跑也照样失败），也不是命令的问题（换成 `Get-Location` 也失败），而是**工作区目录的权限前置条件**：DSH 的 ACL 沙箱要在可写根上写一次安全描述符，其中包含完整性标签；标签住在 SACL 里，因而那次调用额外需要 **WRITE_OWNER**，而所有者的隐式权限只覆盖 `READ_CONTROL` 与 `WRITE_DAC`。只给自己授了 *Modify* 的目录因此缺这一项，调用就会失败 —— 所以用户目录下的工作区开箱可用，而直接建在盘符根下（只继承 Modify）的目录会全废。
+This is not about concurrency (it reproduces with a single Subagent running) and not about the command (even `Get-Location` fails). It is a **directory-permission precondition on the workspace folder**: DSH's ACL sandbox must write a security descriptor onto the session's writable root, and that call includes a mandatory integrity label. The label lives in the SACL, so the call additionally needs **WRITE_OWNER**, while the owner's implicit rights cover only `READ_CONTROL` and `WRITE_DAC`. A folder that grants you only *Modify* therefore lacks it and the call fails — which is why a workspace under your user profile works with no setup, while a folder created directly under a drive root (inheriting only Modify) does not.
 
-**修复已经自动完成**：本插件在会话开始时检查工作区目录，缺 `WRITE_OWNER` 就**只补这一项**（一条非继承的 `TakeOwnership`），然后停止。它不需要批准、不需要提权，也**绝不要**把目录放宽到 *Full control* —— 那会额外给出「改权限 + 夺所有权」，远超所需。
+**The repair is already automatic.** At session start this plugin checks the workspace folder and, if `WRITE_OWNER` is missing, **adds exactly that one permission** (a non-inherited `TakeOwnership`) and stops. It needs no approval and no elevation, and you should **never** widen a folder to *Full control* for this — that would additionally hand over the right to change permissions and take ownership, far beyond what is needed.
 
-若子代理仍然被拒，说明自动补没落地：目录**属于别的账户**，或它在当前进程**不可写**。这时请把「哪个目录、自动补没落地」如实交给你决策。**只读工具不受影响**，所以「读文件、查元数据、改文件」这类任务始终派得出去。
+If a Subagent is still refused, the automatic grant did not land: the folder is **owned by another account**, or it is **not writable** by this process. In that case, treat it as your decision — it is the specific, fixable cause, with the folder named. **Read-only tools are unaffected**, so content and file-metadata tasks are always delegable.
 
-**撞上并发上限** —— 见上面的「子代理并发上限」。那是宿主的拒绝，等现有子代理结束，或把任务合并成一份任务书。
+**You hit the parallelism limit.** See "The Subagent parallelism limit" above; the refusal is the host's. Wait for existing Subagents, or merge tasks into one brief.
 
-**审批弹窗没出现** —— 先确认当前会话的审批策略是 `ask`（headless 配置是 `never`，那时本插件完全不介入）；若你是后台派单且回合已经结束，见「危险操作的审批」最后一节。
+**No approval card appeared.** First check that the session's approval policy is `ask` (a headless configuration is `never`, and then this plugin stays entirely out of the way). If you dispatched in the background and the turn has ended, see the last paragraph of "Approving dangerous operations".
 
-**改了源码却不生效** —— 必须**重启应用**。只递增 profile patch 里的 `?v=N` 对已经在运行的条目是空操作：loader 只看到 name 变了，既不会重新加载模块，也不会重启。细节见 [docs/DESIGN.md](docs/DESIGN.md) 的「改源码后如何生效」。
+**Source edits have no effect.** You must **restart the app**. Bumping `?v=N` in the profile patch alone is a no-op for a row that is already running: the loader only sees that its name changed, so it neither reloads the module nor restarts it. See "Making source edits take effect" in [docs/DESIGN.md](docs/DESIGN.md).
 
 ---
 
-## 验证它真的生效了
+## Verifying that it actually works
 
-选中模式，让协调者试这几件事：
+With the mode selected, have the coordinator try these:
 
-| 你说 | 期望 |
+| You say | Expected |
 |---|---|
-| 「你直接读一下 package.json 告诉我版本」 | ✅ 成功（只读核对是保留的） |
-| 「你自己跑一下 `git status`」 | ❌ 调用不了 —— 工具不在它的可见面里 |
-| 「派个子代理跑 `git status` 并把结论告诉我」 | ✅ 子代理成功执行，只把结论带回来 |
-| 「派个子代理读一下 package.json 并报出文件名与大小」 | ✅ 只读路径始终可用（`read` / `file_info`） |
+| "Read package.json yourself and tell me the version." | ✅ succeeds (read-only checks are kept) |
+| "Run `git status` yourself." | ❌ the call is impossible — the tool is not in its visible set |
+| "Delegate to a Subagent to run `git status` and report the conclusion." | ✅ the Subagent runs it and brings back only the conclusion |
+| "Delegate to a Subagent to read package.json and report the file name and size." | ✅ the read-only route always works (`read` / `file_info`) |
 
-日志里能看到实际收窄了哪些工具（前缀 `dsh-multitask:`）：
+The log shows which tools were actually withheld (all lines are prefixed `dsh-multitask:`):
 
 ```
 dsh-multitask: coordinator scope engaged — withheld N tool(s): edit, pwsh, read_image, ssh_exec, ...
 ```
 
-审批闸门的前置条件与验证步骤（含后台派单的兜底通路）写在 [docs/DESIGN.md](docs/DESIGN.md) 的「验证它真的生效了」与「审批闸门」两节。
+The approval gate's preconditions and its verification steps — including the fallback path for background dispatches — are in [docs/DESIGN.md](docs/DESIGN.md), under "Verifying that it actually works" and "Approving dangerous operations".
 
 ---
 
-## 可调项（profile）
+## Tunables (profile)
 
-按 **id 定位**覆盖，追加在 `dsh-multitask` 那段 `insert` 之后即可（同 id 的后者覆盖前者）：
+Override by **id**, appending after the `dsh-multitask` `insert` block (a later entry with the same id wins):
 
 ```yaml
 - id: multitask
   config:
-    presetId: multitask          # 想同时装多个变体时改这个
-    order: 5                     # 模式选择器里的排序
-    guardEnabled: true           # false = 关掉减震器（退回软约束，仅供排查）
-    keep:                        # 追加到协调者保留集
+    presetId: multitask          # change this to install several variants side by side
+    order: 5                     # position in the mode selector
+    guardEnabled: true           # false = disable the shock absorber (soft constraints only; diagnostics)
+    keep:                        # appended to the coordinator's keep list
       - web_search
       - web_fetch
-    extraDeny:                   # 强制摘除（优先于保留集）
+    extraDeny:                   # force-remove (wins over the keep list)
       - read
 ```
 
-用 `enabled: false` 可整个关掉本插件（不声明 preset，模式从选择器消失）。
+`enabled: false` turns the whole plugin off (no preset is declared, and the mode disappears from the selector).
 
-其余开关改 `presets/multitask/composition.mjs` 里对应行的 `config`：
+The remaining switches live in the `config` of the corresponding rows in `presets/multitask/composition.mjs`:
 
-| 行 | 关掉的效果 |
+| Row | Effect of disabling |
 |---|---|
-| `subagent-mode` | PTC 呈现停用，`subagent_ptc` 退化成与 `subagent` 一样的原生工具面 |
-| `minimal-guard` | 只读 worker 退回「只摘静态三项」，重新看到别的插件装进来的写入类工具 —— **没有安全收益** |
-| `approval-gate` | 危险操作不再弹窗（回到 DSH 默认行为） |
-| `workspace-acl` | 不再自动补 `WRITE_OWNER`（也可用 `config.autoGrantWriteOwner: false`） |
+| `subagent-mode` | the PTC presentation is off, and `subagent_ptc` degrades to the same native surface as `subagent` |
+| `minimal-guard` | the read-only worker reverts to "only the static three withheld" and can see write-capable tools installed by other plugins again — **no security benefit** |
+| `approval-gate` | dangerous operations no longer prompt (back to default DSH behaviour) |
+| `workspace-acl` | `WRITE_OWNER` is no longer granted automatically (or use `config.autoGrantWriteOwner: false`) |
 
-环境变量 `DSH_MULTITASK_MULTI_MODE=0` 一次停用 `subagent_ptc` / `subagent_minimal` 两条路径与 PTC 呈现插件，不影响原有的 `subagent` / `subagent_fork`；它在模块加载时读取，需要重启应用。
+The environment variable `DSH_MULTITASK_MULTI_MODE=0` disables the `subagent_ptc` and `subagent_minimal` paths and the PTC presentation plugin in one step, without touching the original `subagent` / `subagent_fork`; it is read at module load, so it needs an app restart.
 
-改源码必须在**重启**后生效。
-
----
-
-## 卸载
-
-用包管理器装的，交给它：`dsh plugin remove dsh-multitask`，或在**插件**页面里卸载。
-从源码 checkout 装的，把 profile patch 里那一整段 `- insert: - id: multitask` 删掉。
-
-两种方式下，模式都会从**新**会话的选择器里消失（已开跑的会话不受影响），且**不需要重启** —— DSH 会热重载这个 patch，插件卸载时会注销自己那份 preset 声明。想**临时停用**而不卸载，给那一行加 `disabled: true`。
+Source edits take effect only after a **restart**.
 
 ---
 
-## 开发
+## Uninstalling
+
+If you installed from the package manager, let it do the work: `dsh plugin remove dsh-multitask`, or uninstall from the **Plugins** page.
+If you installed from a source checkout, delete the whole `- insert: - id: multitask` block from the profile patch.
+
+Either way the mode disappears from the selector for **new** sessions (running sessions are unaffected), and **no restart is needed** — DSH hot-reloads that patch, and the plugin unregisters its own preset declaration on unload. To **suspend** it temporarily instead, add `disabled: true` to that row.
+
+---
+
+## Development
 
 ```
 dsh-multitask/
-├── package.json                        # dsh.bundle.patch → 装载时插入 host 行；dsh.client → 浏览器半
-├── cordis.patch.yml                    # 向 profile roster 插入 plugin 行
+├── package.json                        # dsh.bundle.patch → inserts the host row on install; dsh.client → the browser half
+├── cordis.patch.yml                    # inserts the plugin row into the profile roster
 ├── lib/
-│   ├── index.js                        # host 半：激活时向 agentPresets 声明自带 preset
-│   └── client.js                       # 浏览器半：设置页「Multitask」+ 通用设置两行
+│   ├── index.js                        # host half: declares the bundled preset with agentPresets
+│   └── client.js                       # browser half: the Multitask settings page + two General rows
 ├── presets/multitask/
-│   ├── composition.mjs                 # preset 组成 + 协调者人格 + 四类 worker 人格
-│   ├── coordinator-guard.mjs           # 减震器（含「模式隔离」归属判据）
-│   ├── subagent-mode.mjs               # PTC 呈现：把带标记的子代理塌缩成 run_code
-│   ├── minimal-guard.mjs               # 只读 worker 的自适应收窄
-│   ├── approval-gate.mjs               # 审批闸门：危险操作弹窗
-│   ├── workspace-acl.mjs               # 工作区 ACL：补 WRITE_OWNER（唯一改系统状态的模块）
-│   └── file-info.mjs                   # 只读元数据工具 file_info
-├── docs/DESIGN.md                      # 设计推导、实测记录、验证清单
-├── README.md / README.en.md
+│   ├── composition.mjs                 # the preset composition + coordinator persona + the four worker personas
+│   ├── coordinator-guard.mjs           # the shock absorber (including the mode-isolation ownership check)
+│   ├── subagent-mode.mjs               # PTC presentation: collapses a marked Subagent onto run_code
+│   ├── minimal-guard.mjs               # adaptive narrowing for the read-only worker
+│   ├── approval-gate.mjs               # the approval gate for dangerous operations
+│   ├── workspace-acl.mjs               # workspace ACL: grants WRITE_OWNER (the only module that changes system state)
+│   └── file-info.mjs                   # the read-only metadata tool file_info
+├── docs/DESIGN.md                      # design reasoning, measured evidence, verification checklist
+├── README.md (English) / README.zh.md (Chinese)
 └── LICENSE
 ```
 
-预设模块（`presets/multitask/*.mjs`）**零 import**：它们不引入任何 `@deepseek-ai/*` 依赖 —— 导入失败等于整份 preset 挂载失败。代价是少量常量各自留一份，由校验脚本比对。
+The preset modules (`presets/multitask/*.mjs`) **import nothing**: they pull in no `@deepseek-ai/*` dependency, because a failed import means the whole preset fails to mount. The cost is that a few constants are duplicated, and the verification scripts compare them.
 
-### 自检
+### Local checks
 
-> ★ **规矩：所有测试文件都必须写进 `test/`。**
-> 探针、校验脚本、一次性核对、诊断脚本、回归套件 —— 一律放 `test/`，用 `node test/<名字>.mjs` 运行，不要放在别处。`test/` 整个目录被 `.gitignore` 忽略，按「是测试就不进远端」的规矩刻意不跟踪，也不进发布物。
+> ★ **Rule: every test file belongs in `test/`.**
+> Probes, verification scripts, one-off checks, diagnostics, regression suites — all go in `test/` and run with `node test/<name>.mjs`; nowhere else. The whole `test/` directory is ignored by `.gitignore` and deliberately untracked (tests do not go to the remote), and it is not part of the published package.
 
-本地现有七套校验，都从脚本自身位置推导被测模块，所以仓库放在任何路径下（含非 ASCII 路径）都能跑：
+There are seven local suites; each derives the modules under test from its own location, so the checkout runs from any path, non-ASCII included:
 
 ```powershell
-node test/guard-mode-isolation-regression.mjs    # 模式隔离回归（13 条断言组）
-node test/repo-consistency.mjs                   # 仓库一致性 / 文档一致 / 测试归位（38 条断言组）
-node test/subagent-mode-marker-source.mjs        # 模式标记的来源（前台与后台两条派单路径，9 条用例）
-node test/minimal-guard-catalog.mjs              # 只读 worker 的目录级过滤（12 条用例）
-node test/approval-gate-rules.mjs                # 审批规则表的漏判与误报（8 条断言组）
-node test/approval-gate-integration.mjs          # 审批闸门的门控 / 事件形状 / 转呈方向（38 条断言组）
-node test/workspace-acl-rules.mjs                # 工作区 ACL 的红线与决策（14 条断言组）
+node test/guard-mode-isolation-regression.mjs    # mode-isolation regression (13 groups)
+node test/repo-consistency.mjs                   # repo consistency / doc consistency / test placement (38 groups)
+node test/subagent-mode-marker-source.mjs        # where the mode marker comes from (foreground and background dispatch, 9 cases)
+node test/minimal-guard-catalog.mjs              # the read-only worker's catalog filter (12 cases)
+node test/approval-gate-rules.mjs                # approval rule table: missed and false positives (8 groups)
+node test/approval-gate-integration.mjs          # gate direction / event shape / relay direction (38 groups)
+node test/workspace-acl-rules.mjs                # workspace ACL red lines and decisions (14 groups)
 ```
 
-它们都是**进程内**运行、自带极小的 `test()` 运行器，不 spawn 子进程、不捕获管道输出（在受限沙箱下 `node --test` 会以 `spawn EPERM` 失败）。多数套件还自带**反向验证**：把关键守卫改坏，对应用例必须变红 —— 一条永远绿的断言等于没有那条断言。
+They all run **in-process** with a tiny built-in `test()` runner: no child processes, no captured pipes (under a restricted sandbox `node --test` fails with `spawn EPERM`). Most suites also carry **reverse verification**: break a key guard and the matching cases must go red — a guard that can never fail is no guard at all.
 
-### 改源码后如何生效
+### Making source edits take effect
 
-**改完源码要重启应用。** 本包在 HMR 监视根之外，Node 的 ESM 缓存会继续返回旧模块；profile patch 虽然会被热重载，但**改一个已经在运行的条目的 `?v=N` 只改到它的 name**，loader 走 name-only 分支、不重新加载。新进程首次加载该条目时，才会真正读到你最新的源码。
+**Restart the app after editing the sources.** This package lives outside the HMR-watched root, so Node's ESM cache keeps serving the old module; and although the profile patch itself *is* hot-reloaded, **bumping `?v=N` on a row that is already running only changes its name** — the loader takes the name-only branch and does not reload. A fresh process reading that row for the first time is what actually picks up your latest source.
 
-顺带两条容易踩的：相对导入**不继承**入口的 query（本包显式逐层传播，所以一次递增刷新整张模块图）；「在同一次保存里删掉又加回」也无效（按 id 比对，仍是同一个条目），必须删、等稳定、再加回。
+Two related traps: a relative import does **not** inherit the entry's query (this package propagates it explicitly, so one bump refreshes the whole module graph), and "delete and re-add within one save" does not work either (the comparison is by id, so it is still the same row) — you must delete, let it settle, then add it back.
 
 ---
 
-## 已知边界
+## Known boundaries
 
-- **模式只能在新会话里选。** 已开跑的会话切不进来。
-- **协调者看不见的东西，它也无法核对。** 保留只读工具正是为了让它能独立验证子代理的结论；若把 `read` / `grep` / `glob` 也摘掉，核实能力就没了。
-- **委派深度是 1。** worker 不能再派；超大任务需要协调者拆成并行的多份任务书。
-- **PTC 的「塌缩」是呈现塌缩，不是能力削减 —— 这是设计，不是缺陷。** `subagent_ptc` 的直接工具面确实只剩 `run_code`，但那份 SDK 绑定表仍然完整可调用（从程序内部）；砍掉它，PTC 就只剩一个空壳。
-- **只读 worker 是「两层收窄」，仍然不是沙箱。** 静态 `toolFilter` 与自适应补收窄在 `dsh-tools` 里是求交关系，结构上不可能放宽；但若某个插件在 worker 创建**之后**才注册一个新的变更类工具，那个工具不会被摘掉（有意取舍）。
-- **审批闸门的兜底只是一条指路通知。** 转呈失败时请求会一直挂着，通知不解除它；真正的解除要靠你在那个子会话里作答。
-- **规则表是模式匹配，会漏判新型危险命令。** 所以真正的闸门是第二级转呈，第一级只负责「安全的不用打扰用户」。
-- **上游改版可能让某个守卫失效**，失效取向一律是「回到没有该守卫的行为」，不是权限被放大。
+- **The mode is only selectable in a new session.** A running session cannot switch in.
+- **What the coordinator cannot see, it cannot verify.** Keeping read-only tools is exactly what lets it check a Subagent's claims; remove `read` / `grep` / `glob` and that ability is gone.
+- **Delegation depth is 1.** A worker cannot delegate further; very large jobs must be split by the coordinator into parallel briefs.
+- **PTC's "collapse" is a presentation collapse, not a capability cut — by design, not a defect.** The direct surface of `subagent_ptc` really is just `run_code`, but the SDK binding table remains fully callable from inside a program; remove it and PTC is an empty shell.
+- **The read-only worker is "two layers of narrowing", still not a sandbox.** The static `toolFilter` and the adaptive narrowing intersect inside `dsh-tools`, so they cannot widen anything; but if a plugin registers a new mutating tool **after** that worker is created, it will not be withheld (a deliberate trade-off).
+- **The approval gate's fallback is only a pointing notice.** When the relay fails the request stays pending, and the notice does not release it; only answering in that child session does.
+- **The rule table is pattern matching, so it will miss novel dangerous commands.** The real gate is therefore the Level-2 relay; Level 1 only exists to keep safe commands from bothering you.
+- **An upstream change can disable a guard**, and every such failure fails towards "the behaviour you had without that guard", never towards wider permissions.
 
-更完整的边界、未确证项、以及每条结论的实测依据，都在 [docs/DESIGN.md](docs/DESIGN.md)。
+More complete boundaries, unverified items, and the measured evidence behind every claim are in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## License
 

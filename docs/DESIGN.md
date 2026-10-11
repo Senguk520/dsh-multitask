@@ -1,7 +1,7 @@
 # dsh-multitask — 设计说明
 
 > **这份文档不是 README。** 面向使用者的说明、安装步骤、设置面板与故障排查在仓库根的
-> [`README.md`](../README.md)（英文版 [`README.en.md`](../README.en.md)）。
+> [`README.md`](../README.md)（英文）与 [`README.zh.md`](../README.zh.md)（中文）。
 >
 > 这里保存的是**开发与维护需要的另一类内容**：设计推导（「为什么必须这么写」）、
 > 验证脚本各自守什么（测试方案），以及如实写出的已知边界与未确证项。
@@ -1055,8 +1055,8 @@ dsh-multitask/
 ├── package.json                        # dsh.bundle.patch → 装载时插入 host 行；dsh.client → 浏览器半
 ├── cordis.patch.yml                    # 向 profile roster 插入 plugin 行（供 bundle 安装方式用）
 ├── LICENSE                             # MIT
-├── README.md                           # ★ 面向使用者的说明（中文）
-├── README.en.md                        # ★ 面向使用者的说明（英文）
+├── README.md                           # ★ 面向使用者的说明（英文）
+├── README.zh.md                        # ★ 面向使用者的说明（中文）
 ├── docs/
 │   └── DESIGN.md                       # ★ 本文件：设计推导 / 验证清单
 ├── lib/
@@ -1076,7 +1076,7 @@ dsh-multitask/
 一个执行点」的决定整体删除，`test/repo-consistency.mjs` 的 C1 会钉住「它不许被重建」。
 
 `package.json` 的 `files` 字段是上面这份清单里**随发布物分发**的那一部分（`lib` /
-`presets` / `cordis.patch.yml` / `README.md` / `README.en.md` / `docs/DESIGN.md` / `LICENSE`）。
+`presets` / `cordis.patch.yml` / `README.md` / `README.zh.md` / `docs/DESIGN.md` / `LICENSE`）。
 **测试套件不在其中**（本包不发测试）。`test/` 目录里的用例见下节，它们**不在**上面
 这份清单里：`test/` 是本地目录，不随仓库与发布物分发（`.gitignore` 有对应规则）。仓库根下的
 `install-multitask.ps1` 同样只在本地存在（`.gitignore` 已忽略）。
