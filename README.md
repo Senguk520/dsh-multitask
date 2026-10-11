@@ -38,12 +38,16 @@ The read-only tools are kept on purpose: the coordinator is meant to **verify** 
 ### From the published package (recommended)
 
 ```
-dsh plugin add dsh-multitask
+dsh plugin --profile <profile> add dsh-multitask
 ```
 
-Or install it from the in-app **Plugins** page. The package lands in the profile's `node_modules`, and the bundled `cordis.patch.yml` inserts a bare package name (`dsh-multitask`) with no absolute paths — so it works on any machine, any user name, any install location.
+`--profile` is an **option** and cannot be dropped — `dsh plugin add dsh-multitask` fails outright with `error: required option '--profile <name>' not specified`. `<profile>` is the profile to install into: the desktop app owns one called `desktop`, and this checkout commonly uses `web`; if you are unsure, look at the directories under `~/.dsh/profiles/`.
 
-> **Desktop (Electron) note.** The app manages its own `desktop` profile exclusively, and the CLI refuses outright: `error: profile "desktop" is managed exclusively by the Electron application`. In that case install from the in-app **Plugins** page, or use the source route below.
+The package then lands in that profile's `node_modules`, and DSH **automatically** appends `dsh-multitask` to the profile's `dsh.profile.bundles` layer list (because this package declares `dsh.bundle.patch`). The bundled `cordis.patch.yml` inserts a bare package name with no absolute paths — so it works on any machine, any user name, any install location. **Restart the app afterwards** — bundle layers are composed at startup.
+
+You can also install it from the in-app **Plugins** page, which needs no command line.
+
+> **Desktop (Electron) note.** **Fully quit the app first** — pnpm rewrites the profile's `node_modules`, and the running app holding those files open will make it fail. The desktop app's own `dsh` launcher can manage `desktop`; a `dsh` **installed separately from npm** is refused outright (`error: profile "desktop" is managed exclusively by the Electron application`). In that case use the in-app **Plugins** page, or the source route below.
 
 ### From a source checkout
 
@@ -154,7 +158,9 @@ Level 1 covers what the sandbox cannot express: destructive commands **inside** 
 
 Authorisation is **one-shot every time**: "Allow once" authorises that call only, and the same call prompts again next time. There is no "always allow".
 
-**With a background dispatch whose turn has ended**, there is nowhere to raise a card (the relay needs the parent session to have an open turn). The plugin then does its best to have a message from that Subagent appear in the main conversation, naming which child session it is, what it wants to run, and where to answer. **That is a notice, not an approval** — the message channel carries no approval result, so the loop still closes only by answering inside that child session; until you do, the call stays blocked.
+**With a background dispatch whose turn has ended**, the first relay fails (it needs the parent session to have an open turn). The plugin then sends a message from that Subagent into the main conversation, naming which child session it is, what it wants to run, and where to answer — and **that message itself wakes the idle parent session**, so the plugin immediately retries the relay against the turn it just opened. In practice an ordinary approval card therefore appears in the main conversation within seconds; answer it there.
+
+Only if that retry also fails (the window elapses, 10 seconds by default) do you need to open the child session named in the message and decide there. **The message is not an approval** — the message channel carries no approval result, so reading it as a go-ahead would bypass the gate; until you answer, that call stays blocked.
 
 ---
 
@@ -203,6 +209,33 @@ The approval gate's preconditions and its verification steps — including the f
 
 ---
 
+## Self-correction: each side's conclusions get checked by the other
+
+This mode has a quiet but important property: **a claim from either side must be grounded in evidence — neither gets by on "I remember" or "I assumed".** It does not depend on a model being asked to review itself; it rests on two mechanisms:
+
+- **When the coordinator's premise is wrong, the worker pushes back.** The worker persona requires it to ground every claim in what it actually observed, never to report a result it did not obtain, and — on hitting a blocking situation — to stop and report it verbatim instead of improvising a workaround. So when a premise in the brief does not hold, it names the premise that does not.
+- **Whatever a worker reports, the coordinator re-checks independently.** Keeping the read-only tools (`read` / `grep` / `glob` / `file_info`) is exactly what lets it go and look for itself rather than treating the report as fact.
+
+In other words: the worker is not there to agree with the brief, and the coordinator may not promote a report into a conclusion — **neither side accepts the other's assertion on trust.**
+
+That is not inferred from the design intent; it was measured. The three screenshots below are consecutive views of one end-to-end test report, and the three mistakes in it were **all corrected by a worker**:
+
+![Test report 1: all four delegation paths exercised, depth limit, context isolation and concurrency](docs/test_image/1.png)
+
+![Test report 2: reading outside the workspace is fully permitted, and the complete write-outside-the-workspace chain](docs/test_image/2.png)
+
+![Test report 3: the three mistakes I made (all corrected by a worker) and the final on-disk state](docs/test_image/3.png)
+
+- **Misjudged the asar as unreadable.** The coordinator first concluded "a packed archive means the sources are unreadable" and told the worker to back off; the worker contradicted it — `ripgrep` reads `.asar` as text, and inside is the real, commented source. The coordinator re-checked, confirmed the worker was right and it was wrong, and got source-level answers to six of seven questions.
+- **Wrote the wrong escalation value.** The coordinator wrote "the narrowest escalation that is still wider", which the native worker read as `workspace-write` — the mode it was already in. Line-by-line verification of the source left no room for interpretation: `app.asar:911220` reads `if (mode === effectiveMode) return effectiveMode;` — **the same level is a silent no-op that never requests approval**; `:911221` reads `is not strictly wider than` (a level that is not wider throws outright); and the ladder has exactly one rung (`:911150-151`, `"workspace-write": ["danger-full-access"]`). The second refusal (byte-for-byte identical to the first) was therefore purely a defect in the brief, and it burned an approval window for nothing. Switching to `danger-full-access` went through on the first try.
+- **Misjudged the temp directory's permissions.** The coordinator asserted the temp directory "needs no escalation"; the cleanup worker measured it being refused and pointed out that the brief's premise did not hold. The correct reading: a **session-private** temp directory (with its own SID and ACE) is not the same as the platform temp root.
+
+One more case from the same run: a file appeared that no brief had asked for, and two independent lines of evidence agreed it was written by a PTC worker probing its own native tool permissions — it deliberately picked a path that looked nonexistent, expected a refusal, and the write succeeded; seeing the file in a concurrent call, it first misattributed it to a sibling worker, and later **withdrew its own "it was not me"**. An independent forensic worker measured the file's NTFS creation time and found it matching that account to the millisecond, inside a 15.6-second window between two other writes — while stating plainly that the filesystem cannot attribute authorship. The evidence established that the file belonged to this session; attribution came from the worker's own account, and that distinction was not glossed over.
+
+To check this yourself: put a **deliberately wrong premise** in a brief (assert that some file is unreadable, say), and expect the worker to name the premise that does not hold rather than work around it.
+
+---
+
 ## Tunables (profile)
 
 Override by **id**, appending after the `dsh-multitask` `insert` block (a later entry with the same id wins):
@@ -233,13 +266,30 @@ The remaining switches live in the `config` of the corresponding rows in `preset
 
 The environment variable `DSH_MULTITASK_MULTI_MODE=0` disables the `subagent_ptc` and `subagent_minimal` paths and the PTC presentation plugin in one step, without touching the original `subagent` / `subagent_fork`; it is read at module load, so it needs an app restart.
 
+### The approval-gate row's switches
+
+The profile patch cannot reach this row's `config` — the host half applies only the top-level switches, and only to the `coordinator-guard` row. To change it, edit its `config` in `presets/multitask/composition.mjs` and restart the app:
+
+| Field | Default | What it does |
+|---|---|---|
+| `classify` | `true` | Master switch for Level 1 (the deterministic rule table). `false` = dangerous commands are no longer stopped to ask; the Level-2 relay still runs |
+| `relay` | `true` | Master switch for Level 2 (the relay). `false` = a Subagent's request no longer reaches the main conversation |
+| `relayRetryWindowMs` | `10000` | How long to wait for the parent session to open a turn when the turn was just closed (ms). `0` disables the retry (back to notice-only) |
+| `notifyOnRelayFailure` | `true` | The fallback notice when the relay fails. `false` turns it off (the retry still runs) |
+| `extraDangerPatterns` | `[]` | Extra danger patterns, each `{ id, re }` or a bare string / regex. It can only **add** a prompt, never remove one |
+| `safePatterns` | `[]` | Extra "match but do not ask" allow-patterns. ⚠️ This is a **prompt-suppressing** channel: a mistake silently lets a dangerous command through |
+| `shellTools` | `['pwsh', 'bash']` | Extra tool names whose command text should be classified (a wrong name does not error, it silently misses) |
+| `fileTools` | `['write', 'edit']` | Extra write tools whose `file_path` may point outside the workspace |
+
+`extraDangerPatterns` / `shellTools` / `fileTools` are **additive**: missing one only means those cases are not examined (equivalent to not having this module), and it never lets through something this module would have asked about. `safePatterns` is **subtractive**: it cancels a danger this module has **already** judged, which is why it is deliberately empty by default — a mistake there is a silent permit, not one fewer prompt.
+
 Source edits take effect only after a **restart**.
 
 ---
 
 ## Uninstalling
 
-If you installed from the package manager, let it do the work: `dsh plugin remove dsh-multitask`, or uninstall from the **Plugins** page.
+If you installed from the package manager, let it do the work: `dsh plugin --profile <profile> remove dsh-multitask`, or uninstall from the **Plugins** page.
 If you installed from a source checkout, delete the whole `- insert: - id: multitask` block from the profile patch.
 
 Either way the mode disappears from the selector for **new** sessions (running sessions are unaffected), and **no restart is needed** — DSH hot-reloads that patch, and the plugin unregisters its own preset declaration on unload. To **suspend** it temporarily instead, add `disabled: true` to that row.
@@ -263,31 +313,14 @@ dsh-multitask/
 │   ├── approval-gate.mjs               # the approval gate for dangerous operations
 │   ├── workspace-acl.mjs               # workspace ACL: grants WRITE_OWNER (the only module that changes system state)
 │   └── file-info.mjs                   # the read-only metadata tool file_info
-├── docs/DESIGN.md                      # design reasoning, measured evidence, verification checklist
+├── docs/
+│   ├── DESIGN.md                       # design reasoning, upstream evidence, known boundaries
+│   └── test_image/                     # the screenshots the READMEs embed
 ├── README.md (English) / README.zh.md (Chinese)
 └── LICENSE
 ```
 
-The preset modules (`presets/multitask/*.mjs`) **import nothing**: they pull in no `@deepseek-ai/*` dependency, because a failed import means the whole preset fails to mount. The cost is that a few constants are duplicated, and the verification scripts compare them.
-
-### Local checks
-
-> ★ **Rule: every test file belongs in `test/`.**
-> Probes, verification scripts, one-off checks, diagnostics, regression suites — all go in `test/` and run with `node test/<name>.mjs`; nowhere else. The whole `test/` directory is ignored by `.gitignore` and deliberately untracked (tests do not go to the remote), and it is not part of the published package.
-
-There are seven local suites; each derives the modules under test from its own location, so the checkout runs from any path, non-ASCII included:
-
-```powershell
-node test/guard-mode-isolation-regression.mjs    # mode-isolation regression (13 groups)
-node test/repo-consistency.mjs                   # repo consistency / doc consistency / test placement (38 groups)
-node test/subagent-mode-marker-source.mjs        # where the mode marker comes from (foreground and background dispatch, 9 cases)
-node test/minimal-guard-catalog.mjs              # the read-only worker's catalog filter (12 cases)
-node test/approval-gate-rules.mjs                # approval rule table: missed and false positives (8 groups)
-node test/approval-gate-integration.mjs          # gate direction / event shape / relay direction (38 groups)
-node test/workspace-acl-rules.mjs                # workspace ACL red lines and decisions (14 groups)
-```
-
-They all run **in-process** with a tiny built-in `test()` runner: no child processes, no captured pipes (under a restricted sandbox `node --test` fails with `spawn EPERM`). Most suites also carry **reverse verification**: break a key guard and the matching cases must go red — a guard that can never fail is no guard at all.
+The preset modules (`presets/multitask/*.mjs`) **import nothing**: they pull in no `@deepseek-ai/*` dependency, because a failed import means the whole preset fails to mount. The cost is that a few constants are duplicated, and changing one means changing the other.
 
 ### Making source edits take effect
 
@@ -301,6 +334,7 @@ Two related traps: a relative import does **not** inherit the entry's query (thi
 
 - **The mode is only selectable in a new session.** A running session cannot switch in.
 - **What the coordinator cannot see, it cannot verify.** Keeping read-only tools is exactly what lets it check a Subagent's claims; remove `read` / `grep` / `glob` and that ability is gone.
+- **Self-correction is a dependable tendency, not a hard guarantee.** That all three mistakes were pushed back on is a measured result, and it rests on two mechanisms being present **at the same time**: the worker persona forbidding results it did not obtain, and the coordinator keeping its read-only tools. With either one gone, the correction may simply not happen.
 - **Delegation depth is 1.** A worker cannot delegate further; very large jobs must be split by the coordinator into parallel briefs.
 - **PTC's "collapse" is a presentation collapse, not a capability cut — by design, not a defect.** The direct surface of `subagent_ptc` really is just `run_code`, but the SDK binding table remains fully callable from inside a program; remove it and PTC is an empty shell.
 - **The read-only worker is "two layers of narrowing", still not a sandbox.** The static `toolFilter` and the adaptive narrowing intersect inside `dsh-tools`, so they cannot widen anything; but if a plugin registers a new mutating tool **after** that worker is created, it will not be withheld (a deliberate trade-off).

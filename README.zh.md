@@ -38,12 +38,16 @@
 ### 用发布包（推荐）
 
 ```
-dsh plugin add dsh-multitask
+dsh plugin --profile <profile> add dsh-multitask
 ```
 
-或在 DSH 的**插件**页面里安装。包落在 profile 的 `node_modules` 下，由本包自带的 `cordis.patch.yml` 插入一行裸包名 `dsh-multitask`，不含任何绝对路径，所以在任何机器、任何用户名、任何安装位置都成立。
+`--profile` 是个**选项**，不能省 —— 写成 `dsh plugin add dsh-multitask` 会直接报 `error: required option '--profile <name>' not specified`。`<profile>` 是你要装进去的 profile 名：桌面版应用自己那个叫 `desktop`，仓库里另一个常用的是 `web`；不确定就看 `~/.dsh/profiles/` 下有哪些目录。
 
-> **桌面版（Electron）注意**：应用自有的 `desktop` profile 由应用独占管理，CLI 会直接拒绝（`error: profile "desktop" is managed exclusively by the Electron application`）。这种情况请用应用内的**插件**页面安装，或走下面的源码安装路径。
+装完后包落在 profile 的 `node_modules` 下，并且 DSH 会**自动**把 `dsh-multitask` 追加进该 profile 的 `dsh.profile.bundles` 层列表（因为本包声明了 `dsh.bundle.patch`）。本包自带的 `cordis.patch.yml` 插入的是一行裸包名，不含任何绝对路径，所以在任何机器、任何用户名、任何安装位置都成立。**装完重启应用** —— bundle 层是在启动时组装的。
+
+也可以在 DSH 的**插件**页面里安装（那条路不用命令行）。
+
+> **桌面版（Electron）注意**：装之前先**完全退出应用** —— pnpm 要重写 profile 的 `node_modules`，应用占着里面的文件会让它失败。用应用自带的那个 `dsh` 启动器可以管理 `desktop`；而**从 npm 单独装的 `dsh`** 会被直接拒绝（`error: profile "desktop" is managed exclusively by the Electron application`），那种情况请用应用内的**插件**页面，或走下面的源码安装路径。
 
 ### 从源码 checkout 运行
 
@@ -154,7 +158,9 @@ Error: subagent limit reached (active child limit: 8); wait for an existing chil
 
 授权是**每次一次性**的：点「允许一次」只放行这一次，再次发同样调用会再次弹窗，没有「永久允许」。
 
-**后台派单 + 你的回合已结束**时弹窗无处可弹（转呈要求父会话有一个打开的回合）。此时插件会尽力通过消息通道，让主对话出现一条来自该子代理的消息，写明是哪个子会话、想执行什么、去哪里作答。**那是通知，不是批准** —— 消息通道不携带审批结果，闭环仍然要在那个子会话里作答才能完成；在你作答之前，那次调用保持阻塞。
+**后台派单 + 你的回合已结束**时，第一次转呈会失败（它要求父会话有一个打开的回合）。此时插件会通过消息通道发一条来自该子代理的消息，写明是哪个子会话、想执行什么、去哪里作答 —— 而**这条消息本身会把空闲的父会话唤醒**，插件随即抓住刚打开的回合**重试一次转呈**。所以通常几秒内主对话里就会出现正常的审批卡，直接在那里作答即可。
+
+只有在重试也没成功时（窗口耗尽，默认 10 秒），才需要按消息里的 id 打开那个子会话作答。**消息不是批准** —— 消息通道不携带审批结果，若读成放行就等于绕过了审批；在你作答之前，那次调用一直保持阻塞。
 
 ---
 
@@ -203,6 +209,51 @@ dsh-multitask: coordinator scope engaged — withheld N tool(s): edit, pwsh, rea
 
 ---
 
+## 自我纠正：各自的结论都要被对方核验
+
+这个模式有一个不显眼、但很要紧的性质：**两边说出来的话都必须有实证 —— 谁也不能靠「我记得」「我以为」过关。**
+它不是靠某个模型自我检讨，而是靠两条机制：
+
+- **协调者的前提写错，worker 会顶回来。** worker 人格要求它「以实际观察为据，没得到的结果不许报」，
+  遇到阻塞要「停在原地、逐字上报，而不是自己编一个绕过」。任务书里的前提不成立时，它把不成立的那一句指出来。
+- **worker 报回来的结论，协调者会独立复验。** 协调者保留只读工具（`read` / `grep` / `glob` / `file_info`）
+  正是为了能自己去看一眼，而不是把回报当成事实。
+
+也就是：worker 不必附和简报，协调者不许直接把回报当结论 —— **两边都不采信对方的断言**。
+
+这不是设计意图的推演，是实测过的。下面三张图是同一份端到端实测报告的连续三屏，其中的三条错
+**全部由 worker 纠正**：
+
+![实测报告（一）：四条委派通道全部实测、深度限制、上下文隔离与并发](docs/test_image/1.png)
+
+![实测报告（二）：读取工作区外完全可行、写入工作区外的完整链路](docs/test_image/2.png)
+
+![实测报告（三）：我犯的三个错（全部由 worker 纠正）、谜团文件的来源与最终磁盘状态](docs/test_image/3.png)
+
+- **误判 asar 不可读。** 协调者先判定「打包存档 → 源码不可读」并让 worker 收手；worker 反驳 ——
+  `ripgrep` 把 `.asar` 当文本读，里面是带注释的真源码。协调者复验后确认是它对、自己错，
+  七个问题拿到六个源码级答案。
+- **升权档位写错。** 协调者写「最窄的可用更宽档位」，worker 理解为 `workspace-write` —— 而当前模式
+  本来就是这一档。逐行复核源码后，结论硬到没有解释余地：`app.asar:911220` 的
+  `if (mode === effectiveMode) return effectiveMode;` 说明**同档是静默 no-op、根本不请求审批**；
+  `:911221` 的 `is not strictly wider than` 说明非更宽档直接抛错；而升权阶梯只有一档
+  （`:911150-151` 的 `"workspace-write": ["danger-full-access"]`）。于是第二次拒绝
+  （与第一次逐字节相同）纯属任务书缺陷，还白耗掉一个审批窗。改成 `danger-full-access` 之后一次通过。
+- **误判临时目录权限。** 协调者断言临时目录「无需升权」，cleanup worker 实测被拒，并指出简报的
+  前提不成立。正确理解是：**会话私有**的临时目录（`dsh-SZKRQR`，带独立 SID / ACE）不等于平台临时根。
+
+同源的还有一条谜团：一个不在任何任务书里的文件（`nonexistent-probe.txt`）。两条独立证据链指向
+它是 PTC worker 探测工具权限时自己写的（它故意挑了个「像不存在」的路径、预期被拒，结果写成功了；
+随后在并发调用里看到该文件，一度误归因给别的 worker）；它最终**主动撤回**了「不是我建的」的说法，
+而独立取证 worker 量到的 NTFS 创建时间（`01:44:43.760`）与它的自述毫秒级吻合、且落在另两次写入
+之间的 15.6 秒窗口内。取证 worker 如实声明**文件系统无法认定作者** —— 「确属本会话」由证据坐实、
+「作者是谁」由当事 worker 的自述补上，这个区分没有被含混过去。
+
+想自己核验这一点：在任务书里**故意写错一个前提**（例如断言某个文件不可读），期望的结果是
+worker 把前提不成立指出来，而不是绕过去硬做。
+
+---
+
 ## 可调项（profile）
 
 按 **id 定位**覆盖，追加在 `dsh-multitask` 那段 `insert` 之后即可（同 id 的后者覆盖前者）：
@@ -233,13 +284,30 @@ dsh-multitask: coordinator scope engaged — withheld N tool(s): edit, pwsh, rea
 
 环境变量 `DSH_MULTITASK_MULTI_MODE=0` 一次停用 `subagent_ptc` / `subagent_minimal` 两条路径与 PTC 呈现插件，不影响原有的 `subagent` / `subagent_fork`；它在模块加载时读取，需要重启应用。
 
+### 审批闸门那一行的开关
+
+`approval-gate` 这一行的 `config` 在 profile patch 里**够不到** —— 宿主半只把顶层那几个开关应用到 preset 内部，而且只改 `coordinator-guard` 那一行。要动它，改 `presets/multitask/composition.mjs` 里它的 `config`，然后重启应用：
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `classify` | `true` | 第一级（确定性规则表）总开关。设 `false` = 危险命令不再被拦下询问；第二级转呈仍在 |
+| `relay` | `true` | 第二级（转呈）总开关。设 `false` = 子代理的请求不再落到主对话 |
+| `relayRetryWindowMs` | `10000` | 「回合刚好关着」时等父会话开回合的上限（毫秒）。`0` = 关闭重试（退回只发通知的行为） |
+| `notifyOnRelayFailure` | `true` | 转呈失败时的兜底通知。设 `false` 关掉它（重试照常进行） |
+| `extraDangerPatterns` | `[]` | 追加危险模式，每项 `{ id, re }` 或裸字符串 / 正则。**只会多问一次，不会少问** |
+| `safePatterns` | `[]` | 追加「命中也不问」的放行模式。⚠️ 这是**抑制询问**的通道，写错会静默放过危险命令 |
+| `shellTools` | `['pwsh', 'bash']` | 追加需要看命令文本的工具名（名字写错不报错，只会静默漏判） |
+| `fileTools` | `['write', 'edit']` | 追加「会把 `file_path` 指向工作区之外」的写工具名 |
+
+`extraDangerPatterns` / `shellTools` / `fileTools` 是**加法**：漏了只意味着那些情况不被过问（等于没有这个模块），不会放过任何它本来会问的东西。`safePatterns` 是**减法**：它取消的是本模块**已经**判定的危险，所以它默认刻意留空 —— 写错它是静默放行，不是少问一次。
+
 改源码必须在**重启**后生效。
 
 ---
 
 ## 卸载
 
-用包管理器装的，交给它：`dsh plugin remove dsh-multitask`，或在**插件**页面里卸载。
+用包管理器装的，交给它：`dsh plugin --profile <profile> remove dsh-multitask`，或在**插件**页面里卸载。
 从源码 checkout 装的，把 profile patch 里那一整段 `- insert: - id: multitask` 删掉。
 
 两种方式下，模式都会从**新**会话的选择器里消失（已开跑的会话不受影响），且**不需要重启** —— DSH 会热重载这个 patch，插件卸载时会注销自己那份 preset 声明。想**临时停用**而不卸载，给那一行加 `disabled: true`。
@@ -263,31 +331,14 @@ dsh-multitask/
 │   ├── approval-gate.mjs               # 审批闸门：危险操作弹窗
 │   ├── workspace-acl.mjs               # 工作区 ACL：补 WRITE_OWNER（唯一改系统状态的模块）
 │   └── file-info.mjs                   # 只读元数据工具 file_info
-├── docs/DESIGN.md                      # 设计推导、实测记录、验证清单
+├── docs/
+│   ├── DESIGN.md                       # 设计推导、上游依据、已知边界
+│   └── test_image/                     # README 引用的实测截图
 ├── README.md（英文）/ README.zh.md（中文）
 └── LICENSE
 ```
 
-预设模块（`presets/multitask/*.mjs`）**零 import**：它们不引入任何 `@deepseek-ai/*` 依赖 —— 导入失败等于整份 preset 挂载失败。代价是少量常量各自留一份，由校验脚本比对。
-
-### 自检
-
-> ★ **规矩：所有测试文件都必须写进 `test/`。**
-> 探针、校验脚本、一次性核对、诊断脚本、回归套件 —— 一律放 `test/`，用 `node test/<名字>.mjs` 运行，不要放在别处。`test/` 整个目录被 `.gitignore` 忽略，按「是测试就不进远端」的规矩刻意不跟踪，也不进发布物。
-
-本地现有七套校验，都从脚本自身位置推导被测模块，所以仓库放在任何路径下（含非 ASCII 路径）都能跑：
-
-```powershell
-node test/guard-mode-isolation-regression.mjs    # 模式隔离回归（13 条断言组）
-node test/repo-consistency.mjs                   # 仓库一致性 / 文档一致 / 测试归位（38 条断言组）
-node test/subagent-mode-marker-source.mjs        # 模式标记的来源（前台与后台两条派单路径，9 条用例）
-node test/minimal-guard-catalog.mjs              # 只读 worker 的目录级过滤（12 条用例）
-node test/approval-gate-rules.mjs                # 审批规则表的漏判与误报（8 条断言组）
-node test/approval-gate-integration.mjs          # 审批闸门的门控 / 事件形状 / 转呈方向（38 条断言组）
-node test/workspace-acl-rules.mjs                # 工作区 ACL 的红线与决策（14 条断言组）
-```
-
-它们都是**进程内**运行、自带极小的 `test()` 运行器，不 spawn 子进程、不捕获管道输出（在受限沙箱下 `node --test` 会以 `spawn EPERM` 失败）。多数套件还自带**反向验证**：把关键守卫改坏，对应用例必须变红 —— 一条永远绿的断言等于没有那条断言。
+预设模块（`presets/multitask/*.mjs`）**零 import**：它们不引入任何 `@deepseek-ai/*` 依赖 —— 导入失败等于整份 preset 挂载失败。代价是少量常量各自留一份，改一处必须同步另一处。
 
 ### 改源码后如何生效
 
@@ -301,6 +352,7 @@ node test/workspace-acl-rules.mjs                # 工作区 ACL 的红线与决
 
 - **模式只能在新会话里选。** 已开跑的会话切不进来。
 - **协调者看不见的东西，它也无法核对。** 保留只读工具正是为了让它能独立验证子代理的结论；若把 `read` / `grep` / `glob` 也摘掉，核实能力就没了。
+- **自我纠正是一条可依赖的倾向，不是硬保证。** 三条错全被 worker 顶回是实测结果，但它靠的是「worker 人格不许凭空报结果」与「协调者保留只读工具」两条机制**同时在场**；缺任何一条，纠正都可能不发生。
 - **委派深度是 1。** worker 不能再派；超大任务需要协调者拆成并行的多份任务书。
 - **PTC 的「塌缩」是呈现塌缩，不是能力削减 —— 这是设计，不是缺陷。** `subagent_ptc` 的直接工具面确实只剩 `run_code`，但那份 SDK 绑定表仍然完整可调用（从程序内部）；砍掉它，PTC 就只剩一个空壳。
 - **只读 worker 是「两层收窄」，仍然不是沙箱。** 静态 `toolFilter` 与自适应补收窄在 `dsh-tools` 里是求交关系，结构上不可能放宽；但若某个插件在 worker 创建**之后**才注册一个新的变更类工具，那个工具不会被摘掉（有意取舍）。

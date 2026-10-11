@@ -4,11 +4,13 @@
 > [`README.md`](../README.md)（英文）与 [`README.zh.md`](../README.zh.md)（中文）。
 >
 > 这里保存的是**开发与维护需要的另一类内容**：设计推导（「为什么必须这么写」）、
-> 验证脚本各自守什么（测试方案），以及如实写出的已知边界与未确证项。
+> 各项决定所依据的上游事实与失败取向，以及如实写出的已知边界与未确证项。
 > 它是本仓库的工程记录，**允许长**，也允许保留「早先这样做是错的」这类纠正记录 ——
 > 那正是后来者不再踩同一个坑的依据。
 >
 > 阅读顺序建议：先读 README 弄懂它是什么，再回到这里看它为什么成立。
+> ⚠️ **测试套件的内容不在这份文档里** —— `test/` 不随仓库与发布物分发，写在这里读者也拿不到。
+> 想核对「某个设计事实由什么守着」，看本机未被跟踪的 `docs/remember.md`。
 
 把 Cursor 的 **Multitask** 工作模式复现到 DSH。
 
@@ -42,17 +44,28 @@
 ### 给使用者：装正式包
 
 ```
-dsh plugin add dsh-multitask
+dsh plugin --profile <profile> add dsh-multitask
 ```
 
-或在 DSH 的**插件**页面里安装。装好后包落在 profile 的 `node_modules` 下
-（`~/.dsh/profiles/<profile>/node_modules/dsh-multitask/`），profile patch 里由本包自带的
-`cordis.patch.yml` 插入一行裸包名 `dsh-multitask` —— 由 DSH 的 bundle 机制解析，
-**不含任何绝对路径**，所以在任何机器、任何用户名、任何安装位置都成立。
+`--profile` 是个**选项，不能省** —— `dsh plugin add dsh-multitask` 会直接报
+`error: required option '--profile <name>' not specified`。`<profile>` 是目标 profile 名
+（桌面版应用自己那个叫 `desktop`；`~/.dsh/profiles/` 下有哪些目录就是哪些）。
 
-> **桌面版（Electron）注意**：应用自有的 `desktop` profile 由应用独占管理，
-> CLI 会直接拒绝：`error: profile "desktop" is managed exclusively by the Electron application`。
-> 这种情况请用应用内的**插件**页面安装，或走下面的源码安装路径。
+装好后包落在该 profile 的 `node_modules` 下
+（`~/.dsh/profiles/<profile>/node_modules/dsh-multitask/`），并且 DSH 会**自动**把
+`dsh-multitask` 追加进该 profile 的 `dsh.profile.bundles` 层列表（依据是本包声明了
+`dsh.bundle.patch` —— `runProfilePnpm()` 在 pnpm 成功后走 `reconcile()`，
+「新装的 bundle 依赖自动启用」）。本包自带的 `cordis.patch.yml` 插入的是一行裸包名，
+**不含任何绝对路径**，所以在任何机器、任何用户名、任何安装位置都成立。
+**装完要重启应用** —— bundle 层在启动时组装。
+
+> **桌面版（Electron）注意**：装之前请**完全退出应用** —— 上游 `requireDesktopProfile()`
+> 的报错原文就是这么要求的（`... then fully quit it before running dsh plugin --profile desktop.`）。
+> 理由是 pnpm 要重写 profile 的 `node_modules`，让应用占着里面的文件是有风险的。
+> 另外，「拒绝 desktop」那条**只对从 npm 单独安装的 `dsh` 生效**：CLI 里的判据是
+> `if (!manageDesktopProfile) rejectElectronProfile(...)`，而应用自带的启动器
+> （`dsh.cmd` → `dsh-desktop-host`）会传 `manageDesktopProfile: true`，所以它**可以**
+> 管理 desktop。旧的「CLI 一律拒绝 desktop」说法不准确，已更正。
 
 ### 给开发者：从源码 checkout 运行
 
@@ -225,7 +238,7 @@ clone 本仓库、直接跑工作区里的源码时用这条（改动不经过 n
 与 minimal worker 的 `DEFAULT_MINIMAL_KEEP`（两个白名单都是**默认关闭**，
 漏加一行不报错，只让该角色看不到它）。
 
-> ⚠️ 以上是**机制事实**（源码 + 本包自带的进程内用例）。它在一个真实部署里是否真被注册、
+> ⚠️ 以上是**机制事实**（源码 + 白名单两处都在位）。它在一个真实部署里是否真被注册、
 > 协调者与 minimal worker 是否真能看到它，需要装机后核对 —— 这属于使用者的验证步骤，
 > 不是本包能替你确认的事。
 
@@ -617,8 +630,7 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 **不会放宽任何东西**。所以本级只可能**增加**一次询问，绝不可能减少保护。
 
 反过来说，**误报是它真正的风险**：每次无谓的询问都会让用户向「无脑点允许」靠一点。
-所以规则表是**成对**维护的 —— `test/approval-gate-rules.mjs` 里同时有
-「65 条必问」与「37 条必放行」两张清单，改正则时两边一起跑。
+所以规则表是**成对**维护的：既有一张「必问」清单，也有一张「必放行」清单，改正则时两边一起跑。
 刻意不问的例子：`git clean -nd`（干跑）、`chmod +x`、`chown user:user f`（日常）、
 `net user` / `wmic process list`（只读列举）、`ls /`、`cat /etc/hosts`（只读）、
 **`icacls <路径>`（不带变更开关时只是显示权限）**。
@@ -628,7 +640,6 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 > 弹了一次窗，用户不得不为一个**纯粹只读**的命令点「允许」。
 > 现在规则要求**出现变更开关**（`/grant` `/deny` `/remove` `/setowner` `/reset`
 > `/inheritance` `/g` `/p` …）才算危险，而 `takeown` 仍然一律问。
-> 这两条都有用例钉住（必问清单里是带开关的写法、必放行清单里是只读的写法）。
 
 **覆盖到 PTC 程序内部**：`run_code` 的桥在派发子调用时构造的输入带 `parent` 令牌，
 而它走的就是 `scheduler.prepare` → `prepareExecution` —— 后者第一件事就是跑
@@ -691,26 +702,40 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 | `MULTITASK-APPROVAL-NOTIFY-SENT` | 转呈失败后，已尽力用消息通道把「有决定在等你」送到父会话 |
 | `MULTITASK-APPROVAL-NOTIFY-SKIPPED reason=…` | 没发通知及原因（`disabled-by-config` / `no-subagents-service` / `not-direct-parent` / `signal-aborted`） |
 | `MULTITASK-APPROVAL-NOTIFY-FAILED` | 通知本身发不出去（不影响审批结果） |
+| `MULTITASK-APPROVAL-RELAY-RETRY-RETRIED` | 通知唤醒父会话后重试转呈**成功**，用户的决定已拿到（含 outcome） |
+| `MULTITASK-APPROVAL-RELAY-RETRY-WAITING` | 正在等父会话的回合打开（`reason=turn-already-open` 时不必等） |
+| `MULTITASK-APPROVAL-RELAY-RETRY-SKIPPED reason=…` | 没有重试及原因（`disabled-by-config` / `not-a-turn-boundary-failure` / `notice-not-delivered` / `turn-state-unreadable` / `signal-aborted` / `parent-not-interactive`） |
+| `MULTITASK-APPROVAL-RELAY-RETRY-FAILED reason=…` | 重试没成功（`window-elapsed` / `retry-threw` / `no-approval-service`），已退回原路径 |
 
 `MULTITASK-APPROVAL-GATE-SKIPPED` 与 `ENGAGED` 都随计数递增，所以派了 N 个 worker
 却一个都没放开时，日志里能看出「跳过了几次、每次为什么」。
 
 ### 如实写出的边界（别把它当成比实际更强的东西）
 
-- **父会话空闲时，子代理的审批无法转呈**（`approval.request` 要求有一个打开的回合，
-  否则抛错）。此时退回原路径并 fail-closed，**并触发兜底**（见下条）。这是**已知限制**，
-  不是缺陷 —— 一个后台续跑的子代理在父会话空闲时想提权，用户看不到弹窗，那个调用会被拒。
-- **兜底只是一条「指路」的通知，不是批准。** 转呈失败后，本模块会尽力通过 Agent 消息通道
+- **父会话空闲时，转呈要靠「唤醒 + 重试」这一条路兜住，它有一个窗口上限。**
+  `approval.request` 要求父会话有一个打开的回合，否则抛错。而这种「回合刚好关着」的个例**不是
+  随机故障**：后台派单时协调者派完就不等了，父会话的回合随之结束，子代理后面才动手 ——
+  所以它会在**一部分**请求上稳定复现（磁盘实测：某次回合结束与请求发起之间差 7.7 秒，
+  而父会话被唤醒后 **3 毫秒**就开了回合）。
+  本模块的处置是：转呈失败 → 发通知（那条通知会把空闲的父会话唤醒）→ 等回合打开 → 重试一次。
+  于是这类个例通常**几毫秒**就回到正常路径（主对话里出现一张审批卡）。
+  仍然有三条边界：① 只在**通知确实送达**时才等（没有送达就没东西会去唤醒父会话）；
+  ② 只在**「缺打开回合」这一种失败**上重试（别的失败重试不会变好，还可能造成重复询问）；
+  ③ 窗口默认 10 秒（`config.relayRetryWindowMs`，设 0 关闭），耗尽后退回原路径并 fail-closed。
+- **兜底通知不是批准，重试成功才是「已批准」。** 转呈失败后，本模块会尽力通过 Agent 消息通道
   （`subagents.sendMessage`）让主对话出现一条来自该子代理的消息，写明**是哪个子会话、
-  想执行什么、去哪里作答**。这段文案里刻意写明「这不是批准、在你作答前那次调用保持阻塞」——
-  因为消息通道**不携带审批结果**，若被读成放行就等于绕过了审批。闭环仍然只有在那个子会话里
-  作答才能完成。另有两条边界：它只对 `backgroundMode: 'continuable'` 的 worker 有效
-  （本模式四类 worker 都是；`subagent_codex` / `subagent_claude_code` 是 `one-shot`，发不出去）；
+  想执行什么、去哪里作答**。这段文案刻意写成**条件式**（「若本对话里出现了审批卡就在这里作答，
+  否则打开那个子会话」）——因为重试可能成功、也可能失败，文案必须在两种结局下都为真；
+  而消息通道**不携带审批结果**，若被读成放行就等于绕过了审批。另有两条边界：
+  它只对 `backgroundMode: 'continuable'` 的 worker 有效（本模式四类 worker 都是；
+  `subagent_codex` / `subagent_claude_code` 是 `one-shot`，发不出去）；
   且 `sendMessage` 只认**直接**父子，多级委派时会跳过（记 `not-direct-parent`）。
-- **转呈失败时请求会一直挂着，兜底不解除它。** 这是最容易被误解的一条：宿主把请求发给浏览器后，
+- **重试没能成功时，请求会一直挂着，兜底不解除它。** 这是最容易被误解的一条：宿主把请求发给浏览器后，
   客户端会为那个（不可见的）子会话**无条件**物化作用域并接住它，而审批路径**没有任何超时**，
   所以那次工具调用会一直阻塞。`run_code` 是例外（它的预算**包含**审批等待）。兜底的作用是让
   用户**知道并找得到**那个请求，真正的解除要靠用户去那个子会话批准/取消，或取消整个回合。
+  日志上区分得开：重试成功是 `-RELAY-RETRY-RETRIED`（拿到了决定），
+  没成功是 `-RELAY-RETRY-FAILED reason=window-elapsed`（要用户自己去子会话）。
 - **规则表是模式匹配，会漏判新型危险命令。** 所以真正的闸门是第二级，
   第一级只负责「安全的不用打扰用户」。
 - **上游改版可能让本模块失效**：它依赖几个未文档化的上游细节（`overrideOf` 取最后一条、
@@ -719,6 +744,36 @@ header，那会抛 `session header uses retired policy baseline fields`）。
   因为父会话不是 `ask` 时本模块什么都不做，而所有失败路径都是「交回下游」。
 - **它不改变沙箱。** 危险命令被批准后仍在该调用原有的沙箱模式下执行；本模块只决定
   「要不要问」，不决定「给多大权限」。
+
+### 可调项（这一行的 `config`）
+
+**profile patch 够不到这一行。** 宿主半（`lib/index.js` 的 `applyGuardOverrides`）只把顶层那几个
+开关应用到 preset 内部，而且只改 `coordinator-guard` 那一行 —— 所以改这一行的开关要动
+`presets/multitask/composition.mjs` 里 `approval-gate` 那一行的 `config`，然后重启应用。
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `classify` | `true` | 第一级（规则表）总开关。`false` = 危险命令不再被拦下询问；第二级转呈仍在 |
+| `relay` | `true` | 第二级（转呈）总开关。`false` = 子代理的请求不再落到主对话 |
+| `relayRetryWindowMs` | `10000` | 「回合刚好关着」时等父会话开回合的上限（毫秒）。`0` = 关闭重试 |
+| `notifyOnRelayFailure` | `true` | 转呈失败时的兜底通知。`false` 关掉它（重试照常进行） |
+| `extraDangerPatterns` | `[]` | 追加危险模式，每项 `{ id, re }` 或裸字符串 / 正则 |
+| `safePatterns` | `[]` | 追加「命中也不问」的放行模式 |
+| `shellTools` | `['pwsh', 'bash']` | 追加需要看命令文本的工具名 |
+| `fileTools` | `['write', 'edit']` | 追加「会把 `file_path` 指向工作区之外」的写工具名 |
+
+**这几个字段的失败方向并不一样，下面几条值得单独写清：**
+
+- `extraDangerPatterns` / `shellTools` / `fileTools` 是**加法**，失败方向安全：漏配一条 =
+  那种情况不被过问（与本模块不存在时等价），**不会**放过任何它本来会问的东西。
+- **`safePatterns` 是减法，方向与 `DANGER_PATTERNS` 相反** —— 它取消的是本模块**已经**判定的
+  危险。所以它默认**刻意留空**：写错它等于静默放行一条危险命令，而「少问一次」与「多放一次」
+  在日志上都看不出来（一次都没问，就没有 `MULTITASK-APPROVAL-ASK` 可对账）。
+  要加它，必须像 `DANGER_PATTERNS` 里那几条一样有实测依据，并且两边的用例一起跑。
+- `relayRetryWindowMs` 的非法值（负数、`NaN`、非数字）一律**退回默认 10 秒**，而不是被读成
+  「不限制」—— 无限等待会让子代理在父会话永不醒来时被永久挂住，那正是本模块最不该制造的状态。
+- `shellTools` / `fileTools` 里**名称写错不会报错**，只会静默漏判（命令照旧在沙箱下执行）。
+  所以默认只列本 composition 真的会注册的那几个，宁可少列。
 
 ---
 
@@ -746,7 +801,7 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 > `Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(<路径>)`。
 > 那不是减震器的错，也不是命令本身的问题 —— 识别方法与处置见「已知边界」里的
 > 「子代理的 shell 可能整体不可用」一节。**只读工具不受影响**，所以那一组里
-> 第二条用例仍然应当成功。
+> 最后一条仍然应当成功。
 
 日志里能看到实际收窄了哪些工具：
 
@@ -788,7 +843,8 @@ dsh-multitask: MULTITASK-APPROVAL-RELAYED tool="pwsh" outcome=allowed-once
 #### 兜底通路（后台派单 / 父会话空闲）
 
 上面那条「弹窗」路径要求**父会话此刻有一个打开的回合**。前台派单时那个条件成立；
-**后台派单 + 回合结束再等回调**时不成立，于是转呈失败，走兜底。验证步骤：
+**后台派单 + 回合结束再等回调**时不成立，于是转呈先失败一次 —— 随后本模块发通知
+唤醒父会话并**重试转呈**（见「如实写出的边界」第一条）。验证步骤：
 
 1. **重启应用**，开一个 Multitask 会话（该会话应为 `ask`）。
 2. 让协调者**后台**派一个子代理跑一条危险命令（例如
@@ -798,21 +854,20 @@ dsh-multitask: MULTITASK-APPROVAL-RELAYED tool="pwsh" outcome=allowed-once
 
 | 你看到的 | 含义 |
 |---|---|
-| 结构化**审批卡** | `approval.request` 转呈生效（父会话恰好有打开的回合） |
-| 一条**来自该子代理的消息**，写着「a decision from you is waiting」并给出子会话 id | 兜底 (d) 生效 —— 这是**通知，不是批准** |
-| **什么都没有** | 两条都没生效；此时那个子代理会一直阻塞，需要手动打开它的会话来处理 |
+| 结构化**审批卡** | 转呈生效（父会话恰好有打开的回合），**或**唤醒后重试成功 —— 两种成因都走这一形态 |
+| 一条**来自该子代理的消息**，写着「a decision from you is waiting」并给出子会话 id，**随后**出现审批卡 | 第一次转呈失败、通知已发出、重试成功。消息与卡片是**同一件事**：消息是唤醒手段，卡片才是作答处 |
+| **只有那条消息，没有卡片** | 重试没能成功（窗口耗尽等）—— 这是**通知，不是批准**；按消息里的 id 打开那个子会话作答 |
 
-4. 若是消息形态：按它给的 id（或页头子代理列表）**打开那个子会话**，在它自己的
+4. 若是最后一种形态：按它给的 id（或页头子代理列表）**打开那个子会话**，在它自己的
    composer 里作答 —— 批准/拒绝**只能在那个子会话里完成**，消息通道不携带审批结果。
-5. 日志里对应 `MULTITASK-APPROVAL-RELAY-FAILED reason=…` 紧跟一条
-   `MULTITASK-APPROVAL-NOTIFY-SENT`。（消息发不出去时是 `-NOTIFY-FAILED`，
-   父链非直接父子时是 `-NOTIFY-SKIPPED reason=not-direct-parent`。）
+5. 日志里对应 `MULTITASK-APPROVAL-RELAY-FAILED reason=…`，随后按结局分别是
+   `-RELAY-RETRY-RETRIED`（重试成功，卡片已出现）或 `-RELAY-RETRY-FAILED reason=window-elapsed`
+   （没等到回合，要用户自己去子会话）。通知那一路是
+   `-NOTIFY-SENT` / `-NOTIFY-FAILED` / `-NOTIFY-SKIPPED reason=…`。
 
-> ⚠️ **上表是预期，不是已观测结果。** 机制侧已核实的是：`sendMessage` 的授权只做
-> 「是否注册表实例」的同一性检查、投递走 `steer` 且 `wakeup = true`（空闲父会话会真的写
-> `turn/start`）、消息落成 `user/message` + `source.kind='agent-message'` 并进入对话流。
-> 而「由**插件**（而不是子代理自己）发起这条消息」这一层，需要在真实会话里按上面的
-> 步骤验证。
+> ⚠️ **第 3 步三种形态的判据是「消息里那张卡是否存在」，不是「有没有消息」。**
+> 重试会**同时**留下消息与卡片，所以只看到消息不能立刻断定失败 ——
+> 要等几秒（窗口默认 10 秒）再看一眼有没有卡。这也正是通知文案写成条件式的原因。
 
 #### 跨重启存活（为什么它能存活，以及怎么确认）
 
@@ -873,9 +928,8 @@ dsh-multitask: MULTITASK-APPROVAL-RELAYED tool="pwsh" outcome=allowed-once
 核对方式：让一个 worker 报它的工具面，看它的提示词里是否还残留
 `You are the coordinator`、以及 `WORKER subagent` / `FULL tool set` 是否在。
 
-⚠️ 这三处措辞是**人格措辞的指纹**，不是脚本 —— `test/` 下**没有任何脚本会比对它们**。
-`verify.mjs` 这个名字在仓库里、`test/` 里都**不存在**（现行脚本只有「自检」一节列出的那七份，
-它们管的是别的机制）。所以这条约束仍然成立，只是**靠人遵守**：改回旧措辞会让上面这条核对失效。
+⚠️ 这三处措辞是**人格措辞的指纹**：它们**不受任何自动化守卫保护**，这条约束靠人遵守 ——
+改回旧措辞会让上面这条核对失效。
 
 ---
 
@@ -968,10 +1022,6 @@ if (layers.every((layer) => layer.admits(name))) visible.set(name, definition);
 id** 覆盖守卫行的 `config.presetId` —— 两者一旦漂移，减震器会认为「没有一个会话属于我」，
 于是整个模式静默失效（只留一句 warn），所以刻意让它们同源而不是各写一份字面量。
 
-> 回归校验：13 条进程内用例（`guard-mode-isolation-regression.mjs`），含**反向验证** ——
-> 把归属判据改成 `if (false)` 后必须有 6 条变红（T2/T3/T5/T6/T11/T13），
-> 否则说明用例是恒真的。反向验证的做法：把归属判据改成 `if (false)`，那 6 条必须变红。
-
 #### 判据分两层，顺序不可颠倒
 
 1. **活绑定（权威）**：`registry.composedPreset(agent.ctx)` —— agent **当前**绑定的那份
@@ -980,8 +1030,7 @@ id** 覆盖守卫行的 `config.presetId` —— 两者一旦漂移，减震器�
 
 ⚠️ 退路**只用于「活绑定缺席」，绝不用于「活绑定是别的 id」**。这个区分是关键：
 已切走的会话活绑定是**存在**的（被重绑到了新 generation），会明确返回另一个 id，
-在第 1 层就被拦下 —— 不会因为会话头还写着旧值而被误收窄。用例 T13 专门钉这一点：
-活绑定说 standard、会话头写着 multitask 时，**必须听活绑定**。
+在第 1 层就被拦下 —— 不会因为会话头还写着旧值而被误收窄。
 
 为什么需要退路：新建会话的 preset 绑定与 `agent/created` 的先后顺序没有实证。
 若绑定更晚，只读活绑定会让**真正的 Multitask 会话**也停止收窄 —— 那是把主功能改坏。
@@ -1019,7 +1068,7 @@ profile patch 里那份 `subagentModels` 挂在 `dsh-multitask` 那一行的 `co
 **用包管理器装的**，就交给它：
 
 ```
-dsh plugin remove dsh-multitask
+dsh plugin --profile <profile> remove dsh-multitask
 ```
 
 或在 DSH 的**插件**页面里卸载。
@@ -1058,7 +1107,8 @@ dsh-multitask/
 ├── README.md                           # ★ 面向使用者的说明（英文）
 ├── README.zh.md                        # ★ 面向使用者的说明（中文）
 ├── docs/
-│   └── DESIGN.md                       # ★ 本文件：设计推导 / 验证清单
+│   ├── DESIGN.md                       # ★ 本文件：设计推导 / 各项决定的上游依据
+│   └── test_image/                     # README 引用的实测截图（文档素材，不是测试）
 ├── lib/
 │   ├── index.js                        # host 半：激活时向 agentPresets 声明自带 preset
 │   └── client.js                       # ★ 浏览器半：设置里的一级页「Multitask」两张卡 + 通用设置两行
@@ -1073,185 +1123,19 @@ dsh-multitask/
 ```
 
 ⚠️ `concurrency-guard.mjs` **不在**这份清单里，也不在仓库里 —— 它已随「并发上限只剩宿主
-一个执行点」的决定整体删除，`test/repo-consistency.mjs` 的 C1 会钉住「它不许被重建」。
+一个执行点」的决定整体删除。
 
 `package.json` 的 `files` 字段是上面这份清单里**随发布物分发**的那一部分（`lib` /
 `presets` / `cordis.patch.yml` / `README.md` / `README.zh.md` / `docs/DESIGN.md` / `LICENSE`）。
-**测试套件不在其中**（本包不发测试）。`test/` 目录里的用例见下节，它们**不在**上面
-这份清单里：`test/` 是本地目录，不随仓库与发布物分发（`.gitignore` 有对应规则）。仓库根下的
-`install-multitask.ps1` 同样只在本地存在（`.gitignore` 已忽略）。
+**测试套件不在其中** —— 本包只发运行时真正需要的文件。
 
-### 自检（`test/` —— 所有测试与校验文件的唯一去处）
+README 里引用的实测截图放在 `docs/test_image/`：它们是**文档素材**（不是测试脚本，所以不进
+`test/`），**进仓库但同样不进发布包**。GitHub 上按相对路径直接渲染；npm 页面上的相对地址则由
+npm 按 `repository` 字段指回本仓库（npm 文档写明 README 是「经 GitHub 的 API 渲染为 GFM」，
+社区也一致如此报告 —— ⚠️ **本仓库没有逐字实测过这一条**）。所以图片进仓库即可，写进 `files`
+只会平白给包添上 1.3 MB。
 
-> ★ **规矩：所有测试文件都必须写进 `test/`。**
-> 探针、校验脚本、一次性核对、诊断脚本、回归套件 —— 一律放 `test/`，用
-> `node test/<名字>.mjs` 运行，**不要**放在 `lib/` / `presets/` / `tools/` 或仓库根下。
-> `test/` 整个目录被 `.gitignore` 忽略，按「是测试就不进远端」的规矩**刻意不跟踪**
-> （也不进 `npm pack` 的产物），所以它**只在本地存在**，不要试图把它加回追踪。
-> 这条规矩由 `test/repo-consistency.mjs` 自动核对：仓库里出现一个 `test/` 之外的
-> 测试类文件，它就会失败并指名那个文件。
-
-本仓**不含**测试文件：按「是测试就不进远端」的规矩，`test/` 整个目录都不跟踪
-（`.gitignore` 里有对应规则），发布物里也没有（见上面的 `files` 清单）。
-回归校验只在本地跑，用例不随仓库分发。
-
-本地现有七套校验，都从各自脚本的位置推导被测模块，所以仓库放在任何路径下
-（含非 ASCII 路径）都能跑：
-
-```powershell
-node test/guard-mode-isolation-regression.mjs    # 减震器的「模式隔离」回归
-node test/repo-consistency.mjs                   # 并发上限收敛 / 文档一致性 / 模块常量 / 测试文件归位
-node test/subagent-mode-marker-source.mjs        # 模式标记的来源（前台/后台两条派单路径）
-node test/minimal-guard-catalog.mjs              # 只读 worker 的目录级过滤（restrict 够不到的那类）
-node test/approval-gate-rules.mjs                # 审批闸门：规则表的漏判与误报
-node test/approval-gate-integration.mjs          # 审批闸门：门控 / 事件形状 / 转呈方向
-node test/workspace-acl-rules.mjs                # 工作区 ACL：最小授权红线 / 看不清楚就不动作
-```
-
-**第一套（模式隔离）** 覆盖 13 条用例（归属判据、模式切换的两个方向、子代理不受影响、
-读不出归属时的取向…），并自带**反向验证**：把归属判据改成 `if (false)` 后必须有 6 条
-变红（T2/T3/T5/T6/T11/T13），否则说明用例是恒真的。
-
-**第二套（仓库一致性）** 是**静态 / 离线**检查：**不加载 DSH、不起会话、不写任何文件**，
-只 `import` 本仓库自己的那五个模块（因此「模块能加载」本身也是一条断言）。
-它分下列几组断言，共 38 条：
-
-| 组 | 守什么 |
-|---|---|
-| **0 / 1**：只剩宿主一个执行点 | `concurrency-guard.mjs` **不得存在**；`composition.mjs` 的**代码行**里不得再出现 `MAX_ACTIVE_CEILING` / `normalizeMaxActive` / `concurrency-guard`；`lib/index.js` 不得再声明 `MAX_ACTIVE_FIELD` 或那两个收敛函数；面板两处 UI 的 `concurrencyRef` 必须都指向 `subagent.maxActiveSubagents`，且不得再出现 `multitask.maxActiveSubagents` / 「限制 ⇄ 不限制」那两档文案 |
-| **1b**：运行期核对 | 真调 `buildPlugins()`：行表里**没有** `concurrency-guard` 行（哪怕显式传了 `maxActiveSubagents` 也得没有），而四条委派行与三个守卫行仍在（防「删除时误伤」）；`Config.validate` 不再产出 `maxActiveSubagents`，而 `subagentModels` 仍在 |
-| **1d**：唯一的设置字段仍是 volatile | `subagentModels` 必须带 `meta.volatile` 并被换成 volatile 引用 —— 漏掉它会让面板写入被判成普通变更 ⇒ **重启插件** ⇒ 模式从新会话列表消失。它现在是**唯一**的字段，所以出错时没有别的字段会连带暴露 |
-| **1e**：不许出现「AI 临时指派模型」 | `composition.mjs` 的**代码行**里不得出现 `modelSelectionSettings:`（注释里解释「为什么不设」是允许的）；协调者保留集里不得再列 `list_subagent_models`；**同时**用反向守护钉住「用户面板那张模型卡仍生效」—— 真调 `buildPlugins({modelMap})`，断言四行的 `agentOptions` 该有的有、该缺的缺（这条挡的是「删 AI 那条路时顺手把用户那条也删掉」） |
-| **1f**：那张卡的排版 | 卡片标题与那一行的标签**用同一个词是对的**（它就是「同一个设置」的信号），所以判据不是「两个字符串必须不同」，而是**在卡片语境里标题只画一次**：`LimitRow` 只在 `props.inCard !== true` 时才渲染视觉标题，而 `label` 仍要交到输入框的 `aria-label`（省视觉 ≠ 省无障碍）；卡片里那一行必须用 `.mt-growCard`（左右 16px，与卡片标题同一套度量），且该规则必须写在 `.mt-grow` **之后**（同为单类选择器，只靠书写顺序覆盖） |
-| **2 / 2b**：文档与实现一致 | README 必须写明「只有一个值、两处 UI 编辑同一字段」「计数口径是当前存活」「拒绝来自宿主、这不是插件坏了」「8 是宿主**默认值**、不是天花板」，并逐字引用宿主那条错误原文、解释「串行时活跃数从未超过 1」的错觉；**并逐行禁止**把已删除的 `multitask.maxActiveSubagents` 当成现行行为（作为「已删除的旧设计」提及时，同一行必须带更正标记）；两份手抄的模式标记必须逐字一致 |
-| **2c**：审批闸门的静态约束 | 改写用的条目名 `subagent:delegation` 与那句原话必须逐字在位（名字漂了就是**静默不改**，连日志都没有）；`approval/policy` 的写入**省略 `source`**（`source: 'delegation'` 的语义是「从父级委派继承」，与本模块的纠正相反）；兜底通知的调用**在 `await next()` 之前**（下游可能无限挂起，排在后面就永远发不出去）；那句错的理由（「校验只允许 delegation」）不许再出现 |
-| **2d**：文档与实际用例数一致 | README 里每个「N 条断言组，N 通过」都必须等于对应脚本实际的 `test(` 计数 —— 这条防的是文档里的数字随着用例增删而悄悄过期，读者据此判断覆盖范围时会得出错误结论 |
-| **2e**：工作区 ACL 的红线 | 授权脚本只许 `TakeOwnership`（**出现 `FullControl` / `Modify` 即失败**）；只做加法（不许删 ACE / 改所有者 / 动标签）；路径必须经环境变量传入；文档里不许再出现那两类**不实的**旧定性（把该问题说成「部署级」、说成需要一次沙箱之外的不受限运行），也不许出现给人照抄的 `:(F)` 授权命令 |
-| **3**：测试文件归位 | 仓库里没有 `test/` 之外的测试类文件（**按内容特征扫**，不只是看文件名）；`test/` 仍在 `.gitignore` 里 |
-
-它还自带**反向验证**：在内存里把 `concurrency-guard` 那一行**加回** composition，
-第 1 组的判据必须立刻命中（同时在真文件上必须**不**命中）—— 两端都验过，才说明那组
-用例不是**恒真**的。
-
-**第三套（审批闸门规则表）** 校验第一级的模式表，8 条断言组，两头都测：
-
-- **漏判**（该问的没问）58 条危险命令：递归删除、磁盘/引导/电源、改远端历史、
-  发布外发、提权、系统级变更、下载即执行、系统路径与凭据写入、强杀进程；
-- **误报**（不该问的问了）32 条日常命令 —— 这一张与上面**同等重要**，
-  因为每次无谓的询问都在把用户往「无脑点允许」推。刻意放行的有 `git clean -nd`（干跑）、
-  `chmod +x`、`chown user:user f`、`net user` / `wmic process list`（只读列举）、
-  `cat /etc/hosts`（只读）；
-- 另有工作区逃逸判定（含 `H:\project-x` 不得被判成 `H:\proj` 的子目录）、畸形输入不抛错、
-  大小写不敏感。
-
-
-**第四套（审批闸门逻辑链）** 用几百字节的假 `ctx` / `approval` / `agent` 把 `apply()`
-真跑起来，38 条断言组覆盖三件最容易写反的事：门控方向（父会话不是 `ask` 时**一个字都不能动**）、
-事件与决策的形状（`source` 省略、`ask` 三个字段齐全）、转呈方向（目标是**父**会话、
-父会话自己的请求要放行、失败要**退回原路径**）。另含多级委派一次走到根、
-畸形父链不成环、断链不转呈、`signal` 沿用，以及**瞬时缺席之后仍可重试**
-（登记「已处理」必须在落库成功之后，否则一次服务未就绪会让该 worker 永久停在 `never`）…
-
-其中 9 条专测**兜底通知**（I28-I36）：转呈失败时发了通知且返回值不变、通知失败不影响返回值、
-缺服务跳过、早退路径不发、多级委派跳过、配置可关、signal 中止跳过，以及最关键的一条 ——
-**下游永不返回时通知仍然发出**（那正是把通知放在 `await next()` 之前的原因）。
-
-它还自带**反向验证**：把 8 处关键守卫逐个改坏（在内存里改，不动磁盘文件），
-每处都必须让对应用例变红。
-
-**第五套（工作区 ACL 规则与决策）** 校验本仓库**唯一会改系统状态**的模块
-（`workspace-acl.mjs` 会给工作区目录补一条最小权限），14 条断言组：
-
-- **红线**：授权脚本只许出现 `TakeOwnership`（= `WRITE_OWNER`），
-  **出现 `FullControl` 或 `Modify` 即失败**；只做加法（不许删既有 ACE、不许改所有者、不许动完整性标签）；路径必须经环境变量传入（不拼进脚本文本）；
-- **看不清楚就不动作**：读不出沙箱模式、模式不是 `workspace-write`、没有 `cwd`、是子代理、
-  被配置关掉 —— 五种情形都必须**什么都不做**，绝不猜着改 ACL；
-- **承诺不破**：载荷畸形不抛错、同一工作区每进程只尝试一次、授权失败只记日志不抛。
-
-⚠️ 它**不会**对着任何真实目录跑授权：唯一的子进程调用指向一个**不存在的路径**，
-所以这个文件跑一万次也不会改动任何 ACL（真正改动 ACL 的验证在装机后由使用者做）。
-
-它同样自带**反向验证**：把脚本里的 `TakeOwnership` 改成 `FullControl`（内存内改），
-对应的红线断言必须变红。
-
-**第六套（模式标记的来源）** 钉的是 `subagent-mode.mjs` / `minimal-guard.mjs` 共用的那一步：
-**「这个子代理来自哪条委派行」是靠读 persona 里的模式标记回答的**。9 条用例：
-
-- **F1 / F2（本轮缺陷的直接回归）**：**只给**子代理自己的 `deployment:persona-prefix`
-  段落、**不给** `subagent/descriptor` 的 `persona` 字段 —— 即**前台派单**的形状。
-  两者都必须识别出来（PTC 要塌缩、minimal 要摘掉 `ssh_exec` / `task_board_run` / `pwsh`）。
-  早期实现只读 descriptor，**在这两条上必红**；
-- **G1 / G2**：后台派单（descriptor 带 persona）仍被识别；段落读不到时 descriptor 兜底仍在；
-- **N1–N3**：别条委派行的 persona 不受影响；两个来源都没有时不动作且不抛错；
-  **协调者绝不被碰**（两个守卫都不碰 —— PTC 那边碰了会改写减震器语义）；
-- **M1 / M2**：上游改了 `SystemPrompt` 内部结构时，必须留一条带固定标识
-  `MULTITASK-MODE-MARKER-SOURCE-MISSING reason=…` 的 warn（**不许静默失效**），
-  且告警之后仍走 descriptor 兜底；缺 `ptcRuntime` 时仍归到既有的 `no-runtime` 分支，
-  不被误判成「没有标记」。
-
-它自带**反向验证**：把两个模块的「主来源优先」改回「只读 descriptor」（改磁盘文件，
-跑完**还原**），F1/F2 必须变红。
-
-> 为什么这条缺陷值得单开一套：它**只在一种派单方式下出现**（前台），而那种方式恰好是
-> **审批弹窗唯一走得通**的那条 —— 于是「按任务书老实做前台派单」时症状最明显，
-> 默认后台派单时反而看不见。四个既有的守卫测试（第一、二套）都过，因为它们喂的是
-> 模块自己的判据，没喂「persona 从哪来」这一层。
-
-**第七套（只读 worker 的目录级过滤）** 钉的是 `minimal-guard.mjs` 的另一半：
-`tools.restrict()` **结构上够不到一类工具**，那一类由**目录级过滤**兜住。12 条用例：
-
-- **C1（合成案例）**：roster 里放一个**不可 restrict** 的外来工具名
-  （测试里的 `PER_AGENT_LEAK`），它必须从目录里消失、**且不进 deny**（进了会让
-  `restrict()` 抛 `unknown global tool`）。用合成名字是因为那个真实案例已随
-  `modelSelectionSettings` 的移除而消失 —— 但这一层要挡的是**结构性**的那一类，
-  任何第三方插件按 agent 单独安装工具就又会落进来；
-- **C2（本轮行为变化的直接回归）**：四条委派工具现在**由 `restrict()` 摘掉**
-  （移除那个开关后它们回到全局注册）。C2 同时是**回归哨兵**：若有人把
-  `modelSelectionSettings` 加回来，那些工具又会变回逐-agent 安装、从 deny 里消失，C2 会红；
-- **C2b**：即便真实泄漏消失，目录过滤**仍须装上**（不许被顺手删掉）；
-- **C3–C6**：允许集与 harness 内部传输名（`run_code` / `structured_output`）被放过；
-  只作用在该 worker 自己的 scope（兄弟与**协调者**都不受影响）；没有 `tools` 数组时原样放过；
-  无可滤项时返回**同一个**对象（不无谓分配）；
-- **C7**：目录里刚好只剩不可 restrict 的那些时，也必须装上过滤器 ——
-  这一条挡的是「把目录过滤放在 `deny.length === 0` 早退之后」这个位置错误；
-- **L1 / L2**：记账只在**第一次**真的滤掉东西时记一条，并列出被滤掉的名字
-  （那是「过度过滤」的唯一出口）；没有隐藏任何东西时不记；
-- **R1 / R2**：`restrict()` 与目录过滤**各自独立登记**清理动作，`agent/disposed` 时**都**执行，
-  且重复触发不重复登记。R1 挡的是一个真实缺陷：两个 disposer 曾写进同一个 `WeakMap` 键，
-  后写覆盖前写 —— 表现是 scope key 复用时新 agent 继承一条本该消失的过滤。
-
-它自带**反向验证**：把「装上目录过滤」改成 `false`（改磁盘文件，跑完**还原**），
-C1 必须变红。
-
-> **为什么需要目录过滤这一层**：`dsh-tools` 的 `view()` 里只有 `inherited` 会进
-> `restrictableNames`，而注册在该 agent **自己 scope** 上的名字只进 `visible` ——
-> 写进 deny 会抛 `names unknown global tool`。所以凡是**按 agent 单独安装**的工具，
-> `restrict()` 结构上都摘不掉。
->
-> ⚠️ 这一层的原始触发案例是：`subagent` / `subagent_ptc` / `subagent_minimal` 三行
-> 设了 `modelSelectionSettings: true`，而那个开关会让 `dsh-tool-subagent` 改为逐 agent
-> `installScoped`。此时 minimal worker 的目录会变成「允许集 + 这三个」，即那几个委派
-> 工具既不在 deny 里、又摘不掉。
->
-> **那个开关现已从四行全部移除**，四条委派工具回到全局注册、由 `restrict()` 正常摘掉
-> （见 C2）。但**这一层不能因此删掉**：它的存在理由是**结构性**的，任何第三方插件只要
-> 按 agent 单独安装工具，就又会落进这条够不到的地带 —— 所以测试改用**合成的**外来
-> 工具名继续守它。
->
-> 这一层修的是**一致性**（人格逐字写着 "Do not delegate further; you cannot"，
-> 模型却看得见委派工具），**不是安全边界** —— 真正的拦截是 `maxDepth`
-> （minimal worker 深度为 1，再往下派会撞 `Error: subagent depth 2 exceeds maxDepth 1`）。
-
-> **为什么这些校验刻意不用 `node --test`**：那个运行器会 spawn 子进程并捕获管道输出，
-> 在受限沙箱下会以 `spawn EPERM` 失败。所以本仓的校验脚本都在**进程内**直接跑断言
-> （自带一个极小的 `test()` 运行器），不 spawn、不捕获输出。
->
-> 同理，写这类运行器时有一个必须避开的坑（本仓踩过）：`test()` 若**就地调用** `body()`
-> 却不 `await`，`async` 用例一碰到第一个 `await` 就交回控制权，`test()` 于是**立刻**记一次
-> 通过 —— 那条用例的断言一旦失败，**不会进 `failures` 列表、也不会印出用例名**，汇总行照印
-> `ALL PASS`。**一条永远绿的守卫断言，恰好等于没有那条断言。** 正确形状是
-> `test()` 只入队 + 收尾在 `await runTests()` 里逐个 `await body()`。
-> 归属判据那套脚本的**反向验证**（把判据改坏、必须变红）就是用来证明这一点没被违反的。
+本包**不随发布物分发测试**，所以这份文档也不描述测试套件 —— 它只讲设计与行为。
 
 ---
 
@@ -1295,7 +1179,7 @@ name: 'file:///<你的路径>/dsh-multitask/lib/index.js?v=6'   # ← 递增这�
 `multitask` 这个 id 在改动前后两张表里都在，拿到的是**同一个 `Entry`**，仍然只看到「名字变了」，
 仍走 name-only 分支。**必须两次保存**（删 → 等稳定 → 加回），中间会短暂没有 preset。
 
-四个必须避开的坑，都已写进代码和回归测试：
+四个必须避开的坑，都已写进代码：
 
 1. **相对导入不继承入口的 query。** 只给入口加 `?v=N`，入口刷新了，但它相对导入的
    `composition.mjs` 仍从旧缓存取 —— 改了 preset 文本却毫无变化、也不报错。
