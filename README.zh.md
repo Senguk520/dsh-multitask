@@ -364,4 +364,4 @@ dsh-multitask/
 
 ## License
 
-MIT
+[MIT](LICENSE)

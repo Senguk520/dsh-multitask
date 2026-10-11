@@ -346,4 +346,4 @@ More complete boundaries, unverified items, and the measured evidence behind eve
 
 ## License
 
-MIT
+[MIT](LICENSE)
