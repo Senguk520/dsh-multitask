@@ -2,7 +2,7 @@
 
 [中文](README.zh.md) · [Design notes and measured evidence](docs/DESIGN.md) · MIT License
 
-A work mode for DSH in which **the main conversation does exactly three things**: understand what you asked for, turn it into task briefs, and report back what the Subagents concluded. Every piece of process data — file contents, command output, build logs, search results, dead ends — is digested inside a **Subagent's context** and never enters the main one. The main conversation therefore holds only high-value information.
+A work mode for **DeepSeek Harness（DSH）** in which **the main conversation does exactly three things**: understand what you asked for, turn it into task briefs, and report back what the Subagents concluded. Every piece of process data — file contents, command output, build logs, search results, dead ends — is digested inside a **Subagent's context** and never enters the main one. The main conversation therefore holds only high-value information.
 
 This is a **mechanism**, not a prompt asking the model to behave. Once the mode is selected, the main conversation (the coordinator) genuinely has a narrower tool surface: the tools that would drag in process data — writing files, running commands, searching the web — are **not in its visible set**. It cannot call them, so it cannot pollute its own context. A Subagent (worker) is the opposite: it gets the full tool surface, does the work, and returns only its conclusion.
 
