@@ -3,13 +3,8 @@
  *
  * ── 它解决什么问题 ────────────────────────────────────────────────────────────
  *
- * `composition.mjs` 里 `tool-subagent-minimal` 那一行的 `toolFilter.deny` 是**静态**
- * 三项（`write` / `edit` / `pwsh|bash`）。它只敢列「本 composition 自己确定会注册」
- * 的名字，因为 `tools.restrict()` 对**当前部署不存在**的名字会**抛错**，而它是在
- * 委派窗口里被调用的 —— 抛出来的表现是「委派功能坏了」，极难反查。
- *
- * 后果是：任何**由别的插件**注册进这个部署的工具，对 minimal worker 依然可见。
- * 实测（自查 + 实调）确认本机部署里 minimal worker 仍持有：
+ * 任何**由别的插件**注册进这个部署的工具，若不加处理，对 minimal worker 依然可见。
+ * 实测（自查 + 实调）确认本机部署里 minimal worker 曾持有：
  *
  *   - 6 个 `ssh_*`（含 `ssh_exec` —— 它在**远端主机**上执行命令）；
  *   - 8 个 `task_board_*`（含 `task_board_run`）。
@@ -17,10 +12,11 @@
  * 也就是说「只读调研 worker」其实能改远端机器、能触发看板任务 —— 人格说它不能，
  * 机制却让它能。**人格与机制不一致**正是本包反复踩过的坑。
  *
- * ── 为什么是「自适应」而不是把静态名单写长 ───────────────────────────────────
+ * ── 为什么是「自适应」而不是一张写死的名单 ───────────────────────────────────
  *
- * 不能把 `ssh_*` 直接写进 `MINIMAL_DENY`：**没装 ssh 插件的部署**会在创建 minimal
- * worker 时**直接失败**，比现在更糟（这正是 `composition.mjs` 作者当初不列它们的理由）。
+ * 不能把 `ssh_*` 直接写死：**没装 ssh 插件的部署**会在创建 minimal worker 时
+ * **直接失败**（`tools.restrict()` 对**当前部署不存在**的名字会**抛错**，而它是在
+ * 委派窗口里被调用的 —— 抛出来的表现是「委派功能坏了」，极难反查）。
  *
  * 本模块改用同仓 `coordinator-guard.mjs` 已验证的手法 —— **从该 scope 实际可见的
  * 工具集反推 deny**：
@@ -30,39 +26,16 @@
  * 于是名单里每个名字都必然合法（它就是刚读出来的），`restrict()` 不会抛错；
  * 宿主或插件以后新增任何工具，默认对 minimal worker 关闭 —— **无需改这个文件**。
  *
- * ── 两层 restrict 的交互：求交，不是替换（本模块成立的技术支点）──────────────
+ * ── ⚠️ 自 DSH 0.2.1-rc.2 起，本模块是**唯一**一层收窄 ─────────────────────────
  *
- * `dsh-subagent` 的 `applyChildComposition` 已经先施加了**静态** `toolFilter`
- * （`_investigation/_dshsrc/dsh-subagent/lib/index.js:522`）：
+ * 旧版本还有第二层：`composition.mjs` 里 `tool-subagent-minimal` 那一行的静态
+ * `toolFilter.deny`（`write` / `edit` / `pwsh|bash`）。上游**删除了 `toolFilter`
+ * 配置项**（配置里出现即抛错、整个 preset 挂载失败），那一层因此不存在了。
  *
- *     if (composition.toolFilter !== void 0) childCtx.tools.restrict(composition.toolFilter);
- *
- * 本模块要在**同一 scope** 上再施加一层。两层会不会互相覆盖？**不会**，三处源码互证：
- *
- *   1. `dsh-tools/lib/index.js:2889-2891`（JSDoc）：`Restrictions **intersect**;`；
- *   2. `dsh-tools/lib/index.js:2909`：`layer.restrictions.append(compiled)` —— 追加；
- *   3. `dsh-scope/lib/index.js:98-109`：`append()` 用一个**新 `Symbol()`** 作 key，
- *      只 `data.set`，**从不覆盖已有条目**；再由 `dsh-tools/lib/index.js:2642` 的
- *      `admits()` **遍历全部** restriction，任一命中即判不可见。
- *
- * 所以有效 deny = 静态层 ∪ 自适应层，**结构上不可能放宽权限**。
- *
- * ⚠️ 由此推出一个**反直觉但有依据**的决定：本模块**不**把静态三项
- * （`write` / `edit` / `pwsh|bash`）重复写进 deny。两个理由：
- *   - 求交语义下它们**不是必需**的：即使本模块漏掉某项，静态层仍然拦着，不会漏；
- *   - 重复写**反而危险**：deny 里的名字必须存在于 `restrictableNames`，而 `bash` 与
- *     `pwsh` 是**互斥**的（另一平台那个名字根本没注册）—— 无条件同时列出会在 win32 上
- *     抛 `names unknown global tool "bash"`。静态那层用平台条件避开了这个坑，
- *     本模块不该把它再引入一遍。
- *
- * 还有一点让「重复列出」更加没有意义：本模块在 `agent/created` 时读到的可见集，
- * 是**静态层已经生效之后**的面（见下「时机」），`write`/`edit`/`pwsh` 根本不在里面。
- *
- * ── 允许集：白名单，而且**多列不存在的名字是安全的**─────────────────────────
- *
- * 算法是「可见集 − 允许集」，所以允许集里列一个本部署没有的 `foo` 不会产生任何后果
- * （`foo` 不在可见集里，算差集时自然不参与）。**这正是本方案相对静态名单的优势**：
- * 允许集可以放心写宽、跨部署复用；而静态 deny 名单写宽就会抛错。
+ * 这不影响覆盖面 —— `DEFAULT_MINIMAL_KEEP` 里没有写入 / 执行类工具，所以原先静态
+ * 名单要摘的三项照样被摘掉。但它改变了**失败后果**：本模块装不上时，不再有静态那层
+ * 兜底，minimal worker 就是**完全没有收窄**。所以本模块的失败必须**响亮告警**，
+ * 而且告警里要说明「没有任何静态层在你后面」。
  *
  * ── 时机：`agent/created`，且必须在首次 prompt 组装之前 ──────────────────────
  *
@@ -71,10 +44,11 @@
  * 所以在瀑布**内部**改工具面改变不了它服务的那次请求 —— 只能下一轮生效，
  * 等于第一次请求漏网。`agent/created` 是瀑布之外的安全窗口。
  *
- * 能拿到 persona 标记的前提是描述符已经写进 session。已核实：`dsh-subagent` 的
- * `activations.materialize()` 是**先 `setup`**（append descriptor + applyChildComposition）
- * **再 `announce`**（发出 `agent/created`），且 `setup` 里 `append("subagent/descriptor")`
- * 是同步的 —— 所以本模块在 `agent/created` 里一定读得到标记，也一定能看到静态层已生效。
+ * 能认出「这是 minimal worker」的前提是委派描述符已经写进 session。已核实：
+ * `dsh-subagent` 的 `activations.materialize()` 是**先 `setup`**（append descriptor
+ * + 应用子组合）**再 `announce`**（发出 `agent/created`），且 `setup` 里
+ * `append("subagent/descriptor")` 是同步的 —— 所以本模块在 `agent/created` 里
+ * 一定读得到 provider 名。
  *
  * ── 失败要响亮（与 subagent-mode 取向相反，与 coordinator-guard 一致）────────
  *
@@ -87,14 +61,15 @@
  *
  * 硬前置与 `coordinator-guard.mjs` / `subagent-mode.mjs` 用**同一条判据**
  * （`origin` / `parentSession` / `delegationDepth` 三信号）：不是子代理就一律不动作。
- * 然后还要命中 `[multitask-mode:minimal]` 标记 —— 没标记的行
- * （`subagent` / `subagent_fork` / `subagent_ptc`）**完全不受影响**。
+ * 然后还要命中 minimal 那一行的 **provider 名**（`multitask_minimal`）——
+ * 别的行（`spawn` / `fork` / `multitask_ptc`）**完全不受影响**。
  *
  * ── 如实写出的边界（别把它当成比实际更强的东西）─────────────────────────────
  *
  *   1. 本模块只读 `agent.ctx.tools.restrict` / `schemas` / `view`。若该部署的
- *      工具服务不暴露这些，收窄**装不上**（会响亮告警），此时 minimal worker 退回
- *      「只有静态三项被摘掉」的旧状态 —— 那是**没有变好**，不是变坏。
+ *      工具服务不暴露这些，收窄**装不上**（会响亮告警），此时 minimal worker
+ *      **没有任何收窄**（静态那层已随上游删除）—— 这是本版本相对旧版本的**唯一退步**，
+ *      必须让使用者看见。
  *   2. 触发点只有 `agent/created` + `agent/disposed`（卸限制）。**没有**自愈重算：
  *      若某个插件在 minimal worker 创建**之后**才注册一个全局变更类工具，
  *      那个工具不会被摘掉。这是有意的取舍 —— 代价是「会话中途热装插件」这一种
@@ -204,13 +179,38 @@ function isDelegatedChild(agent) {
 }
 
 /**
- * persona 里的模式标记。
+ * minimal worker 那一行的 **provider 名**。
  *
- * ⚠️ 必须与 `composition.mjs` 导出的 `MINIMAL_MODE_MARKER` **逐字一致**。
+ * ⚠️ 必须与 `composition.mjs` 导出的 `MINIMAL_PROVIDER` **逐字一致**。
  * 两个文件各自留一份常量而不是互相 import，是为了保持本包本地模块「零 import」的
- * 约定（`subagent-mode.mjs` 对 `PTC_MODE_MARKER` 也是这么做的）。
+ * 约定（`subagent-mode.mjs` 对 `PTC_PROVIDER` 也是这么做的）。
+ *
+ * ── 为什么标记从 persona 换成了 provider（DSH 0.2.1-rc.2）────────────────────
+ *
+ * 旧版本把标记写在委派行的 `persona` 里。上游删除了那个配置项，配置里只要出现就抛错、
+ * **整个 preset 挂载失败**（模式从新会话列表消失）。现在改用 `provider` 名：
+ * 它由行决定、原样写进 `subagent/descriptor`，且可以按 worker 种类各起一个名字。
+ * 详见 `composition.mjs` 的 `WORKER_PROVIDERS` 注释。
  */
-const MINIMAL_MODE_MARKER = '[multitask-mode:minimal]'
+const MINIMAL_PROVIDER = 'multitask_minimal'
+
+/**
+ * PTC worker 那一行的 provider 名 —— 本模块只用它做**排他判定**。
+ *
+ * 理由见 `isMinimalChild()`：两个新 provider 名是新组合才产生的，一旦读到其中一个，
+ * 它就是该子代理的最终身份，不能再被 descriptor 里残留的旧标记推翻。
+ *
+ * ⚠️ 必须与 `composition.mjs` 的 `PTC_PROVIDER` 逐字一致（测试里比对）。
+ */
+const PTC_PROVIDER = 'multitask_ptc'
+
+/**
+ * 旧版本写在 persona 开头的模式标记 —— **只用于续接旧会话**。
+ *
+ * 新会话走 provider 名，不需要它；但旧会话的 descriptor 里留着它，而 provider 还是
+ * 当年那个通用名，认不出来，所以保留这条只读兜底。
+ */
+const LEGACY_MINIMAL_MARKER = '[multitask-mode:minimal]'
 
 /**
  * 取该子代理 session 里能看到的事件数组。
@@ -238,150 +238,68 @@ function sessionEvents(agent) {
   return []
 }
 
-/**
- * 承载「本行 persona」的 system prompt 段落名。
+/** 已由 `descriptorOf()` 取代的旧实现（读 system prompt 段落取 persona）留作说明：
  *
- * 逐字为 `dsh-subagent` 的 `applyChildComposition()` 注册它时用的名字
- * （上游常量 `PERSONA_PREFIX_SECTION` 的值）。名字漂了不会报错，只会**读不到** ——
- * 于是退化成「找不到标记 = 什么都不做」这种最难查的坏法。
+ * 旧版本靠 `deployment:persona-prefix` 段落里的字符串标记识别 worker 种类。那条路在
+ * DSH 0.2.1-rc.2 **彻底断了**：上游删除了委派行的 `persona` 配置项，那份段落不再由
+ * `applyChildComposition()` 注册。现在改读 `subagent/descriptor` 的 `provider` 名 ——
+ * 简单一步，不再依赖上游未文档化的 `systemPrompt.layers.merge`。
  */
-const PERSONA_SECTION_NAME = 'deployment:persona-prefix'
 
 /**
- * 从子代理**自己的 system prompt 段落**里取该行配置的 persona（**主来源**）。
+ * 读该子代理委派行的 **provider 名**（`subagent/descriptor` 的 `data.provider`）。
  *
- * 为什么它是主来源：这是**两条委派路径都有**的那一份。`applyChildComposition()`
- * 在 `setup()` 阶段注册该段落，而 `setup()` 严格早于 `agent/created`
- * （上游 `initializeAgent` 先 `await setup()`、再 `await publish()`）——
- * 与 `coordinator-guard` 依赖的时序是同一条。
- *
- * 对比 `descriptorPersona()`：那个只在 `backgroundMode: 'continuable'` 行上有效，
- * 所以**不能**单独用它。只用它会让「只读收窄」在**前台派单**时整体失效 ——
- * 而前台派单恰好是审批弹窗唯一走得通的路径，于是外在表现会变成
- * 「前台派单测出来一切正常、默认后台派单时反而没问题，唯独前台那批 worker
- * 仍然握着 `ssh_exec`」这种极难归因的坏法。
- *
- * ⚠️ 读法用的是上游**未文档化**的内部结构（`SystemPrompt` 的公开声明只列了注册方法、
- * 顺序查询与 `assemble()`；`layers` / `merge()` 都不在其中）。所以这里的原则是：
- *
- *   - 全程不抛错，任何一步读不到都返回 undefined，由调用方退到兜底来源；
- *   - **结构性缺失**（连 `layers.merge` 都不在）记一条带**固定标识**的 warn ——
- *     那说明上游改了内部结构，本模块对前台派单会开始静默失效，这件事必须可 grep；
- *   - 段落**不存在**不告警：那是「该行本来就没配 persona」，属于正常情形。
- *
- * 不走公开的 `assemble()`：它是 `async`，而且每次会 `structuredClone` 全部工具 schema
- * （本部署 40+ 个），为读一段文本付这个代价不合适。
+ * 只认第一条 descriptor（上游定性：「first event is authoritative」）。
  *
  * @param agent - 目标子代理。
- * @param warn - 每进程每原因只报一次的记录器。
- * @returns persona 文本，或 undefined。
+ * @returns provider 名与旧版 persona 标记（都可能缺）。
  */
-function promptSectionPersona(agent, warn) {
-  const service = (() => {
-    try {
-      const direct = agent?.ctx?.systemPrompt
-      if (direct !== undefined && direct !== null) return direct
-      return agent?.ctx?.get?.('systemPrompt')
-    } catch {
-      return undefined
-    }
-  })()
-
-  const layers = service?.layers
-  if (layers === undefined || layers === null || typeof layers.merge !== 'function') {
-    warn(
-      "this deployment's systemPrompt service exposes no readable section layers, so a subagent's own " +
-        'persona section cannot be read; the mode marker falls back to the subagent descriptor, which omits ' +
-        'persona for foreground (one-shot) delegations — those workers are NOT narrowed ' +
-        '[MULTITASK-MODE-MARKER-SOURCE-MISSING reason=no-section-layers]',
-    )
-    return undefined
-  }
-
-  try {
-    // scope 键就是 agent 对象本身：上游 `assembleContextFor()` 传的是 `{ scope: agent }`，
-    // 而 `createScope(loopCtx, this)` 用的键也是这个 agent。
-    // 子代理自己的层在链条最内侧，因此它盖掉全局那份部署级 persona。
-    const sections = layers.merge(agent, (layer) => layer.sections)
-    const section = sections?.get?.(PERSONA_SECTION_NAME)
-    const text = section?.text
-    // `text` 可以是函数（按组装上下文求值）；本行配置的 persona 是纯字符串，
-    // 遇到函数形态说明读到的不是委派行那一份，按「读不到」处理。
-    return typeof text === 'string' && text !== '' ? text : undefined
-  } catch (error) {
-    warn(
-      `reading a subagent's own persona section failed: ${error instanceof Error ? error.message : String(error)} — ` +
-        'the mode marker falls back to the subagent descriptor, which omits persona for foreground ' +
-        '(one-shot) delegations [MULTITASK-MODE-MARKER-SOURCE-MISSING reason=merge-threw]',
-    )
-    return undefined
-  }
-}
-
-/**
- * 从子代理的 `subagent/descriptor` 事件里取该行配置的 persona（**兜底来源**）。
- *
- * descriptor 是「委派行原样的快照」，上游自己的定性是
- * 「first event is authoritative」，所以它是很干净的一份 —— 但**覆盖面有限**：
- *
- *   `snapshotSubagentDescriptor()` 对 `mode === 'one-shot'` 的行只保留
- *   `version` / `mode` / `provider` / `label`，persona 与 toolFilter **都被丢掉**；
- *   而且 one-shot 的 descriptor 要到**第一轮 `agent/pre-step`** 才 append
- *   （`attachDescriptorAppend`），在 `agent/created` 那一刻**根本还不存在**。
- *
- * 所以它只对 `continuable` 行有效。本机实测（全部 340 个会话、298 条 descriptor）：
- * one-shot 的 76 条**无一带 persona**，continuable 的 222 条里 219 条带 ——
- * 分界线与上面那段字段集完全一致。
- *
- * @param agent - 目标子代理。
- * @returns persona 文本，或 undefined。
- */
-function descriptorPersona(agent) {
+function descriptorOf(agent) {
   for (const event of sessionEvents(agent)) {
     if (event?.type !== 'subagent/descriptor') continue
-    const persona = event?.data?.persona
-    if (typeof persona === 'string' && persona !== '') return persona
+    const data = event?.data
+    const provider = typeof data?.provider === 'string' && data.provider !== '' ? data.provider : undefined
+    const persona = typeof data?.persona === 'string' && data.persona !== '' ? data.persona : undefined
+    return { provider, persona }
   }
-  return undefined
-}
-
-/**
- * 取该子代理所属委派行的 persona —— 主来源优先，descriptor 兜底。
- *
- * 两个来源都取自同一个 `request.persona`，内容一致；顺序之所以这样定，是因为
- * 主来源在**两条派单路径上都存在**，而兜底只在后台那条上存在。
- *
- * @param agent - 目标子代理。
- * @param warn - 每进程每原因只报一次的记录器。
- * @returns persona 文本，或 undefined。
- */
-function childPersona(agent, warn) {
-  const fromPrompt = promptSectionPersona(agent, warn)
-  if (typeof fromPrompt === 'string') return fromPrompt
-  return descriptorPersona(agent)
+  return { provider: undefined, persona: undefined }
 }
 
 /**
  * 判定该子代理是不是 minimal（只读）worker。
  *
- * 找不到标记 = 不是本模块的对象。这样做的直接后果是：`subagent` / `subagent_fork` /
- * `subagent_ptc` 三条**别的**委派路径完全不受影响 —— 这是「不破坏现有模式」的实现
- * 方式，而不是靠额外判断。
+ * 判定顺序与 `subagent-mode.mjs` 完全一致：
+ *   1. **provider 名**（主通道，新会话全走这里）—— 与 `MINIMAL_PROVIDER` 逐字比较；
+ *   2. **旧 persona 标记**（兜底，只对续接旧会话有意义）。
  *
- * ⚠️ 判「不是」与「读不到 persona」在本模块里**不可区分**，而两者的后果不同：
- * 前者是「这条行按设计不用收窄」，后者是「本该收窄却没读出来」。这个方向是**安全**的
- * （不收窄 ≠ 放宽权限：静态 `toolFilter` 仍在，本模块只是没能补上第二层），
- * 但它意味着「读不到」必须**可观测** —— 所以两个来源的读取路径都带固定标识告警，
- * 而不是静默返回 undefined。
+ * 两样都没有 = 不是本模块的对象。这样做的直接后果是：`subagent` / `subagent_fork` /
+ * `subagent_ptc` 三条**别的**委派路径完全不受影响 —— 这是「不破坏其它 worker」的
+ * 实现方式，而不是靠额外判断。
+ *
+ * ⚠️ 判「不是」与「读不到 provider」在本模块里**不可区分**，而两者的后果不同：
+ * 前者是「这条行按设计不用收窄」，后者是「本该收窄却没读出来」。这个方向仍是**安全**的
+ * （不收窄 ≠ 放宽权限），但它比旧版本更依赖本模块单层收窄工作 —— 因为静态那层
+ * `toolFilter` 已随上游删除。所以本模块装载失败时是**响亮告警**（见 apply 里的分支），
+ * 而不是旧版本那种「反正还有静态那层兜着」的静默降级。
  *
  * @param agent - 目标子代理。
- * @param warn - 每进程每原因只报一次的记录器。
- * @returns 命中 minimal 标记时为 true。
+ * @returns 是 minimal worker 时为 true。
  */
-function isMinimalChild(agent, warn) {
-  const persona = childPersona(agent, warn)
-  if (typeof persona !== 'string') return false
-  return persona.includes(MINIMAL_MODE_MARKER)
+function isMinimalChild(agent) {
+  const { provider, persona } = descriptorOf(agent)
+
+  // ── 两个**新** provider 名是排他的 ──
+  //
+  // 新名字只可能由新组合产生（旧版本的委派行用的是 `spawn` / `fork`），所以一旦读到
+  // 其中任一个，它就是这个子代理的**最终**身份，不许再被 descriptor 里残留的旧标记推翻。
+  // 少了这一条，一个 `multitask_ptc` 的 worker 只要 descriptor 里带着旧 minimal 标记，
+  // 就会被当成只读 worker 收窄 —— 那是把 PTC worker 的工具面削掉，且完全静默。
+  if (provider === MINIMAL_PROVIDER) return true
+  if (provider === PTC_PROVIDER) return false
+
+  // ── 旧会话：provider 还是当年的通用名（`spawn` / `fork`），只能看残留标记 ──
+  if (typeof persona === 'string' && persona.includes(LEGACY_MINIMAL_MARKER)) return true
+  return false
 }
 
 /**
@@ -517,7 +435,7 @@ const CATALOG_EXEMPT = ['run_code', 'structured_output']
  *
  * ⚠️ **它只改「模型看到什么」，不改「能不能调」。** 真正的执行拦截仍然是
  * `maxDepth`（minimal worker 的深度是 1，再往下派会撞
- * `Error: subagent depth 2 exceeds maxDepth 1`）与静态 `toolFilter`。
+ * `Error: subagent depth 2 exceeds maxDepth 1`）与本模块装的那层 `restrict()`。
  * 把这个过滤当成安全边界是错的 —— 它修的是**一致性**：人格里逐字写着
  * "Do not delegate further; you cannot, and you should not try"，
  * 而模型抬头就能看见三个委派工具。
@@ -613,7 +531,7 @@ export function apply(ctx, config) {
    *
    * ⚠️ 失败方向：拿不到 event registry 就**只告警、不抛错**。本模块对外的承诺是
    * 「任何意外都不得影响会话创建」，而这一层修的是**一致性**（人格与目录对上），
-   * 不是安全边界 —— 真正的拦截仍是 `maxDepth` 与静态 `toolFilter`。
+   * 不是安全边界 —— 真正的拦截仍是 `maxDepth` 与本模块装的那层 `restrict()`。
    *
    * 第一次真的滤掉东西时记一条 info（每个 worker 一次），列出被滤掉的名字。
    * 这条日志是**过度过滤的出口**：允许集是白名单，若哪天它误伤了某个 harness
@@ -685,9 +603,9 @@ export function apply(ctx, config) {
     // 判错方向代价最高：在协调者 scope 上摘工具会改写减震器语义。
     if (!isDelegatedChild(agent)) return
 
-    // ── 硬前置 2：只认 minimal 标记 ──
-    // 没标记的行（subagent / subagent_fork / subagent_ptc）一律不动作。
-    if (!isMinimalChild(agent, warn)) return
+    // ── 硬前置 2：只认 minimal worker ──
+    // 别的委派行（subagent / subagent_fork / subagent_ptc）一律不动作。
+    if (!isMinimalChild(agent)) return
 
     if (narrowed.has(agent)) return
 
@@ -695,7 +613,9 @@ export function apply(ctx, config) {
     if (tools === undefined || tools === null || typeof tools.restrict !== 'function') {
       warn(
         'a read-only worker scope exposes no tools.restrict(); it was NOT narrowed, so it keeps every tool ' +
-          'the static filter did not remove (including any ssh_* / task_board_* this deployment registers)',
+          'the composition registered (including any ssh_* / task_board_* this deployment registers). ' +
+          'There is no static tool filter behind this module — DSH 0.2.1-rc.2 removed the delegation row\'s ' +
+          'toolFilter field — so this worker is effectively un-narrowed. [MINIMAL-NARROW-SKIPPED reason=no-restrict]',
       )
       return
     }
@@ -706,7 +626,9 @@ export function apply(ctx, config) {
       // 这里不装任何东西（也不放宽任何东西），只告警。
       warn(
         'no tool schemas were readable for a read-only worker scope; it was NOT narrowed, so it keeps every tool ' +
-          'the static filter did not remove (will not be retried: the creation window has passed)',
+          'the composition registered. There is no static tool filter behind this module — DSH 0.2.1-rc.2 ' +
+          'removed the delegation row\'s toolFilter field. It will not be retried: the creation window has passed. ' +
+          '[MINIMAL-NARROW-SKIPPED reason=no-visible-surface]',
       )
       return
     }
@@ -768,7 +690,9 @@ export function apply(ctx, config) {
       // 少摘的工具不会因此被摘掉，但没有偷偷放宽任何东西（静态层仍在）。
       warn(
         `engaging the read-only restriction failed: ${error instanceof Error ? error.message : String(error)} — ` +
-          'that worker keeps every tool the static filter did not remove',
+          'that worker keeps every tool the composition registered. There is no static tool filter behind this ' +
+          'module — DSH 0.2.1-rc.2 removed the delegation row\'s toolFilter field. ' +
+          '[MINIMAL-NARROW-SKIPPED reason=restrict-threw]',
       )
     }
   }

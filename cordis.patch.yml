@@ -3,11 +3,16 @@
 # 作为一个 profile bundle 层应用（由本包 package.json 的 `dsh.bundle.patch`
 # 声明），作用只有一个：把 host 插件行插进 profile 的 roster。
 #
-# host 半（`lib/index.js`，exports "."）在激活时把本包自带的 Multitask agent
-# preset 声明给 agent-preset 注册表。声明成功 = 新会话的模式选择器里出现
-# 「Multitask 减震器模式」。
+# host 半（`lib/index.js`，exports "."）在激活时做两件事：
+#   1. 把本包自带的 Multitask agent preset 声明给 agent-preset 注册表 ——
+#      声明成功 = 新会话的模式选择器里出现「Multitask 减震器模式」；
+#   2. 往 `ctx.subagents` 注册两类自建 worker 后端（`multitask_ptc` /
+#      `multitask_minimal`）。**必须在宿主半做，不能放进 preset 内部**：provider
+#      注册的 effect 由服务自己的 context 拥有，preset 重新声明时旧注册不会被卸掉，
+#      新一代再注册同名会撞 DUPLICATE_PROVIDER，那会让整个 preset 挂载失败。
 #
-# 没有浏览器半：本模式不需要自建 UI，它复用 DSH 已有的 preset 选择器。
+# 浏览器半（`lib/client.js`，exports "./client"）提供「设置 → Multitask」页与
+# 「设置 → 通用设置」里的两行，由 package.json 的 `dsh.client` 声明，不经过这个文件。
 - insert:
     - id: multitask
       name: 'dsh-multitask'
