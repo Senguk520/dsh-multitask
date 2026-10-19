@@ -187,6 +187,26 @@ Level 1 covers what the sandbox cannot express: destructive commands **inside** 
 
 **The red line**: all of this is enabled **only in interactive sessions** — the parent session's approval policy must be `ask`. Headless and unattended deployments rely on `never` to guarantee they are never left waiting for an answer that will not come, and this plugin does nothing at all in that environment.
 
+### How this interacts with Experimental Auto Review
+
+DSH has an experimental feature, Auto Review: it switches the permission preset to `auto`, so **every native tool call** (and every inner call inside a PTC program) is first risk-classified by a reviewer running the same model. It and this plugin are **two independent gates** on the same chain, enforced by two separate pieces of code.
+
+While it is on, **this plugin's Level 1 yields** — the reviewer is the authority for that session:
+
+| Reviewer decision | Result |
+|---|---|
+| allow (low risk, or a medium action with explicit authorisation) | runs immediately — **this plugin does not raise `ask`**, so you are not asked twice |
+| deny, with the approval policy at `ask` | the reviewer returns `ask` itself, which reaches this plugin's Level-2 relay → a card appears in the main conversation for you |
+| deny, with the policy at `never` | the reviewer's denial is final; `AUTO_REVIEW_DENIED` goes straight back to the Subagent |
+| reviewer failure | treated as `deny` (fail-closed) — never a silent allow |
+
+**With Auto Review off, behaviour is completely unchanged**: this plugin raises `ask` from the rule table as before. The test is "is this session's permission preset `auto`", the same test the reviewer uses, so the two sides can never disagree about who is in charge. The switch is `yieldToAutoReview` (default `true`); pass `false` to keep prompting even when the reviewer is in charge.
+
+⚠️ Two boundaries worth knowing:
+
+- **The reviewer does not review the outer `run_code`**, only the inner calls inside it; a `subagent_ptc` worker can produce Node side effects directly from its program. For a PTC worker, **the sandbox is still the last line**, not the reviewer.
+- **Review costs extra tokens**: every reviewed call is a full model request.
+
 Authorisation is **one-shot every time**: "Allow once" authorises that call only, and the same call prompts again next time. There is no "always allow".
 
 **With a background dispatch whose turn has ended**, the first relay fails (it needs the parent session to have an open turn). The plugin then sends a message from that Subagent into the main conversation, naming which child session it is, what it wants to run, and where to answer — and **that message itself wakes the idle parent session**, so the plugin immediately retries the relay against the turn it just opened. In practice an ordinary approval card therefore appears in the main conversation within seconds; answer it there.
@@ -312,6 +332,7 @@ The profile patch cannot reach this row's `config` — the host half applies onl
 | `shellTools` | `['pwsh', 'bash']` | Extra tool names whose command text should be classified (a wrong name does not error, it silently misses) |
 | `fileTools` | `['write', 'edit']` | Extra write tools whose `file_path` may point outside the workspace |
 | `autoApproveTempRoots` | each platform's temp directory | "Scratch space" roots: writing there, or deleting **only** there, does not prompt. Pass `[]` to turn this off |
+| `yieldToAutoReview` | `true` | When this session's permission preset is `auto` (Auto Review is on), yield to the reviewer instead of raising a second `ask`. Pass `false` to keep prompting anyway |
 
 `extraDangerPatterns` / `shellTools` / `fileTools` are **additive**: missing one only means those cases are not examined (equivalent to not having this module), and it never lets through something this module would have asked about. `safePatterns` is **subtractive**: it cancels a danger this module has **already** judged, which is why it is deliberately empty by default — a mistake there is a silent permit, not one fewer prompt.
 

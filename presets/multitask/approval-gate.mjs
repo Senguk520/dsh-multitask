@@ -769,6 +769,51 @@ function effectivePolicyOf(ctx, session) {
 }
 
 /**
+ * 读一个会话当前**生效的权限预设**名。
+ *
+ * 读不到时返回 undefined（调用点一律把「读不到」当作「不是我认识的预设」）。
+ *
+ * @param ctx - 插件上下文。
+ * @param session - 目标会话。
+ * @returns 预设名（如 `'auto'` / `'custom'`），或 undefined。
+ */
+function permissionPresetOf(ctx, session) {
+  try {
+    const presets = ctx?.get?.('permissionPresets')
+    if (presets === undefined || presets === null || typeof presets.current !== 'function') return undefined
+    const name = presets.current(session)
+    return typeof name === 'string' ? name : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 自动审查（EXP）此刻是不是正在为这个会话把关。
+ *
+ * ── 判据为什么是「权限预设名 === `'auto'`」────────────────────────────────────
+ *
+ * `@deepseek-ai/dsh-experimental-auto-review` 自己的门就是这么写的：
+ *
+ *     if (permissionPresets.current(agent.session) !== AUTO_PRESET) return next();
+ *
+ * 而 `'auto'` 这个预设**只有 EXP 装了才会出现** —— 权限注册表的 `specOf()` 里
+ * `name === "auto"` 那一支要求 `autoAdmit !== undefined`，而 `autoAdmit` 正是
+ * `registerAuto()` 写的。所以这个判据同时回答了「EXP 在不在」与「用户在不在用」，
+ * 不需要去探测插件是否安装，也就不会与上游的注册细节耦合。
+ *
+ * ⚠️ `current()` 返回 `'custom'` 时**不算** EXP 在管：那表示用户选过 auto 但事后改了
+ * 沙箱或审批档位，此时 EXP 自己也会 `return next()` 不审查。两边用同一个判据，行为才一致。
+ *
+ * @param ctx - 插件上下文。
+ * @param session - 目标会话。
+ * @returns EXP 正在把关时为 true。
+ */
+function autoReviewActive(ctx, session) {
+  return permissionPresetOf(ctx, session) === 'auto'
+}
+
+/**
  * 装载本模块。
  *
  * @param ctx - preset scope 的插件上下文。
@@ -1175,6 +1220,28 @@ export function apply(ctx, config) {
         // `decide()` 的第一行按 `never` 判成 `rejected` —— 那会把一条原本能在沙箱里
         // 正常跑完的命令变成拒绝。宁可不问，也不能制造出一个必然被拒的询问。
         if (effectivePolicyOf(ctx, agent.session) !== 'ask') return downstream
+
+        // ── 让位给自动审查（EXP）────────────────────────────────────────────
+        //
+        // 用户开了「自动审查（实验）」这个权限预设时，**它才是这个会话的把关人**：
+        // 每次原生工具调用与 PTC 内层调用都由它先审一遍。此时本模块的规则表再升一次
+        // `ask`，效果是「EXP 已经放行、却又弹卡问用户」—— 那是纯粹的重复打扰，也正是
+        // 用户反馈的那个现象。
+        //
+        // 两种结局都符合用户的要求：
+        //   · EXP 允许 → 本模块不动作 → 直接执行（不再打扰用户）
+        //   · EXP 拒绝 → 它自己返回 `ask`（`ask` 策略下）→ 走本模块的第二级转呈，
+        //     照样落到主对话由用户裁决；`never` 策略下它直接终局拒绝
+        //
+        // ⚠️ 判据与 EXP 自己那条门**逐字同源**（`permissionPresets.current() === 'auto'`），
+        // 所以「它会不会审」与「我要不要让位」永远一致 —— 见 `autoReviewActive()`。
+        // 反过来说：EXP 没装、或用户没选它时，这个判断恒为假，本模块行为与之前完全一样。
+        if (config?.yieldToAutoReview !== false && autoReviewActive(ctx, agent.session)) {
+          ctx.logger?.info?.(
+            `dsh-multitask: MULTITASK-APPROVAL-YIELDED reason=auto-review tool=${JSON.stringify(exec.name)}`,
+          )
+          return downstream
+        }
 
         const cwd = agent?.session?.header?.cwd
         const hit = classifyExecution(exec, { shellTools, fileTools, danger, safe, cwd, caseInsensitive, tempRoots })
