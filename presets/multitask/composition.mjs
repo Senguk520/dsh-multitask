@@ -193,6 +193,21 @@ You have more than one delegation path, and they do NOT have the same tool surfa
 
 When in doubt, use **subagent**. These are defaults for picking the best fit, not a rigid rule — they tell you where each path is strongest, and the judgement of which one a given task belongs to stays yours.
 
+## Dispatching to another installed mode
+
+The four paths above are this mode's OWN workers. There is one more path that reaches OUTSIDE this mode:
+
+- **subagent_preset** — runs a worker under a DIFFERENT installed agent mode (an agent preset), for example a mode the user installed from the plugin market because it specialises in a workflow this mode does not cover.
+
+Reach for it when a job is genuinely better served by another mode's design than by any of your four workers, and when you can say which mode that is. Call it with \`list: true\` first to read the roster: each mode publishes its own id, name, and description, and **that description is the only reliable statement of what the mode is for** — do not infer a mode's capabilities from its id. The same call returns whether each mode can currently compose a session; a mode marked "CANNOT RUN" is broken and must not be chosen.
+
+Two rules, both learned from how the seam behaves:
+
+- **The brief must be fully self-contained.** A cross-mode worker starts under a different composition with no access to this conversation — same rule as any other worker, but stricter here, because the worker may not even share this mode's tool conventions.
+- **Do not dispatch to this mode itself.** The call refuses it, because a Multitask worker cannot delegate further and would spend a turn failing. For work inside this mode, use \`subagent\` / \`subagent_fork\` / \`subagent_ptc\` / \`subagent_minimal\`.
+
+If you cannot tell which mode fits, ask the user — they installed it and know why. Guessing an id from the roster and hoping the description holds is worse than one short question.
+
 ## How far you can fan out
 
 Two limits bound the shape of a fan-out. Plan the scale of a delegation accordingly.
@@ -1175,6 +1190,48 @@ export function buildPlugins(options) {
       },
     },
 
+    // ── ★ 跨模式派发：协调者可以派活给**别的已安装模式** ──────────────────────
+    //
+    // 只做一件事：注册 `subagent_preset`，让协调者把任务书投给市面上装进来的任意
+    // agent preset（standard / ptc / minimal / cordis / 任何第三方模式）。
+    //
+    // ── 为什么这功能是本模式的定位，而不是附加项 ──────────────────────────────
+    //
+    // 「减震器」的价值在于**主对话只留高价值信息**。此前它只能减震本 preset 内部的
+    // 四类 worker；用户从插件市场装进来的模式依然只能自己开新会话去用，过程数据照样
+    // 会落进某个对话。补上这条之后，协调者成了**用户与所有模式之间的那一层**：
+    // 它按各模式自己声明的适用范围挑一个，把任务书投进去，只收回结论。
+    //
+    // ── 为什么按「描述文本」挑，而不是解析对方的内部结构 ─────────────────────
+    //
+    // 刻意只用两样稳定的东西：注册表的 `list()`（id / 名称 / 描述 / 是否 broken）与
+    // 上游的 `startActivation({ request: { agentPreset } })`。不解析别人的插件行、不猜
+    // 工具名、不读别人的 config —— 那是别人家的实现细节，一次上游改版就会连带坏掉。
+    // 「这个模式是干什么的」唯一权威且稳定的来源就是它自己发布的 description。
+    //
+    // ── 为什么 provider 固定 `spawn`（不做成配置项）──────────────────────────
+    //
+    // 上游 `assertCapabilities()` 有一条硬约束：带 `agentPreset` 的请求要求 provider
+    // 具备 `agentPreset: true` 且**不**继承父上下文（`inheritsParentContext === false`）。
+    // 内置 `spawn` 满足，`fork` 不满足。配错了只会在**委派那一刻**抛能力错误，排查成本
+    // 远高于「干脆不开放这个开关」，所以写死在 `preset-dispatch.mjs` 里。
+    //
+    // ── 与四类 worker 的分工 ────────────────────────────────────────────────
+    //
+    // 四类 worker 是**本模式自己的**工具面分流（谁去干活、看得见多少工具）；
+    // 本行是**跨模式**的路由（这件事本来就该由别的模式来做）。两者不重叠：
+    // 拿不准该用哪个时，先 `list: true` 看各模式自述，仍不确定就用 `subagent`。
+    {
+      id: 'preset-dispatch',
+      name: local('./preset-dispatch.mjs'),
+      config: {
+        enabled: true,
+        // 本模式自己的 id —— 派给自己会被明确拒绝（那会造出一个「子协调者」，
+        // 而深度限制让它派不出去，等于白跑一次还容易误判成功能坏了）。
+        selfPresetId: PRESET_ID,
+      },
+    },
+
     // ── ★ 审批闸门：让子代理的**危险操作**能弹到用户面前 ──────────────────────
     //
     // 只做三件事，全部围绕一个事实：`dsh-subagent` 把子会话的审批策略**钉死为
@@ -1280,7 +1337,10 @@ export function buildPlugins(options) {
         // ⚠️ 宿主半还可能覆盖它（profile 里把 `config.presetId` 改成别的值时，
         // 声明 id 与这里必须一起改）—— 那一处见 lib/index.js 的 applyGuardOverrides。
         presetId: PRESET_ID,
-        keep: MULTI_MODE_ENABLED ? ['subagent_ptc', 'subagent_minimal'] : [],
+        // `subagent_preset` **不受** `MULTI_MODE_ENABLED` 门控：跨模式派发是独立能力，
+        // 与本 preset 内部那两类 worker（ptc / minimal）不是一回事。所以它无条件保留 ——
+        // 不写进来协调者就看不见它（保留集是白名单，`deny = 可见集 − 保留集`）。
+        keep: ['subagent_preset', ...(MULTI_MODE_ENABLED ? ['subagent_ptc', 'subagent_minimal'] : [])],
       },
     },
 

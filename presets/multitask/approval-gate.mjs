@@ -257,7 +257,8 @@ const DEFAULT_FILE_TOOLS = ['write', 'edit']
  * ⚠️ 少了某一条的后果只是「这条命令和以前一样直接执行」，所以这张表**天然是安全的**：
  * 它决定的是「要不要多问一次」，不是「要不要放行」。
  */
-const DANGER_PATTERNS = [
+/** 内置的危险模式表。导出供回归直接使用真实规则，而不是在测试里重抄一份。 */
+export const DANGER_PATTERNS = [
   // ── 递归 / 强制删除（工作区**之内**的破坏，沙箱允许，正是本级要补的洞）──────
   // `rm -rf` / `rm -fr` / `rm -r -f` / `rm --recursive`（PowerShell 里 `rm` 是
   // `Remove-Item` 的别名，所以这一条在 win32 上同样命中）
@@ -540,28 +541,160 @@ function stringArg(exec, name) {
   return typeof value === 'string' ? value : undefined
 }
 
+/** 需要**递归删除**语义的模式 id —— 「删除能不能放行」只认这一组。 */
+const DELETION_PATTERN_IDS = new Set([
+  'rm-recursive-force',
+  'remove-item-force',
+  'cmd-del-force',
+  'cmd-rmdir-recursive',
+])
+
+/**
+ * 默认视为**免询问**的临时根目录。
+ *
+ * ── 为什么临时目录值得单独开一档 ─────────────────────────────────────────────
+ *
+ * 临时目录是**所有进程共享的草稿纸**：DSH 自己就在那里建 `dsh-subagent-*`、
+ * `dsh-acl-locks` 之类的目录。一个 worker 往那里写中间产物是正常工作，不是危险操作 ——
+ * 为它弹一次审批，只会训练用户「闭眼点允许」，那反而削弱了真正的危险询问。
+ *
+ * ── 为什么只从环境变量推导，不 import `node:os` ────────────────────────────
+ *
+ * 本仓库的预设模块约定「零 import」（彼此不 import，也不引入运行时依赖）。
+ * `os.tmpdir()` 的取值本来就来自这些环境变量，直接读它们是等价且无依赖的。
+ * win32 上补一条 `%LOCALAPPDATA%\Temp`，因为 `TEMP` 偶尔会被某些父进程改掉。
+ *
+ * @returns 规范化后的根目录列表（去重、去尾斜杠）。
+ */
+export function defaultTempRoots() {
+  const candidates = []
+  for (const key of ['TEMP', 'TMP', 'TMPDIR']) {
+    const value = process.env[key]
+    if (typeof value === 'string' && value.trim() !== '') candidates.push(value)
+  }
+  if (process.platform === 'win32') {
+    const local = process.env.LOCALAPPDATA
+    if (typeof local === 'string' && local.trim() !== '') candidates.push(`${local}\\Temp`)
+  }
+  candidates.push('/tmp')
+
+  const roots = []
+  const seen = new Set()
+  for (const entry of candidates) {
+    const normalized = inspectPath(entry).normalized.replace(/\/+$/, '')
+    if (normalized === '') continue
+    const key = process.platform === 'win32' ? normalized.toLowerCase() : normalized
+    if (seen.has(key)) continue
+    seen.add(key)
+    roots.push(normalized)
+  }
+  return roots
+}
+
+/**
+ * 判断一个路径是否落在**允许根**之下（含根目录本身）。
+ *
+ * 只做词法比较，不碰文件系统 —— 与 `escapesWorkspace` 同一取向：不需要真的解析，
+ * 而且**误判方向是安全的**（判成「不在根下」只是多问一次）。
+ *
+ * @param filePath - 待判定的路径。
+ * @param roots - 已规范化的允许根。
+ * @param caseInsensitive - 是否大小写不敏感（win32 为 true）。
+ * @returns 落在任一允许根下时为 true。
+ */
+export function isUnderRoots(filePath, roots, caseInsensitive) {
+  if (!Array.isArray(roots) || roots.length === 0) return false
+  const target = inspectPath(filePath)
+  if (target.normalized === '' || !target.absolute || target.escapes) return false
+
+  const fold = (text) => (caseInsensitive ? text.toLowerCase() : text)
+  const a = fold(target.normalized)
+  for (const root of roots) {
+    const b = fold(String(root)).replace(/\/+$/, '')
+    if (b === '') continue
+    if (a === b || a.startsWith(`${b}/`)) return true
+  }
+  return false
+}
+
+/**
+ * shell 元字符 —— 出现任何一个就**不**做「删除放行」的判定。
+ *
+ * 理由：这条豁免一旦误判，就会把「真正危险的一整行命令」放过去；而多问一次只是
+ * 一次点击。所以宁可只认**最简单**的形态（单个删除命令 + 纯路径参数）。
+ */
+const SHELL_METACHARACTERS = /[;|&`$><]/
+
+/**
+ * 判断一条**删除**命令是否只作用于允许根（默认是临时目录）。
+ *
+ * 判定刻意保守，四个条件缺一不可：
+ *   1. 命令行里**没有** shell 元字符（管道、串联、重定向、变量展开、命令替换都不认）；
+ *   2. 至少有一个**绝对路径**参数；
+ *   3. **所有**绝对路径参数都落在允许根下；
+ *   4. 相对路径参数也算数：它会让「到底删的是哪」变得不可判定，所以直接判否。
+ *
+ * 于是 `rm -rf /tmp/x` 放行，而 `rm -rf /tmp/x /home/u`、`rm -rf $env:TEMP\x`、
+ * `Remove-Item -Recurse C:\Windows` 都要询问。
+ *
+ * @param command - 命令文本。
+ * @param roots - 已规范化的允许根。
+ * @param caseInsensitive - 是否大小写不敏感。
+ * @returns 可以视为「仅清理允许根」时为 true。
+ */
+export function confinedToRoots(command, roots, caseInsensitive) {
+  if (typeof command !== 'string' || command.trim() === '') return false
+  if (!Array.isArray(roots) || roots.length === 0) return false
+  if (SHELL_METACHARACTERS.test(command)) return false
+
+  const tokens = command
+    .split(/\s+/)
+    .map((token) => token.replace(/^["']|["']$/g, ''))
+    .filter((token) => token !== '')
+
+  const paths = []
+  for (const token of tokens) {
+    const inspected = inspectPath(token)
+    if (inspected.normalized === '') continue
+    // `-Recurse` / `--force` 这类选项不是路径；它们的 `inspectPath` 结果既不是绝对路径
+    // 也不含 `/`，跳过即可（真正的判定只看路径 token）。
+    if (!inspected.absolute && !inspected.normalized.includes('/')) continue
+    paths.push(token)
+  }
+
+  if (paths.length === 0) return false
+  return paths.every((token) => isUnderRoots(token, roots, caseInsensitive))
+}
+
 /**
  * 判定一次工具调用是否需要征求用户同意（第一级闸门）。
  *
  * @param exec - 工具执行输入（含 `name` / `arguments`）。
- * @param options - 编译好的模式表、工具名集合与工作区信息。
+ * @param options - 编译好的模式表、工具名集合、工作区信息与允许根。
  * @returns 命中时的描述，否则 undefined。
  */
 export function classifyExecution(exec, options) {
   const toolName = exec?.name
   if (typeof toolName !== 'string' || toolName === '') return undefined
+  const tempRoots = Array.isArray(options?.tempRoots) ? options.tempRoots : []
 
   if (options.shellTools.has(toolName)) {
     const command = stringArg(exec, 'command')
     const hit = classifyShellCommand(command, options.danger, options.safe)
-    if (hit !== undefined) return { kind: 'shell', pattern: hit, command }
-    return undefined
+    if (hit === undefined) return undefined
+    // 删除类命令：只有当它**只**碰允许根（临时目录）时才算清理，不打扰用户。
+    if (DELETION_PATTERN_IDS.has(hit) && confinedToRoots(command, tempRoots, options.caseInsensitive)) {
+      return undefined
+    }
+    return { kind: 'shell', pattern: hit, command }
   }
 
   if (options.fileTools.has(toolName)) {
     const filePath = stringArg(exec, 'file_path')
     if (filePath === undefined) return undefined
     if (escapesWorkspace(filePath, options.cwd, options.caseInsensitive)) {
+      // 往临时目录里写是草稿行为：DSH 自己就在那里建运行时目录。
+      if (isUnderRoots(filePath, tempRoots, options.caseInsensitive)) return undefined
       return { kind: 'file', pattern: 'write-outside-workspace', filePath }
     }
     return undefined
@@ -650,6 +783,22 @@ export function apply(ctx, config) {
   const shellTools = new Set([...DEFAULT_SHELL_TOOLS, ...(config?.shellTools ?? [])])
   const fileTools = new Set([...DEFAULT_FILE_TOOLS, ...(config?.fileTools ?? [])])
   const caseInsensitive = process.platform === 'win32'
+
+  /**
+   * 「免询问」的根目录：往这里写文件、或只删这里的东西，都当作草稿行为放行。
+   *
+   * 默认是各平台临时目录（见 `defaultTempRoots()`）。`config.autoApproveTempRoots`
+   * 可以**替换**它（传空数组 = 关掉这一档，连临时目录也要问）。
+   *
+   * ⚠️ 这一档只影响**询问**，不影响沙箱：能写到哪里仍然由 DSH 的沙箱与 ACL 决定。
+   * 在这里放宽的只是「要不要打扰用户」，不是「能不能做」。
+   */
+  const tempRoots = Array.isArray(config?.autoApproveTempRoots)
+    ? config.autoApproveTempRoots
+        .filter((entry) => typeof entry === 'string' && entry.trim() !== '')
+        .map((entry) => inspectPath(entry).normalized.replace(/\/+$/, ''))
+        .filter((entry) => entry !== '')
+    : defaultTempRoots()
 
   /**
    * 已经放开过策略的子代理。
@@ -1028,7 +1177,7 @@ export function apply(ctx, config) {
         if (effectivePolicyOf(ctx, agent.session) !== 'ask') return downstream
 
         const cwd = agent?.session?.header?.cwd
-        const hit = classifyExecution(exec, { shellTools, fileTools, danger, safe, cwd, caseInsensitive })
+        const hit = classifyExecution(exec, { shellTools, fileTools, danger, safe, cwd, caseInsensitive, tempRoots })
         if (hit === undefined) return downstream
 
         const label = hit.kind === 'shell' ? hit.command : hit.filePath
