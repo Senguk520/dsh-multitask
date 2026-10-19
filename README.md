@@ -95,6 +95,37 @@ When in doubt, use `subagent`. That guidance lives in the coordinator persona, a
 
 ---
 
+## Dispatching to another mode
+
+The four paths above are this mode's **own** workers. One more path reaches **outside** this mode:
+
+| Delegation tool | Target | Best for |
+|---|---|---|
+| `subagent_preset` | **any installed agent preset** (including third-party modes installed from the market) | when the job is genuinely something that other mode exists to do |
+
+This is what makes the coordinator a layer between **you and every installed mode**: it picks one by reading what that mode says about itself, hands the brief over, and only receives the conclusion. The work happens in **that mode's worker**, not in your main conversation.
+
+To use it, call with `list: true` first to read the roster (id, name, description, and whether each mode can currently compose a session), then choose by description. **The description is the only reliable statement of a mode's capabilities** — do not guess from the id. A mode marked `CANNOT RUN` is broken and must not be chosen.
+
+Three boundaries:
+
+- **The brief must be fully self-contained.** A cross-mode worker may not even share this mode's tool conventions, so it needs the background written out even more completely than an ordinary worker.
+- **You cannot dispatch to this mode itself.** That would spawn a sub-coordinator, which the depth limit then refuses to let delegate — the call is rejected outright and points you at the four built-in paths.
+- **Workers cannot dispatch further.** `subagent_preset` belongs to the coordinator; a worker calling it is refused for the same depth reason, so splitting always stays with the coordinator.
+
+**A fourth boundary (measured, and worth knowing): a cross-mode worker is not governed by this mode's guards.**
+
+In `setup()` a subagent is attached to the **target mode's** scope with `bindScopeParent(childKey, targetGenerationKey)`, and events like `agent/created` and `tools/pre-execute` reach only listeners **on that scope chain**. A cross-mode worker's chain is `[itself, target mode]` — it does **not** contain this mode. That cuts both ways:
+
+- **The good side:** this mode's persona injection, read-only narrowing, and approval gate never leak into someone else's mode. A task you hand to a read-only mode will not be told "you have the full tool set" by this mode.
+- **The side to keep in mind:** the **approval gate does not cover it either**. Upstream pins a child session's approval policy to `never`, so a cross-mode worker's dangerous operations are **refused outright** (fail-closed — never silently allowed), but **no card is raised to ask you**. It is governed by the target mode; if that mode has guards of its own, they apply.
+
+So cross-mode dispatching is a **capability router, not a security proxy**. Work that needs this mode's two-level gate should still go to one of the four built-in paths.
+
+The provider is fixed to `spawn` and is not a configuration option: upstream requires a provider that can select another preset to declare the `agentPreset` capability **and** not inherit the parent's context. The built-in `spawn` satisfies both and `fork` does not. Hard-coding it avoids a class of capability error that would otherwise only surface at delegation time.
+
+---
+
 ## Settings
 
 Once installed, DSH's settings gain the following.
@@ -260,7 +291,7 @@ The remaining switches live in the `config` of the corresponding rows in `preset
 | Row | Effect of disabling |
 |---|---|
 | `subagent-mode` | the PTC presentation is off, and `subagent_ptc` degrades to the same native surface as `subagent` |
-| `minimal-guard` | the read-only worker reverts to "only the static three withheld" and can see write-capable tools installed by other plugins again — **no security benefit** |
+| `minimal-guard` | the read-only worker is **not narrowed at all** — it sees every tool the composition registers, including write-capable ones and anything other plugins add. There is no static layer behind it any more (DSH 0.2.1-rc.2 removed the delegation row's `toolFilter`), so this switch is a **security downgrade**, not a convenience |
 | `approval-gate` | dangerous operations no longer prompt (back to default DSH behaviour) |
 | `workspace-acl` | `WRITE_OWNER` is no longer granted automatically (or use `config.autoGrantWriteOwner: false`) |
 
@@ -280,8 +311,30 @@ The profile patch cannot reach this row's `config` — the host half applies onl
 | `safePatterns` | `[]` | Extra "match but do not ask" allow-patterns. ⚠️ This is a **prompt-suppressing** channel: a mistake silently lets a dangerous command through |
 | `shellTools` | `['pwsh', 'bash']` | Extra tool names whose command text should be classified (a wrong name does not error, it silently misses) |
 | `fileTools` | `['write', 'edit']` | Extra write tools whose `file_path` may point outside the workspace |
+| `autoApproveTempRoots` | each platform's temp directory | "Scratch space" roots: writing there, or deleting **only** there, does not prompt. Pass `[]` to turn this off |
 
 `extraDangerPatterns` / `shellTools` / `fileTools` are **additive**: missing one only means those cases are not examined (equivalent to not having this module), and it never lets through something this module would have asked about. `safePatterns` is **subtractive**: it cancels a danger this module has **already** judged, which is why it is deliberately empty by default — a mistake there is a silent permit, not one fewer prompt.
+
+### Temp-directory exemption (`autoApproveTempRoots`)
+
+The temp directory is the **scratch paper every process shares** — DSH itself creates `dsh-subagent-*` and `dsh-acl-locks` there. A worker writing intermediate artifacts there is ordinary work; prompting for it only trains you to click "Allow" without looking, which weakens the prompts that matter. Two cases are exempt by default:
+
+- **writing into** the temp directory (a `write` / `edit` whose `file_path` lands under an allowed root);
+- **deleting only inside** it (under the strict conditions below).
+
+The default roots are derived from `TEMP` / `TMP` / `TMPDIR` and `%LOCALAPPDATA%\Temp` (no `node:os` import — this package's preset modules are dependency-free), plus `/tmp`. Add your own cache directory by listing it in this array.
+
+**The deletion exemption is deliberately strict** — four conditions, all required: no shell metacharacters (`;` `|` `&` `` ` `` `$` `>` `<`); at least one absolute path argument; **every** path argument under an allowed root; and no relative path arguments. So:
+
+| Command | Result |
+|---|---|
+| `rm -rf /tmp/x` | no prompt |
+| `rm -rf /tmp/x /home/u` | **prompts** — one path is outside the roots |
+| `rm -rf C:\Windows` | **prompts** |
+| `rm -rf $env:TEMP\x` | **prompts** — it contains `$`, so no exemption |
+| `Remove-Item -Recurse C:\Windows` | **prompts** |
+
+The reason is blunt: one wrong exemption lets an entire dangerous command through, while one extra prompt costs a click. **This tier only decides whether to interrupt you, never what the sandbox allows** — where a worker can actually write is still decided by DSH's sandbox and ACL.
 
 Source edits take effect only after a **restart**.
 
@@ -337,7 +390,7 @@ Two related traps: a relative import does **not** inherit the entry's query (thi
 - **Self-correction is a dependable tendency, not a hard guarantee.** That all three mistakes were pushed back on is a measured result, and it rests on two mechanisms being present **at the same time**: the worker persona forbidding results it did not obtain, and the coordinator keeping its read-only tools. With either one gone, the correction may simply not happen.
 - **Delegation depth is 1.** A worker cannot delegate further; very large jobs must be split by the coordinator into parallel briefs.
 - **PTC's "collapse" is a presentation collapse, not a capability cut — by design, not a defect.** The direct surface of `subagent_ptc` really is just `run_code`, but the SDK binding table remains fully callable from inside a program; remove it and PTC is an empty shell.
-- **The read-only worker is "two layers of narrowing", still not a sandbox.** The static `toolFilter` and the adaptive narrowing intersect inside `dsh-tools`, so they cannot widen anything; but if a plugin registers a new mutating tool **after** that worker is created, it will not be withheld (a deliberate trade-off).
+- **The read-only worker is "one adaptive layer of narrowing", still not a sandbox.** Narrowing is done by `minimal-guard.mjs` alone (`deny = visible set − allowed set`): the names come from the real visible surface, so the call cannot throw, and any tool a host or plugin registers later is withheld from that worker by default. DSH 0.2.1-rc.2 removed the delegation row's `toolFilter`, so the old static layer no longer exists — meaning **there is no fallback if this one layer fails to install** (it warns loudly). Also, if a plugin registers a new mutating tool **after** that worker is created, it will not be withheld (a deliberate trade-off).
 - **The approval gate's fallback is only a pointing notice.** When the relay fails the request stays pending, and the notice does not release it; only answering in that child session does.
 - **The rule table is pattern matching, so it will miss novel dangerous commands.** The real gate is therefore the Level-2 relay; Level 1 only exists to keep safe commands from bothering you.
 - **An upstream change can disable a guard**, and every such failure fails towards "the behaviour you had without that guard", never towards wider permissions.

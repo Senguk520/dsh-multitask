@@ -374,17 +374,22 @@ worker **仍然占着名额**。所以「派一批 → 等它们全部结束 →
 
 两条新路径用的是**两套完全不同的机制**，别混淆：
 
-- **`subagent_minimal` —— 原生 `toolFilter` + 本包的自适应补收窄。**
-  `toolFilter` 就是 `dsh-tool-subagent` 自带的字段，把工具从子代理的可见面里**减掉**；
-  但它是**静态**名单，只敢列本 composition 确定会注册的名字（`write` / `edit` / `pwsh|bash`），
-  因为 `tools.restrict()` 对**当前部署不存在**的名字会抛错。于是**别的插件注册**进来的写入类
-  工具（典型是 `ssh_*` 里的 `ssh_exec`、`task_board_*` 里的 `task_board_run`）不受这张静态表
-  约束 —— 人格说只读、机制却让它能改远端机器。`minimal-guard.mjs` 补上第二层：
-  在 `agent/created` 时按 `deny = 可见集 − 允许集` **自适应**收窄，名单里每个名字都必然存在。
+- **`subagent_minimal` —— 本包的自适应收窄（`minimal-guard.mjs`）。**
+  在 `agent/created` 时按 `deny = 可见集 − 允许集` 收窄，名单里每个名字都必然存在于
+  该 scope 的实际可见面，所以不会抛错；别的插件注册进来的写入类工具
+  （典型是 `ssh_*` 里的 `ssh_exec`、`task_board_*` 里的 `task_board_run`）也一并被摘，
+  而且不需要预先知道它们的名字。人格说只读、机制也做到了只读。
+
+  > ⚠️ **旧版本这里还有第二层：委派行自带的静态 `toolFilter`。DSH 0.2.1-rc.2 删除了
+  > 该配置项**（配置里出现即抛错、整个 preset 挂载失败），所以现在只剩上面这一层。
+  > 覆盖面不减反增（静态那层只能列出三个确定存在的名字），但**失败后果变了**：
+  > 本模块装不上时不再有静态层兜底，minimal worker 就是完全不收窄。因此它的失败
+  > 一律**响亮告警**，并带 `MINIMAL-NARROW-SKIPPED reason=…`。
+
 - **`subagent_ptc` —— `presentAs('ptc')`（本包插件 `subagent-mode.mjs`）。**
   PTC 不是「筛掉一些工具」，而是**换一套呈现方式**：整张工具面塌缩成
   「只可直呼 `run_code`」，其余端能力工具都从程序里经生成的 SDK 到达。
-  这个能力**无法用 `toolFilter` 模拟**（`run_code` 是保留传输名，
+  这个能力**无法用工具筛选模拟**（`run_code` 是保留传输名，
   `tools.restrict()` 明确拒绝它），所以必须由插件实现。
 
 协调者要能看见这两个新工具名，靠的是 composition 里给减震器那行传的 `keep`
@@ -414,42 +419,54 @@ ASCII 标识**，一条 grep 就能同时看到「跳过的」与「生效的」
 
 ### 模式标记是怎么被子代理之外的代码读到的
 
-插件要回答「刚创建的子代理来自哪一行」，而 `dsh-tool-subagent` 的 Config schema 里
-**没有**任何模式/组成字段，也**没有**运行时句柄。所以只能靠一个被注入到子代理自身的
-标记来间接识别 —— `persona` 是唯一符合条件的载体。
+插件要回答「刚创建的子代理来自哪一行」。这件事换过一次载体，**别再按旧版本读**。
 
-⚠️ **但这份 persona 有两条到达路径，覆盖面不同 —— 这里踩过一个真实的坑：**
+**现在（DSH 0.2.1-rc.2 起）：读 `subagent/descriptor` 的 `provider` 字段。**
 
-| 来源 | 前台派单（`one-shot`） | 后台派单（`continuable`） |
-|---|---|---|
-| 子代理自己的 `deployment:persona-prefix` 段落 | ✅ 有 | ✅ 有 |
-| `subagent/descriptor` 事件的 `data.persona` | ❌ **被丢掉** | ✅ 有 |
+`dsh-tool-subagent` 的 Config 里只剩 provider / toolName / modelSelectionSettings /
+agentOptions / agentPreset / allowedAgentPresets / maxDepth。其中只有 `provider` 同时满足
+三个条件：
 
-`snapshotSubagentDescriptor()` 对 `mode === 'one-shot'` 的行只保留
-`version` / `mode` / `provider` / `label` 四个字段，persona 与 toolFilter **都被丢掉**；
-而且 one-shot 的 descriptor 要到**第一轮 `agent/pre-step`** 才 append，在
-`agent/created` 那一刻**根本还不存在**。
+1. 由**委派行**决定（不是模型传的参数）；
+2. 原样写进 `subagent/descriptor`（`data.provider`），因而在 `agent/created` 窗口读得到；
+3. 同一个实现可以注册多个名字，所以每类 worker 各占一个。
 
-**早期实现只读 descriptor**，于是两个守卫在**前台派单时整体失效** —— 症状是
-`subagent_ptc` 不塌缩（照旧拿着一整排原生工具，连 `run_code` 都没有）、
-`subagent_minimal` 不收窄（仍然握着 `ssh_exec` / `task_board_run`）。
-而前台派单恰好是**审批弹窗唯一走得通**的那条路径，所以这个缺陷偏偏在
-「按任务书老实做前台派单」时最明显，在默认后台派单时反而不出现。
+四条委派行因此各绑一个 provider 名：`spawn` / `fork` / `multitask_ptc` /
+`multitask_minimal`。前两个沿用宿主内置的（主路径不冒额外注册失败的险），后两个由本包
+在**宿主平面**注册（`lib/worker-providers.js`），注册不上时那两个工具**根本不出现**，
+模式降级成「只有两条委派路径」而不是抛错。
 
-现在以**段落为主来源、descriptor 为兜底**。段落这条在 `setup()` 阶段注册，
-严格早于 `agent/created`，两条派单路径都有。
+`toolName` 虽然也按行而异，但**不落进子代理会话**（descriptor 里没有它），所以不能当标记。
 
-> **所以两条新模式行不限于 `continuable`。** 它们本来就是 continuable，
-> 但那是为别的理由（见下），不再是因为标记读不到。
-> `codex` / `claude-code` 两行是 `one-shot`（且默认 `disabled`）—— 插件**同样能**
-> 认出它们，只是它们不走这套四类 worker 的分流。
+**为什么换掉了旧载体：** 旧版本读的是委派行 `persona` 里一段字符串标记，主来源是子代理
+自己的 `deployment:persona-prefix` 段落（还要读上游**未文档化**的
+`systemPrompt.layers.merge()`），descriptor 的 `persona` 只是兜底。上游删除了
+`persona` 与 `toolFilter` 两个配置项，配置里出现即抛
 
-⚠️ 段落那条读的是上游**未文档化**的内部结构（`SystemPrompt.layers.merge()`），
-公开声明只列了注册方法与 `assemble()`。所以读不到时**只告警、绝不抛错**，
-告警带固定标识 `MULTITASK-MODE-MARKER-SOURCE-MISSING reason=…` ——
-好让「上游改版导致本模块静默失效」能被 grep 到，而不是退化成一个永远不动作的死模块。
-（不走公开的 `assemble()`：它是 `async`，且每次会 `structuredClone` 全部工具 schema，
-为读一段文本付这个代价不合适。）
+```
+tool-subagent: persona is no longer supported; configure persona and tool plugins
+in an Agent Preset and select it with agentPreset (spawn only)
+```
+
+**后果不是「人格不生效」，而是整个 preset 挂载失败** —— 模式从新会话列表里彻底消失。
+这次改版因此不是可选的优化，是必须的迁移；顺带还得到了两个好处：读法只剩一步、
+不再依赖任何未文档化结构，且**前台派单与后台派单没有覆盖差异**了
+（descriptor 在 `setup()` 里 append，`agent/created` 必晚于它）。
+
+**人格去了哪里：** 上游删掉 `persona` 之后，人格改由 `worker-persona.mjs` 在
+`agent/created` 窗口按 provider 名注册到子代理自己的 scope 上（同一个段落名
+`deployment:persona-prefix`，scope 层叠规则不变，照样盖掉协调者那份）。人格文本通过
+`config.personas` 从 composition 传入，不走 import —— 相对 import 不继承入口的 `?v=N`
+query，改了文本会从旧缓存取回旧内容且不报错。
+
+**旧会话兼容：** 旧版本创建的会话，descriptor 里 provider 还是当年的通用名，但 persona
+里留着 `[multitask-mode:ptc]` / `[multitask-mode:minimal]` 标记。两个守卫都保留一条
+**只读**旧标记的兜底路径，让续接这类会话时不至于丢掉收窄/塌缩。
+
+> **两个新 provider 名是排他的。** 一旦读到 `multitask_ptc` / `multitask_minimal`，
+> 它就是该子代理的最终身份，不许再被残留的旧标记推翻。少了这一条，一个 PTC worker 只要
+> descriptor 里带着旧 minimal 标记就会被当成只读 worker 收窄 —— 那是把它的工具面削掉，
+> 且完全静默。`test/subagent-mode-marker-source.mjs` 的 L3 用例锁的正是这一点。
 
 ### 怎么关掉
 
@@ -473,7 +490,7 @@ ASCII 标识**，一条 grep 就能同时看到「跳过的」与「生效的」
    `config.enabled` 改成 `false`。关掉后 `subagent_ptc` 仍可用，
    只是退化成与 `subagent` 同样的原生工具面。
 
-### ⚠️ 给未来维护者：改 `toolFilter.deny` 必须小心
+### ⚠️ 给未来维护者：改 minimal 的允许集必须小心
 
 `tools.restrict()` 对**当前部署不存在**的工具名**会抛错**：
 
@@ -481,19 +498,19 @@ ASCII 标识**，一条 grep 就能同时看到「跳过的」与「生效的」
 tools.restrict() names unknown global tool "x"; known global tools: …
 ```
 
-而子代理的 `toolFilter` 是在**委派窗口内**被 `restrict()` 消费的 —— 写进一个不存在
-的名字，抛出来的位置在「创建子代理」里面，外在表现是**「委派功能坏了」**，
-而不是「某个工具名写错了」，排查代价极高。
+这正是 `minimal-guard.mjs` 不用静态 deny 名单、而用 `deny = 可见集 − 允许集` 的原因：
+名单里的名字取自**刚读出来的可见面**，必然合法，所以那条错误路径根本不会被走到。
 
-因此 `subagent_minimal` 的 `deny` 名单刻意**保守**，只列本 composition 自己会注册、
-且**确定存在**的名字（`write` / `edit`，以及按平台二选一的 `pwsh` / `bash`）。
+> **旧版本的教训仍然有效，只是换了个位置。** 旧版本有一份静态 `toolFilter.deny`
+> （`write` / `edit` / 按平台二选一的 `pwsh` / `bash`），必须与工具行的 `disabled`
+> 条件严格互斥，否则在另一平台上会指到一个没注册的名字、在**委派窗口内**抛错，
+> 外在表现是「委派功能坏了」。新版已删除该字段，但同一类陷阱移到了
+> `DEFAULT_MINIMAL_KEEP`：那是**允许集**（白名单），多列一个本部署没有的名字是**安全的**
+> （它不在可见集里，算差集时不参与），但**少列**一个该保留的名字就会把它摘掉 ——
+> 所以往允许集里加东西要谨慎。
 
-> **`bash` 与 `plugin_manager` 在 win32 上是被禁用的**（本 composition 里对应的工具行带 `disabled`），写进 `deny` 会抛错。
-> 本包的 `deny` 用平台条件与工具行保持互斥，因而不会指到被禁用的那个。
-> **`run_code` 永远不能写进 `deny`**（保留传输名，`restrict()` 拒绝它）。
-
-想再收窄（例如也摘掉 `ssh_*` / `task_board_*`），**必须先确认该部署真的装了对应插件**。
-宁可少摘，也不要赌部署构成。
+**`run_code` 永远不能出现在 `deny` 里**（保留传输名，`restrict()` 拒绝它），
+代码里由 `CATALOG_EXEMPT` 兜住。
 
 ### 已知边界与未确证项
 
@@ -513,13 +530,13 @@ tools.restrict() names unknown global tool "x"; known global tools: …
   has no "ptcRuntime" service`，就是这种情况。
 - **纯 PTC 模式下子代理不能直呼 `write` / `pwsh`**，只能经 `run_code` 里的 SDK 调用。
   这是 PTC 语义本身（通告面 = 可调用面），**不是缺陷**；直呼会得到 `UNKNOWN_TOOL`。
-- **`subagent_minimal` 的只读性是「两层收窄」，仍然不是沙箱。** 第一层是 composition 里
-  静态的 `toolFilter`（`write` / `edit` / `pwsh|bash`，只列本 composition 确定会注册的名字）；
-  第二层是 `minimal-guard.mjs` 在 `agent/created` 时按 `deny = 可见集 − 允许集` 自适应补上的
-  （覆盖 `ssh_*` / `task_board_*` 这类**由别的插件注册**、静态名单不敢列的写入类工具）。
-  两层在 `dsh-tools` 里是**求交**关系，所以结构上不可能放宽。但**它终究不是沙箱**：
-  若某个插件在 minimal worker 创建**之后**才注册一个新的变更类工具，那个工具**不会被摘掉**
-  （有意取舍，见 `minimal-guard.mjs` 文件头「如实写出的边界」）。
+- **`subagent_minimal` 的只读性现在是「一层自适应收窄」，仍然不是沙箱。**
+  `minimal-guard.mjs` 在 `agent/created` 时按 `deny = 可见集 − 允许集` 收窄，覆盖
+  `write` / `edit` / `pwsh` 以及 `ssh_*` / `task_board_*` 这类**由别的插件注册**的工具。
+  它比旧版的「静态 `toolFilter` + 自适应」覆盖更全，但**没有第二层兜底**：
+  静态那层已随上游删除，所以本模块装不上时 minimal worker 完全不收窄（会响亮告警）。
+  **它终究不是沙箱**：若某个插件在 minimal worker 创建**之后**才注册一个新的变更类工具，
+  那个工具**不会被摘掉**（有意取舍，见 `minimal-guard.mjs` 文件头「如实写出的边界」）。
 
 ---
 
@@ -727,8 +744,12 @@ header，那会抛 `session header uses retired policy baseline fields`）。
   想执行什么、去哪里作答**。这段文案刻意写成**条件式**（「若本对话里出现了审批卡就在这里作答，
   否则打开那个子会话」）——因为重试可能成功、也可能失败，文案必须在两种结局下都为真；
   而消息通道**不携带审批结果**，若被读成放行就等于绕过了审批。另有两条边界：
-  它只对 `backgroundMode: 'continuable'` 的 worker 有效（本模式四类 worker 都是；
-  `subagent_codex` / `subagent_claude_code` 是 `one-shot`，发不出去）；
+  它只对**可续接**的 worker 有效（本模式四类 worker 都是；`subagent_codex` /
+  `subagent_claude_code` 若是外部一次性后端就发不出去）。注意新版 DSH 已删除
+  `backgroundMode` 配置项 —— 可续接性现在由 **provider 的能力**决定：
+  实现了 `prepareContinuable()` 的 provider 会走进程内续接路径，`sendMessage` 才认它。
+  本包那两个自建 provider（`multitask_ptc` / `multitask_minimal`）与内置的
+  `spawn` / `fork` 都实现了它，所以四类 worker 全部满足这条前提。
   且 `sendMessage` 只认**直接**父子，多级委派时会跳过（记 `not-direct-parent`）。
 - **重试没能成功时，请求会一直挂着，兜底不解除它。** 这是最容易被误解的一条：宿主把请求发给浏览器后，
   客户端会为那个（不可见的）子会话**无条件**物化作用域并接住它，而审批路径**没有任何超时**，
@@ -761,6 +782,7 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 | `safePatterns` | `[]` | 追加「命中也不问」的放行模式 |
 | `shellTools` | `['pwsh', 'bash']` | 追加需要看命令文本的工具名 |
 | `fileTools` | `['write', 'edit']` | 追加「会把 `file_path` 指向工作区之外」的写工具名 |
+| `autoApproveTempRoots` | 各平台临时目录 | 「草稿区」根目录：往这里写、或**只**删这里的东西，都不问。传 `[]` 关闭这一档 |
 
 **这几个字段的失败方向并不一样，下面几条值得单独写清：**
 
@@ -774,6 +796,132 @@ header，那会抛 `session header uses retired policy baseline fields`）。
   「不限制」—— 无限等待会让子代理在父会话永不醒来时被永久挂住，那正是本模块最不该制造的状态。
 - `shellTools` / `fileTools` 里**名称写错不会报错**，只会静默漏判（命令照旧在沙箱下执行）。
   所以默认只列本 composition 真的会注册的那几个，宁可少列。
+
+### 临时目录为什么默认免询问（`autoApproveTempRoots`）
+
+这一档是**新增的默认**，也是唯一一处「本模块主动少问一次」的改动，所以它的理由与边界都要写清。
+
+**理由一：临时目录是草稿纸，不是用户资产。** DSH 自己在 `%TEMP%` 下建 `dsh-subagent-*`、
+`dsh-acl-locks`、`dsh-spill-*` 等运行期目录；一个 worker 往那里写中间产物或清掉自己的临时目录，
+是正常工作的一部分。为它弹窗，只会训练用户养成「闭眼点允许」的习惯 —— 而那会直接削弱真正的
+危险询问。**噪声也是安全性的一部分**：一个每次都问的闸门等于没有闸门。
+
+**理由二：它不改任何权限。** 这一档只影响「要不要问」，不改变沙箱、不改变 ACL、不改变
+DSH 对写入范围的判定。能写到哪里仍然由沙箱决定；本模块只是不再为一个低信息量的动作打扰用户。
+
+**边界一：删除的豁免比写入严得多。** 写入只看「目标在不在允许根下」；删除还额外要求
+**整条命令**都只碰允许根 —— 没有 shell 元字符（`;` `|` `&` `` ` `` `$` `>` `<`）、至少一个
+绝对路径参数、**所有**路径参数都在根下、且不含相对路径参数。四条缺一不可：
+
+| 命令 | 结果 | 为什么 |
+|---|---|---|
+| `rm -rf /tmp/x` | 不问 | 唯一目标在允许根下 |
+| `rm -rf /tmp/x /home/u` | **照问** | 混了一个根外路径 —— 豁免不许被借道 |
+| `rm -rf C:\Windows` | **照问** | 根外 |
+| `rm -rf $env:TEMP\x` | **照问** | 含 `$`，目标无法静态判定 |
+| `Remove-Item -Recurse C:\Windows` | **照问** | 根外 |
+
+方向是刻意的：**豁免误判一次就会放过整行危险命令，而多问一次只是一次点击**。
+
+**边界二：它确实让 worker 能静默往一个共享目录放文件。** `%TEMP%` 是所有进程共享的、
+通常可写的目录，所以严格地说，这一档放开了「静默放置文件到共享位置」这件事。评估为可接受的两个
+依据：① 本模块从来就不是沙箱，放置文件本身不产生执行；② 从临时目录执行脚本
+（`pwsh <temp>\x.ps1`）本来就不在任何危险模式里 —— 也就是说，即使关掉这一档，
+那条路径也不会被拦下。要让「从临时目录执行」也受管，需要新增一条危险模式，
+那是**另一件事**（并且要先确认它不会误伤正常的构建脚本调用）。
+
+**要收紧就传 `[]`**：那一档立刻消失，连删临时目录也会照问。想让某个私有缓存目录也免询问，
+把它加进数组即可（例如一个专门的构建输出目录）。
+
+---
+
+## 跨模式派发（`preset-dispatch.mjs`）
+
+这是把「减震器」从**本 preset 内部**扩展成**用户与所有已安装模式之间那一层**的那一步。
+
+### 它做什么
+
+注册一个工具 `subagent_preset`。协调者用它把任务书投给**任意已安装的 agent preset**
+（standard / ptc / minimal / cordis / 任何从插件市场装进来的第三方模式），只收回结论。
+
+```
+用户 ──► 协调者（减震器）──► 任意已安装的模式 ──► 结论回到主对话
+```
+
+### 为什么按「描述」挑，而不是解析对方的内部结构
+
+判据只有两样**稳定**的东西：注册表的 `list()`（id / 名称 / **描述** / 是否 broken）与上游的
+`startActivation({ request: { agentPreset } })`。
+
+刻意**不**解析别的 preset 的插件行、不猜它的工具名、不读它的 `config`：
+
+- 那些是别人家的实现细节，任何一次上游改版或插件升级都会让本模块连带坏掉；
+- 而「这个模式是干什么的」唯一**权威且稳定**的来源，就是它自己发布的 `description`；
+- 于是市场里新装一个模式**不需要改本包一行代码**，它就自动可选 —— 这正是「让市场去完善功能」
+  的落地方式。
+
+`list: true` 的返回里也带「当前能不能起来」：标着 `CANNOT RUN` 的模式是坏的，不能选，
+调用方据此改派而不是对着一个空 id 发呆。
+
+### 三条硬边界
+
+1. **provider 固定 `spawn`，不做配置项。** 上游 `assertCapabilities()` 要求：带 `agentPreset`
+   的请求必须由「声明 `agentPreset` 能力 **且** 不继承父会话上下文（
+   `inheritsParentContext === false`）」的 provider 承担。内置 `spawn` 满足，`fork` 不满足。
+   做成配置项只会制造一类「配错了到委派那一刻才抛错」的故障，而且错误信息指向 provider 能力、
+   与本模块毫无关系 —— 所以写死。
+2. **不能派给本模式自己。** 那会造一个「子协调者」，而深度限制让它派不出去。调用被明确拒绝，
+   并给出正确替代（四条内置路径）—— 直接拒绝比让用户等一次注定失败的委派好。
+3. **worker 不能再往下派。** 与四类 worker 同一条判据（`isDelegatedChild` 三信号）。
+   不在这一层挡住的话，那次调用会走到 `startActivation` 才被深度限制拒绝，报错说的是
+   `subagent depth 2 exceeds maxDepth 1` —— 看不出与跨模式派发有关，很容易被误读成功能坏了。
+
+### ★ 第四条边界：跨模式 worker 不受本模式守卫管辖（源码确证）
+
+这一条不是推测，是从两处上游源码读出来的，而且它同时解释了「为什么安全」与「哪里不安全」：
+
+**① 事件按作用域链派发。** `dsh-agent` 的 `agentCarrier(agent)` 就是
+`scopeTarget(agent, agent)`，而 `scopeTarget` 的过滤器只放行这样的监听者：
+
+```js
+const tag = scopeOf(ctx)
+if (tag === void 0) return true
+for (let cursor = key; cursor !== void 0; cursor = scopeParents.get(cursor)) if (cursor === tag) return true
+```
+
+也就是「订阅者所在的 scope 必须在这条链上」。`agent/created`、`agent/disposed` 都走它。
+
+**② 子代理挂到目标模式的 scope 下。** 注册表的 `bind()` 对子代理执行
+`bindScopeParent(childKey, generation.key)`，其中 `generation.key` 是**目标 preset**
+（`mountPreset` 返回的 `scopeOf(ctx)`）那一份的键。
+
+两条合起来：跨模式 worker 的 scope 链是 `[它自己, 目标模式]`，**不含本模式**。于是：
+
+| 本模式的守卫 | 对跨模式 worker |
+|---|---|
+| `worker-persona`（人格注入） | **不作用** —— 正好，不会把「你有完整工具集」套到只读模式上 |
+| `minimal-guard`（只读收窄） | **不作用** —— 收窄归目标模式自己 |
+| `approval-gate`（两级闸门） | **不作用** —— 见下 |
+| `subagent-mode`（PTC 塌缩） | **不作用** —— 那本来只认本模式的 `multitask_ptc` |
+
+**所以必须说清楚：跨模式派发是能力路由，不是安全代理。**
+
+审批闸门覆盖不到的后果具体是什么？上游 `captureDelegatedPolicyOverrides()` 把子会话的
+审批策略钉死为 `'never'`，所以跨模式 worker 的危险操作会**直接被拒绝**（fail-closed，
+**不会**静默放行），但**不会弹卡问你**。需要本模式两级闸门保护的任务，仍然应该派给
+四条内置路径。
+
+这一条以前没有写在任何地方，是因为在加 `subagent_preset` 之前**不存在**跨模式的子代理 ——
+是本功能引入的新边界，必须如实记录。
+
+### 它与「四类 worker」的分工
+
+- 四类 worker（`subagent` / `subagent_fork` / `subagent_ptc` / `subagent_minimal`）是
+  **本模式自己的**工具面分流：同一个模式下，谁去干活、看得见多少工具；
+- `subagent_preset` 是**跨模式**的路由：这件事本来就该由别的模式来做。
+
+两者不重叠，也不互相替代。协调者人格里写明了这条分工与「拿不准就问用户 —— 模式是用户装的，
+他知道为什么装」。
 
 ---
 
@@ -913,17 +1061,21 @@ dsh-multitask: MULTITASK-APPROVAL-RELAYED tool="pwsh" outcome=allowed-once
 一个被告知「你不能执行」的 worker，会倾向于拒绝干活 —— 而那正是它唯一被派出去要做的事。
 所以这**不是措辞好不好听的问题，是会实质削弱整个模式的问题**。
 
-**修法**：本包给两个进程内委派行都配了独立的 worker 人格，并声明它拥有完整工具集。
-两份**刻意不共用同一份文本**（上下文起点不同）：
+**修法**：本包给每一类 worker 配了独立的人格，并声明它拥有对应的工具面。
+各份**刻意不共用同一份文本**（上下文起点与工具面都不同）：
 
-| 委派行 | 人格常量 |
-|---|---|
-| `tool-subagent`（spawn） | `WORKER_PERSONA` |
-| `tool-subagent-fork`（fork） | `FORK_PERSONA` |
+| 委派行 | provider 名 | 人格常量 |
+|---|---|---|
+| `tool-subagent` | `spawn` | `WORKER_PERSONA` |
+| `tool-subagent-fork` | `fork` | `FORK_PERSONA` |
+| `tool-subagent-ptc` | `multitask_ptc` | `PTC_WORKER_PERSONA` |
+| `tool-subagent-minimal` | `multitask_minimal` | `MINIMAL_WORKER_PERSONA` |
 
-`dsh-subagent` 会把它作为子代理**自己 scope** 上的 section 注册，
-按 scope 层叠「最近的作用域赢得同名 section」的规则盖掉协调者那份。
-（`subagent_ptc` / `subagent_minimal` 另有两份各自的 `*_PERSONA`，见「多模式子代理」一节。）
+**注入者已经不是 `dsh-subagent` 了。** 旧版本把人格配在委派行的 `persona` 上、由上游
+注册成子代理 scope 的 section；DSH 0.2.1-rc.2 删除了那个配置项，现在由本包的
+`worker-persona.mjs` 在 `agent/created` 窗口按 **provider 名**挑出该行的文本，注册到
+**子代理自己的 scope** 上（同一个段落名 `deployment:persona-prefix`）。scope 层叠规则不变，
+「最近的作用域赢得同名 section」，照样盖掉协调者那份。
 
 核对方式：让一个 worker 报它的工具面，看它的提示词里是否还残留
 `You are the coordinator`、以及 `WORKER subagent` / `FULL tool set` 是否在。
@@ -940,8 +1092,9 @@ dsh-multitask: MULTITASK-APPROVAL-RELAYED tool="pwsh" outcome=allowed-once
 这是整个模式的支点。
 
 `dsh-subagent` 的 `applyChildComposition()` 会强制每个子代理加入**父级那一份 preset**，
-而 `toolFilter` 只能**收窄**、不能放宽。所以「协调者窄、worker 宽」**没法靠配置实现** ——
-必须在 preset 内部动手。
+而任何工具筛选都只能**收窄**、不能放宽（旧版是委派行的 `toolFilter`，新版已删除该字段，
+只剩**同一个 preset 内的 scope 级 restriction**，语义同样是只减不增）。所以「协调者窄、
+worker 宽」**没法靠配置实现** —— 必须在 preset 内部动手。
 
 突破口在 preset 注册表的 `join()`：它把 agent 的 scope 绑到 **preset 的 generation key** 上，
 不是绑到父 agent 的 scope 上：
@@ -1051,9 +1204,14 @@ id** 覆盖守卫行的 `config.presetId` —— 两者一旦漂移，减震器�
 所以「在 Multitask 会话里委派 → 子代理拿到 Multitask 的 worker 人格与四类工具面」
 不是本插件额外做的事，而是 DSH 的既有契约 + 本插件把 preset 声明对。
 
-核对方式：在一个 Multitask 会话里委派一个子代理，看它的 `subagent/descriptor` ——
-persona 应当是 `WORKER subagent in Multitask mode`，且工具面包含 `read_image` / `pwsh`
-这类被协调者摘掉的工具。
+核对方式：在一个 Multitask 会话里委派一个子代理，读它的 `subagent/descriptor` ——
+`provider` 应当是 `spawn` / `fork` / `multitask_ptc` / `multitask_minimal` 之一
+（这正是四类 worker 的判据），且该子代理的提示词里应是 `WORKER subagent in Multitask mode`，
+工具面包含 `read_image` / `pwsh` 这类被协调者摘掉的工具。
+
+> ⚠️ 别再用 `descriptor.persona` 判断：新版 DSH 已删除委派行的 `persona` 配置项，
+> 那份字段对新会话不再写入；人格改由 `worker-persona.mjs` 按 `provider` 名注入。
+> descriptor 里残留的 `persona` 只可能来自**旧版本创建的会话**，本包对它有只读兜底。
 
 ⚠️ 反过来的一条边界：**子代理的模型映射只在 Multitask 内生效**。
 profile patch 里那份 `subagentModels` 挂在 `dsh-multitask` 那一行的 `config` 上，
