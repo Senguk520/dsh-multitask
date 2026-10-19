@@ -529,7 +529,9 @@ tools.restrict() names unknown global tool "x"; known global tools: …
   若日志里出现 `a subagent was configured for "ptc" presentation, but this deployment
   has no "ptcRuntime" service`，就是这种情况。
 - **纯 PTC 模式下子代理不能直呼 `write` / `pwsh`**，只能经 `run_code` 里的 SDK 调用。
-  这是 PTC 语义本身（通告面 = 可调用面），**不是缺陷**；直呼会得到 `UNKNOWN_TOOL`。
+  这是 PTC 语义本身（通告面 = 可调用面），**不是缺陷**；直呼会得到
+  `Error: unknown tool "<名字>": only run_code is callable directly — call <名字> from inside a run_code program instead`
+  （实测原文，注意是小写的 `unknown tool` —— 1.2.10 的自检判据曾按大写的 `UNKNOWN_TOOL` 去匹配而误判）。
 - **`subagent_minimal` 的只读性现在是「一层自适应收窄」，仍然不是沙箱。**
   `minimal-guard.mjs` 在 `agent/created` 时按 `deny = 可见集 − 允许集` 收窄，覆盖
   `write` / `edit` / `pwsh` 以及 `ssh_*` / `task_board_*` 这类**由别的插件注册**的工具。
@@ -810,8 +812,8 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 DSH 对写入范围的判定。能写到哪里仍然由沙箱决定；本模块只是不再为一个低信息量的动作打扰用户。
 
 **边界一：删除的豁免比写入严得多。** 写入只看「目标在不在允许根下」；删除还额外要求
-**整条命令**都只碰允许根 —— 没有 shell 元字符（`;` `|` `&` `` ` `` `$` `>` `<`）、至少一个
-绝对路径参数、**所有**路径参数都在根下、且不含相对路径参数。四条缺一不可：
+**整条命令**都只碰允许根 —— 没有 shell 元字符（`;` `|` `&` `` ` `` `$` `>` `<` `,`）、至少一个
+绝对路径参数、**所有**路径参数都在根下、路径里不含 `..` 段、且不含相对路径参数。五条缺一不可：
 
 | 命令 | 结果 | 为什么 |
 |---|---|---|
@@ -820,8 +822,17 @@ DSH 对写入范围的判定。能写到哪里仍然由沙箱决定；本模块�
 | `rm -rf C:\Windows` | **照问** | 根外 |
 | `rm -rf $env:TEMP\x` | **照问** | 含 `$`，目标无法静态判定 |
 | `Remove-Item -Recurse C:\Windows` | **照问** | 根外 |
+| `Remove-Item -LiteralPath "/tmp/a","C:\Windows" -Recurse -Force` | **照问** | 逗号粘连：两个路径之间没有空格 |
+| `rm -rf /tmp/../../../etc` | **照问** | `..` 段把目标带出根外，词法前缀比较挡不住 |
+| `rm -rf /tmp/a ..` | **照问** | 相对路径参数，删的是工作目录的父级 |
 
 方向是刻意的：**豁免误判一次就会放过整行危险命令，而多问一次只是一次点击**。
+
+后三行是 1.2.10 的实测缺陷（E3 系列），修法与三条回归用例（T7/T8/T9）记在
+`docs/remember.md`。这三条有个共同点值得记住：**它们都不是「模式表漏了一条正则」，
+而是豁免判据本身可以被绕过** —— 所以修法放在判据上（逗号进元字符表、`..` 一律判否、
+相对路径一律判否），而不是加危险模式。写危险模式解决不了「一条本来就被判定为危险、
+却被豁免掉」的命令。
 
 **边界二：它确实让 worker 能静默往一个共享目录放文件。** `%TEMP%` 是所有进程共享的、
 通常可写的目录，所以严格地说，这一档放开了「静默放置文件到共享位置」这件事。评估为可接受的两个

@@ -345,7 +345,7 @@ The temp directory is the **scratch paper every process shares** — DSH itself 
 
 The default roots are derived from `TEMP` / `TMP` / `TMPDIR` and `%LOCALAPPDATA%\Temp` (no `node:os` import — this package's preset modules are dependency-free), plus `/tmp`. Add your own cache directory by listing it in this array.
 
-**The deletion exemption is deliberately strict** — four conditions, all required: no shell metacharacters (`;` `|` `&` `` ` `` `$` `>` `<`); at least one absolute path argument; **every** path argument under an allowed root; and no relative path arguments. So:
+**The deletion exemption is deliberately strict** — four conditions, all required: no shell metacharacters (`;` `|` `&` `` ` `` `$` `>` `<` `,`); at least one absolute path argument; **every** path argument under an allowed root; and no relative path arguments, with no `..` segment anywhere in a path. So:
 
 | Command | Result |
 |---|---|
@@ -354,6 +354,11 @@ The default roots are derived from `TEMP` / `TMP` / `TMPDIR` and `%LOCALAPPDATA%
 | `rm -rf C:\Windows` | **prompts** |
 | `rm -rf $env:TEMP\x` | **prompts** — it contains `$`, so no exemption |
 | `Remove-Item -Recurse C:\Windows` | **prompts** |
+| `Remove-Item -LiteralPath "/tmp/a","C:\Windows" -Recurse -Force` | **prompts** — comma-glued, the two paths have no space between them |
+| `rm -rf /tmp/../../../etc` | **prompts** — `..` walks the path outside the root |
+| `rm -rf /tmp/a ..` | **prompts** — a relative path argument deletes the parent of the working directory |
+
+The last three rows are three real holes measured on 1.2.10 (comma gluing, `..` traversal, and relative path arguments all rode the exemption); the fix and its regressions land from 1.2.12.
 
 The reason is blunt: one wrong exemption lets an entire dangerous command through, while one extra prompt costs a click. **This tier only decides whether to interrupt you, never what the sandbox allows** — where a worker can actually write is still decided by DSH's sandbox and ACL.
 

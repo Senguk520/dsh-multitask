@@ -592,6 +592,23 @@ export function defaultTempRoots() {
 }
 
 /**
+ * 路径里有没有**上溯段**（`..`），不论它出现在哪个位置。
+ *
+ * 为什么必须独立成一个判据：`isUnderRoots` 是做**纯词法前缀比较**的，而
+ * `<临时根>/../../../Windows` 字面上确实以临时根开头、比较必然成立 —— 但它真正指向的
+ * 是根外的系统目录。1.2.10 的实测（E3 系列）就是靠这一手整条借道豁免。
+ *
+ * 取向与其它判定一致：**误判方向安全**。含 `..` 就判否只是多问一次，而去做「规范化
+ * 之后再比较」要处理盘符、`..` 折叠、符号链接、UNC 前缀 —— 任何一处漏了都是新洞。
+ *
+ * @param normalized - 已把 `\` 换成 `/` 的路径。
+ * @returns 含 `..` 段时为 true。
+ */
+function hasTraversalSegment(normalized) {
+  return normalized.split('/').some((segment) => segment === '..')
+}
+
+/**
  * 判断一个路径是否落在**允许根**之下（含根目录本身）。
  *
  * 只做词法比较，不碰文件系统 —— 与 `escapesWorkspace` 同一取向：不需要真的解析，
@@ -606,6 +623,12 @@ export function isUnderRoots(filePath, roots, caseInsensitive) {
   if (!Array.isArray(roots) || roots.length === 0) return false
   const target = inspectPath(filePath)
   if (target.normalized === '' || !target.absolute || target.escapes) return false
+  // ⚠️ 路径里**任何位置**出现 `..` 段都判否：前缀比较是纯词法的，
+  // `<临时根>/../../../Windows` 字面上确实以临时根开头，但它真正指向的是根外的系统目录。
+  // 实测（1.2.10，E3）就是这样整条借道的。误判方向安全（多问一次），所以这里不去
+  // 做规范化后比较，而是直接拒绝 —— 规范化要处理盘符、符号链接、UNC，任何一处写漏
+  // 都是一个新洞，而「含 `..` 就照问」只有一次点击的代价。
+  if (hasTraversalSegment(target.normalized)) return false
 
   const fold = (text) => (caseInsensitive ? text.toLowerCase() : text)
   const a = fold(target.normalized)
@@ -618,24 +641,55 @@ export function isUnderRoots(filePath, roots, caseInsensitive) {
 }
 
 /**
+ * 不该被当成路径令牌的**选项值关键词**。
+ *
+ * PowerShell 的选项有些带值（`-ErrorAction Continue`），而那些值不是路径。把它们判成
+ * 相对路径会让「清理临时目录」这种日常命令也弹卡 —— 而误报的代价是用户学会闭眼点允许。
+ *
+ * 这张表**只收纯枚举值**，且必须与路径有明显区别。漏收一个的后果是「多问一次」，
+ * 收错一个的后果才是「放过一个真实路径」—— 所以宁可短。
+ */
+const OPTION_VALUE_KEYWORDS = new Set([
+  'continue',
+  'silentlycontinue',
+  'stop',
+  'inquire',
+  'ignore',
+  'suspend',
+])
+
+/**
  * shell 元字符 —— 出现任何一个就**不**做「删除放行」的判定。
  *
  * 理由：这条豁免一旦误判，就会把「真正危险的一整行命令」放过去；而多问一次只是
  * 一次点击。所以宁可只认**最简单**的形态（单个删除命令 + 纯路径参数）。
+ *
+ * ⚠️ `,` 是 1.2.10 实测出来的漏网（E3）：PowerShell 的多路径写法
+ * `Remove-Item -LiteralPath "A","B"` 里两个路径**不带空格**地用逗号粘在一起，
+ * 于是分词后只剩一个令牌、它以临时根开头，前缀比较被判成「在根下」—— 整条命令借道放行。
+ * 逗号在 shell 里本来也不该出现在这种「纯路径删除」的形态里，所以直接判否（fail-closed）。
+ *
+ * ⚠️ `\n` / `\r` 不在这里：它们被分词当空白处理，每个路径令牌仍要逐个过判定，
+ * 所以多行命令里根外的路径照样会被拦住（见回归用例）。
  */
-const SHELL_METACHARACTERS = /[;|&`$><]/
+const SHELL_METACHARACTERS = /[;|&`$><,\n\r]/
 
 /**
  * 判断一条**删除**命令是否只作用于允许根（默认是临时目录）。
  *
- * 判定刻意保守，四个条件缺一不可：
- *   1. 命令行里**没有** shell 元字符（管道、串联、重定向、变量展开、命令替换都不认）；
+ * 判定刻意保守，四条缺一不可：
+ *   1. 命令行里**没有** shell 元字符（管道、串联、重定向、变量展开、命令替换、逗号都不认）；
  *   2. 至少有一个**绝对路径**参数；
- *   3. **所有**绝对路径参数都落在允许根下；
+ *   3. **所有**路径参数都落在允许根下；
  *   4. 相对路径参数也算数：它会让「到底删的是哪」变得不可判定，所以直接判否。
  *
  * 于是 `rm -rf /tmp/x` 放行，而 `rm -rf /tmp/x /home/u`、`rm -rf $env:TEMP\x`、
  * `Remove-Item -Recurse C:\Windows` 都要询问。
+ *
+ * ⚠️ 第 4 条在 1.2.10 里只是**注释里的话**：实现把「既不是绝对路径、又不含 `/`」的令牌
+ * 一律跳过，于是 `rm -rf <临时根>/a ..`（删当前目录的父目录）、
+ * `rm -rf <临时根>/a *`（删当前目录全部）都整条借道。现在真的按第 4 条执行：
+ * 除「程序名」「`-` 开头的选项」「选项值关键词」之外，**每个**令牌都必须是根下的绝对路径。
  *
  * @param command - 命令文本。
  * @param roots - 已规范化的允许根。
@@ -653,12 +707,20 @@ export function confinedToRoots(command, roots, caseInsensitive) {
     .filter((token) => token !== '')
 
   const paths = []
-  for (const token of tokens) {
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]
+    // 第 0 个是程序名（`rm` / `Remove-Item`），不是它的参数。
+    if (index === 0) continue
+    // `-Recurse` / `--force` / `-LiteralPath` 这类选项本身不是路径，它们的值另算。
+    if (token.startsWith('-')) continue
+    // 纯枚举值（`-ErrorAction Continue` 的 `Continue`）不是路径。
+    if (OPTION_VALUE_KEYWORDS.has(token.toLowerCase())) continue
+
     const inspected = inspectPath(token)
     if (inspected.normalized === '') continue
-    // `-Recurse` / `--force` 这类选项不是路径；它们的 `inspectPath` 结果既不是绝对路径
-    // 也不含 `/`，跳过即可（真正的判定只看路径 token）。
-    if (!inspected.absolute && !inspected.normalized.includes('/')) continue
+    // 走到这里的一切都必须是**根下的绝对路径**。相对路径（`..`、`*`、`dist`）会让
+    // 「实际删的是哪」取决于工作目录，那正是豁免最不该承担的不确定性。
+    if (!inspected.absolute) return false
     paths.push(token)
   }
 
