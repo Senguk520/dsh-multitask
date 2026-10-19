@@ -345,7 +345,7 @@ The temp directory is the **scratch paper every process shares** — DSH itself 
 
 The default roots are derived from `TEMP` / `TMP` / `TMPDIR` and `%LOCALAPPDATA%\Temp` (no `node:os` import — this package's preset modules are dependency-free), plus `/tmp`. Add your own cache directory by listing it in this array.
 
-**The deletion exemption is deliberately strict** — four conditions, all required: no shell metacharacters (`;` `|` `&` `` ` `` `$` `>` `<` `,`); at least one absolute path argument; **every** path argument under an allowed root; and no relative path arguments, with no `..` segment anywhere in a path. So:
+**The deletion exemption is deliberately strict** — four conditions, all required: no shell metacharacters (`,`, newline, and `;` `|` `&` `` ` `` `$` `>` `<`); at least one absolute path argument; **every** path argument under an allowed root; and no relative path arguments, with no `..` segment anywhere in a path. So:
 
 | Command | Result |
 |---|---|
