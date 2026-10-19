@@ -782,12 +782,26 @@ export function buildPlugins(options) {
   const modelMap = normalizeModelMap(options?.modelMap)
   return [
     // ── 身份：协调者人格 + Multitask 工作纪律 ─────────────────────────────────
+    //
+    // ⚠️ **不要给这里加 `suffix` 里的 `{{...}}` 变量，除非确认它已注册。**
+    // 实测教训（1.2.9 发版后立刻炸）：曾写着
+    //     suffix: 'Your working directory is {{cwd}}.'
+    // 而新版 DSH 的 `dsh-agent-loop` 只注册了两个提示词变量：
+    //     ctx.systemPrompt.variable("provider", …)
+    //     ctx.systemPrompt.variable("model", …)
+    // 全 asar 里没有任何模块注册 `cwd`。于是每次组装提示词都抛
+    //     unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix";
+    //     registered variables: provider, model
+    // 症状是**每一轮运行都失败**，而不是某个功能不灵。
+    //
+    // 工作目录已经由 `@deepseek-ai/dsh-working-directory` 作为**运行时上下文**提供给
+    // 模型（它 `inject` 了 `systemPrompt` 并负责“model context”），所以这个后缀本来
+    // 就是重复的 —— 直接删掉，不需要找替代变量。
     {
       id: 'persona',
       name: '@deepseek-ai/dsh-persona',
       config: {
         prefix: COORDINATOR_PERSONA,
-        suffix: 'Your working directory is {{cwd}}.',
       },
     },
 
