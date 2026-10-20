@@ -408,6 +408,8 @@ dsh-multitask/
 │   ├── subagent-mode.mjs               # PTC 呈现：把带标记的子代理塌缩成 run_code
 │   ├── minimal-guard.mjs               # 只读 worker 的自适应收窄
 │   ├── approval-gate.mjs               # 审批闸门：危险操作弹窗
+│   ├── interrupt-before-send.mjs        # 纠错时序：拦 send_message，先停当前轮次再发送
+│   ├── preset-dispatch.mjs             # 跨模式派发：把任务书投给任意已安装的模式
 │   ├── workspace-acl.mjs               # 工作区 ACL：补 WRITE_OWNER（唯一改系统状态的模块）
 │   └── file-info.mjs                   # 只读元数据工具 file_info
 ├── docs/

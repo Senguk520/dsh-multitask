@@ -935,6 +935,84 @@ Remove-Item -LiteralPath "<temp>\dsh-mt-rt-e4\..\..\..\..\dsh-mt-shadow-e4" -Rec
 
 ---
 
+## 纠错时序：追加给子代理的话必须**立刻**生效（`interrupt-before-send.mjs`）
+
+### 它解决什么问题
+
+协调者发现子代理正在做错事时，唯一的手段是 `send_message`。而宿主的投递语义是
+**`steer`（步骤边界投递）**：
+
+```
+A working target receives the message at its nearest step boundary through Steer;
+an inactive target starts or resumes a turn.
+```
+
+「最近的步骤边界」听起来很快，实际上不是：**一步可以是一整个长工具调用**（跑一次构建、
+拉一次依赖、递归扫一棵目录树）。而子代理做错事时，它正在跑的往往恰好就是这种长任务。
+于是：
+
+1. 子代理按一条**错误**的要求往下做；
+2. 协调者发一条纠错 —— 它进了收件箱 / 步骤边界队列；
+3. 那条错误的要求**继续跑完**，纠错才被读到；
+4. 到那时错误已经造成（文件改错、命令跑完、产物写坏）。
+
+**纠错的价值全在时效上**，晚一步就只剩善后。所以光发不够，还得先把当前轮次停掉。
+
+### 它怎么做
+
+在 `tools/pre-execute` 上拦 `send_message`，在**发送真正发生之前**调一次
+`ctx.subagents.interrupt(targetId, { kind: 'ancestor', agent })`。
+
+中断是**同步**的，只停当前轮次并保留收件箱（上游逐字：
+`stops a child's current turn while keeping its inbox and descendants intact`）。
+消息内容一个字不改 —— 本模块只改变它的**时机**。
+
+### 为什么拦 `send_message`，而不是新注册一个「纠错」工具
+
+新工具的正确性依赖模型每次都选对工具，而模型在赶进度时恰恰不会去分辨
+「这次是追加还是纠错」—— 那正是它刚做错事的那一刻。`send_message` 只有一条路径，
+拦在它前面就**不可能**漏。这就是本包一贯的取向：**人格说明意图，机制保证行为**。
+
+### 代价，以及为什么不加「智能判断」
+
+中途追加会牺牲当前这一步的进度 —— 包括子代理正在做**对**的事的时候。这是刻意接受的：
+在本模式里，追加几乎总是为了纠错（任务书已经把该说的事说完了）。要退回宿主原语义
+（排队）就把这一行配成 `enabled: false`。
+
+刻意**不**提供「按内容判断该不该中断」的选项：那种判断只能靠模型自己声明
+「我这条是纠错」，而那正是它最容易搞错的地方。一个永远成立的规则比一个需要判断的规则可靠。
+
+### 只拦「协调者 → 子代理」这一个方向
+
+硬前置：发送方不能是被委派的子代理。因为 worker 也能给父会话发消息（汇报进度），
+若对那个方向也先中断，被停掉的会是**主对话自己的回合** —— 用户正在看的回答被掐断。
+判据与其它守卫同源（`origin` / `parentSession` / `delegationDepth` 三信号）。
+
+即使那条判据写漏了，`authority: { kind: 'ancestor' }` 也会在非祖先方向被上游拒绝，
+而失败只记一条 info、不影响发送 —— 双层防护。
+
+### 失败取向：静默降级
+
+中断失败（服务缺失、目标不是自己的后代、id 读不出来）**绝不**影响发送本身。
+把「纠错稍晚」降级成「纠错根本没发出去」方向正好反了。所以任何失败都只记一条带固定标识的 info，
+然后照常发送。
+
+### 怎么确认它生效了
+
+| 持久事件里应当看到 | 含义 |
+|---|---|
+| `approval/asked` / `turn/end` 之间目标会话出现一次**提前结束**的回合 | 中断发生了 |
+| `turn/end` 的 `data.reason.kind` | 见下面的边界 |
+
+⚠️ **`turn/end` 无法区分「被本模块中断」与「用户按了停止」**：取消原因的类型只有
+`{ readonly kind: 'user' }` 一支，两种情形写进去的是同一个值。所以不要拿它当判读依据 ——
+它只能证明「有一个回合提前结束了」，不能证明是谁停的。
+
+（若你接了日志汇聚，对应标识是 `MULTITASK-STEER-INTERRUPT-ENGAGED` /
+`-SKIPPED reason=…` / `-FAILED`；本部署不持久化 `ctx.logger`，grep 不到属正常。）
+
+---
+
 ## 跨模式派发（`preset-dispatch.mjs`）
 
 这是把「减震器」从**本 preset 内部**扩展成**用户与所有已安装模式之间那一层**的那一步。
@@ -1412,6 +1490,8 @@ dsh-multitask/
     ├── subagent-mode.mjs               # ★ 多模式子代理：PTC 呈现（零依赖，零 import）
     ├── minimal-guard.mjs               # ★ subagent_minimal 的自适应收窄（零依赖，零 import）
     ├── approval-gate.mjs               # ★ 审批闸门：危险操作弹窗请用户裁决（零依赖，零 import）
+    ├── interrupt-before-send.mjs        # ★ 纠错时序：拦 send_message，先停当前轮次再发送（零依赖，零 import）
+    ├── preset-dispatch.mjs             # ★ 跨模式派发：把任务书投给任意已安装的 agent preset
     ├── workspace-acl.mjs               # ★ 工作区 ACL：补 WRITE_OWNER，让 shell 开箱即用（唯一改系统状态的模块）
     └── file-info.mjs                   # ★ 只读文件元数据工具 file_info（零依赖，零 import）
 ```

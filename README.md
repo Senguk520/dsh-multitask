@@ -390,6 +390,8 @@ dsh-multitask/
 │   ├── subagent-mode.mjs               # PTC presentation: collapses a marked Subagent onto run_code
 │   ├── minimal-guard.mjs               # adaptive narrowing for the read-only worker
 │   ├── approval-gate.mjs               # the approval gate for dangerous operations
+│   ├── interrupt-before-send.mjs        # correction timing: interrupt the target's turn before relaying
+│   ├── preset-dispatch.mjs             # cross-mode dispatch: hands a brief to any installed agent preset
 │   ├── workspace-acl.mjs               # workspace ACL: grants WRITE_OWNER (the only module that changes system state)
 │   └── file-info.mjs                   # the read-only metadata tool file_info
 ├── docs/
