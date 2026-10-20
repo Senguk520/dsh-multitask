@@ -468,7 +468,20 @@ export function classifyShellCommand(command, danger = DANGER_PATTERNS, safe = S
   }
   for (const { id, re } of danger) {
     try {
-      if (re.test(command)) return id
+      if (!TEXTUAL_PATTERN_IDS.has(id)) {
+        if (re.test(command)) return id
+        continue
+      }
+      // ── 文本型模式：逐个命中检查，跳过「引号内的数据字面量」───────────────
+      //
+      // 不能只测一次就返回：`-match 'log|sh'` 是误报，但同一条命令里可能还藏着
+      // 一个真的 `| sh`。所以扫**全部**命中，只要有一个不是字面量就判危险。
+      const scan = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`)
+      for (let match = scan.exec(command); match !== null; match = scan.exec(command)) {
+        if (!isQuotedDataLiteral(command, match.index)) return id
+        // 零宽匹配时手动推进，否则 exec 会原地不动、死循环。
+        if (match[0] === '') scan.lastIndex += 1
+      }
     } catch {
       // 同上。
     }
@@ -592,7 +605,7 @@ export function defaultTempRoots() {
 }
 
 /**
- * 路径里有没有**上溯段**（`..`），不论它出现在哪个位置。
+ * 路径里有**上溯段**（`..`），不论它出现在哪个位置。
  *
  * 为什么必须独立成一个判据：`isUnderRoots` 是做**纯词法前缀比较**的，而
  * `<临时根>/../../../Windows` 字面上确实以临时根开头、比较必然成立 —— 但它真正指向的
@@ -607,6 +620,120 @@ export function defaultTempRoots() {
 function hasTraversalSegment(normalized) {
   return normalized.split('/').some((segment) => segment === '..')
 }
+
+/**
+ * 按**纯词法**折叠掉路径里的 `.` 与 `..` 段。
+ *
+ * 只用于**显示**（审批卡上告诉用户「你批准的东西真正指向哪里」），不参与任何放行判定。
+ * 刻意不做符号链接解析、不碰文件系统：解引用要让 `node:fs` 进来，而这个模块约定零依赖，
+ * 何况审批卡需要的正是「命令文本声称的目标」，不是当前磁盘状态。
+ *
+ * @param normalized - 已把 `\` 换成 `/` 的路径。
+ * @returns 折叠后的路径。
+ */
+function collapseSegments(normalized) {
+  const isAbsolute = normalized.startsWith('/')
+  const out = []
+  for (const part of normalized.split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') {
+      // 别把盘符根或 POSIX 根弹掉：`C:/..` 仍然是 `C:/`，`/..` 仍然是 `/`。
+      const atRoot = out.length === 1 && /^[a-zA-Z]:$/.test(out[0])
+      if (out.length > 0 && !atRoot) out.pop()
+      continue
+    }
+    out.push(part)
+  }
+  return `${isAbsolute ? '/' : ''}${out.join('/')}`
+}
+
+/**
+ * 找出命令里**被 `..` 折叠改变了含义**的路径参数，供审批卡显示真实目标。
+ *
+ * 这一条是为一个实测发现补的：E4 的卡面只显示
+ * `...\dsh-mt-rt-e4\..\..\..\..\dsh-mt-shadow-e4`，而它真正指向
+ * `C:\Users\asus\AppData\dsh-mt-shadow-e4`。用户要在看不到真实目标的情况下决定
+ * 是否批准，那**不算知情同意** —— 卡面必须把折叠后的路径一并画出来。
+ *
+ * 只报「折叠后与原文不同」的项，否则卡面会把整条命令的每个路径都铺一遍，反而更难读。
+ *
+ * @param command - 命令文本。
+ * @returns `{ literal, resolved }` 数组（去重，可能为空）。
+ */
+export function resolvedTargetsOf(command) {
+  if (typeof command !== 'string' || command.trim() === '') return []
+  const seen = new Set()
+  const out = []
+  for (const raw of command.split(/\s+/)) {
+    const token = raw.replace(/^["']|["']$/g, '')
+    if (token === '') continue
+    const inspected = inspectPath(token)
+    if (!inspected.absolute) continue
+    const resolved = collapseSegments(inspected.normalized)
+    if (resolved === inspected.normalized) continue
+    if (seen.has(resolved)) continue
+    seen.add(resolved)
+    out.push({ literal: token, resolved })
+  }
+  return out
+}
+
+/**
+ * 判断一个**数据/正则参数**的引号内文本里出现的关键词，是否只是字面量。
+ *
+ * ── 为什么需要这条（实测误报的反面证据）─────────────────────────────────────
+ *
+ * 自检报告把 `pipe-to-shell` 的误报归因为「实现退化为含 `|` 即危险」。**那不是事实**：
+ * 该正则从 1.0.0 起一直是 `\|\s*(sh|bash|zsh|pwsh|powershell)\b`，从未按裸 `|` 判定
+ * （`git log -S` 只有一个提交，逐字比对 1.2.5 / 1.2.10 / 1.2.13 三者相同）。
+ *
+ * 真实的误报面窄得多，是**引号里的字面量**：`-match 'log|sh'` 这种正则交替，`|sh`
+ * 落在单引号内，shell 根本不会把它当管道。同类还有 `Select-String 'iex'`
+ * （字面量里含 `iex` 四个字母）。
+ *
+ * ── 为什么这是**窄豁免**而不是整体去引号 ────────────────────────────────────
+ *
+ * 「把引号内容整体剥掉再匹配」会造成真实的漏判：`pwsh -Command "cat x | sh"` 的管道
+ * 也在引号里，但它**确实执行**。所以这里只豁免「引号前面的参数名是纯数据/正则语义」
+ * 的那一小类（`-Pattern` / `-match` / `-like` / `-eq` / `Select-String` …），
+ * `-Command` / `-c` 刻意**不在**名单里 —— 它们的引号内容会进解释器。
+ *
+ * @param command - 整条命令文本。
+ * @param index - 危险关键词匹配到的下标。
+ * @returns 该命中只是数据字面量时为 true。
+ */
+function isQuotedDataLiteral(command, index) {
+  // 向前扫，找出匹配点是否处于一个未闭合的引号内。
+  let quote
+  let quoteStart = -1
+  for (let i = 0; i < index; i += 1) {
+    const ch = command[i]
+    if (quote === undefined) {
+      if (ch === "'" || ch === '"') {
+        quote = ch
+        quoteStart = i
+      }
+    } else if (ch === quote) {
+      quote = undefined
+    }
+  }
+  if (quote === undefined) return false
+
+  // 引号前必须紧跟一个**纯数据语义**的参数名或 cmdlet 名。
+  const before = command.slice(0, quoteStart)
+  return /(?:\b-?(?:Pattern|match|notmatch|like|notlike|eq|ne|contains|notcontains|replace|split|regex)|\bSelect-String)\s+$/i.test(
+    before,
+  )
+}
+
+/**
+ * 判定为「文本长得像代码」的那几个模式 —— 它们最容易在**引号内的字面量**上误报。
+ *
+ * ⚠️ 名单刻意很短：只放**匹配目标本身就是一段文本**的模式。像 `rm-recursive-force`
+ * 这种「命令本身就是动作」的模式绝不能进来 —— 对它们做引号豁免会让
+ * `Remove-Item -LiteralPath '...'` 整类命令失去保护。
+ */
+const TEXTUAL_PATTERN_IDS = new Set(['pipe-to-shell', 'pipe-to-iex', 'invoke-expression'])
 
 /**
  * 判断一个路径是否落在**允许根**之下（含根目录本身）。
@@ -1314,12 +1441,26 @@ export function apply(ctx, config) {
         ctx.logger?.info?.(
           `dsh-multitask: MULTITASK-APPROVAL-ASK tool=${JSON.stringify(exec.name)} pattern=${hit.pattern}`,
         )
+
+        // ── 把「命令声称的路径」与「它真正指向哪里」一起画在卡上 ────────────────
+        //
+        // 实测（E4）：卡面只显示 `...\dsh-mt-rt-e4\..\..\..\..\dsh-mt-shadow-e4`，而它
+        // 真正指向 `C:\Users\asus\AppData\dsh-mt-shadow-e4`。批准者看不到真实目标就
+        // 无法做知情决定 —— 那不是「稍微不清楚」，那是这张卡失去了它存在的理由。
+        //
+        // 只在**折叠改变了含义**时补一句话，否则卡面会为每个正常路径都加一行，反而更难读。
+        const resolved = hit.kind === 'shell' ? resolvedTargetsOf(hit.command) : []
+        const resolvedSuffix =
+          resolved.length === 0
+            ? ''
+            : ` [resolves to: ${resolved.map((entry) => entry.resolved).join(', ')}]`
+
         return {
           kind: 'ask',
-          reason: `${ASK_REASON_PREFIX} flagged ${hit.kind === 'shell' ? 'a destructive shell command' : 'a write outside the workspace'} (${hit.pattern}): ${label}`,
+          reason: `${ASK_REASON_PREFIX} flagged ${hit.kind === 'shell' ? 'a destructive shell command' : 'a write outside the workspace'} (${hit.pattern}): ${label}${resolvedSuffix}`,
           displayReason: {
-            en: `A delegated Subagent wants to run ${exec.name}, which the Multitask approval gate flagged as destructive (${hit.pattern}). Approve only if you meant this.`,
-            zh: `被委派的子代理要执行 ${exec.name}，Multitask 审批闸门判定它有破坏性（${hit.pattern}）。确认你确实要这么做再批准。`,
+            en: `A delegated Subagent wants to run ${exec.name}, which the Multitask approval gate flagged as destructive (${hit.pattern}). Approve only if you meant this.${resolved.length === 0 ? '' : ` The path(s) resolve to: ${resolved.map((entry) => entry.resolved).join(', ')} — not the literal text shown in the command.`}`,
+            zh: `被委派的子代理要执行 ${exec.name}，Multitask 审批闸门判定它有破坏性（${hit.pattern}）。确认你确实要这么做再批准。${resolved.length === 0 ? '' : `命令里的路径实际指向：${resolved.map((entry) => entry.resolved).join('、')}，与字面写法不同。`}`,
           },
         }
       } catch (error) {
