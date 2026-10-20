@@ -250,7 +250,7 @@ With the mode selected, have the coordinator try these:
 | "Delegate to a Subagent to run `git status` and report the conclusion." | ✅ the Subagent runs it and brings back only the conclusion |
 | "Delegate to a Subagent to read package.json and report the file name and size." | ✅ the read-only route always works (`read` / `file_info`) |
 
-The log shows which tools were actually withheld (all lines are prefixed `dsh-multitask:`):
+With a log sink attached, the log shows which tools were actually withheld (all lines are prefixed `dsh-multitask:`). ⚠️ This deployment does **not** persist that channel (measured: the only occurrences left in session logs are source text echoed in conversation), so failing to grep it does **not** mean nothing was withheld — the judge is that calling those tools fails:
 
 ```
 dsh-multitask: coordinator scope engaged — withheld N tool(s): edit, pwsh, read_image, ssh_exec, ...

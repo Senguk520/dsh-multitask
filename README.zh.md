@@ -250,7 +250,7 @@ Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(<工作区路径>)
 | 「派个子代理跑 `git status` 并把结论告诉我」 | ✅ 子代理成功执行，只把结论带回来 |
 | 「派个子代理读一下 package.json 并报出文件名与大小」 | ✅ 只读路径始终可用（`read` / `file_info`） |
 
-日志里能看到实际收窄了哪些工具（前缀 `dsh-multitask:`）：
+如果接入了日志汇聚，能看到实际收窄了哪些工具（前缀 `dsh-multitask:`）。⚠️ 本部署**不持久化**这条日志通道（实测：会话日志里该前缀只剩对话中回显的源码），所以 grep 不到它**不代表**收窄未生效 —— 判据应看「调用这些工具会失败」：
 
 ```
 dsh-multitask: coordinator scope engaged — withheld N tool(s): edit, pwsh, read_image, ssh_exec, ...

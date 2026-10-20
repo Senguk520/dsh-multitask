@@ -709,13 +709,41 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 因为那时返回 `ask` 只会被 `decide()` 的第一行判成 `rejected`，**会把一条原本能在沙箱里
 正常跑完的命令变成拒绝**，比不问更糟。
 
-### 怎么确认它生效了（可 grep 的固定标识）
+### 怎么确认它生效了（两套证据，别混用）
+
+这里有两套完全不同的观测通道。**混用它们会得出错误结论**，因为其中一套在本部署里根本不落盘。
+
+#### 证据一：持久事件（唯一可靠的通道）
+
+闸门的每一次询问都会在**会话日志**里留下一条 `approval/asked`，用户的答复留下
+`approval/decided`。这是唯一跨重启存活、可离线核对的证据。三类询问的 `reason` 前缀
+彼此不同，因此**一条 grep 就能把它们分开**：
+
+| `approval/asked` 的 `reason` 以什么开头 | 是谁在问 |
+|---|---|
+| `Multitask approval gate flagged a destructive shell command (…): …` | **第一级**：规则表判定危险（或往工作区外写时是 `a write outside the workspace`） |
+| `Multitask approval gate: a delegated Subagent (……) asked to run "…"` | **第二级**：把子代理的请求转呈给了父会话 |
+| `Auto review denied tool "…": …` | **自动审查（EXP）**自己拒绝，本模块未插手 |
+
+`approval/decided` 的 `outcome` 是 `allowed-once` / `rejected` / `cancelled` 三者之一 ——
+没有「永久允许」这一档。
+
+⚠️ **`session.v4.jsonl.zstd` 是多帧拼接的**，直接 `zstdDecompressSync(整个文件)` 只解第一帧
+（实测：8.7 MB 的文件只返回 193 字节的会话头）。要按 `0x28B52FFD` 魔数切帧后逐帧解压，
+否则会看到「日志里什么都没有」的假象。
+
+#### 证据二：`MULTITASK-*` 日志标识（只对**接了日志汇聚**的部署有效）
+
+下面这些标识走 `ctx.logger`。**本部署不持久化该通道** —— 实测：全量会话日志里
+`warn` 前缀 0 条、`info` 前缀 16 条且全是对话中回显的源码。所以如果你在会话目录里
+grep 不到它们，**那不代表闸门没生效**，只代表没有 sink 接收。
 
 | 标识 | 含义 |
 |---|---|
 | `MULTITASK-APPROVAL-GATE-ENGAGED` | 已放开一个子代理的策略，闸门就位 |
 | `MULTITASK-APPROVAL-GATE-SKIPPED reason=…` | 跳过了（`reason=` 说明为什么：父会话不是 ask / 缺服务 / 载荷畸形…） |
 | `MULTITASK-APPROVAL-ASK` | 第一级判定某次调用危险，正在征求用户同意 |
+| `MULTITASK-APPROVAL-YIELDED reason=auto-review` | 让位给自动审查，本模块不再升 `ask` |
 | `MULTITASK-APPROVAL-RELAYED` | 第二级把子代理的请求转呈给了父会话（含结果） |
 | `MULTITASK-APPROVAL-RELAY-FAILED reason=…` | 转呈失败，已退回原路径 |
 | `MULTITASK-APPROVAL-NOTIFY-SENT` | 转呈失败后，已尽力用消息通道把「有决定在等你」送到父会话 |
@@ -728,6 +756,21 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 
 `MULTITASK-APPROVAL-GATE-SKIPPED` 与 `ENGAGED` 都随计数递增，所以派了 N 个 worker
 却一个都没放开时，日志里能看出「跳过了几次、每次为什么」。
+
+#### 怎么用「证据一」验证自动审查的让位（这是 E8 的正确判据）
+
+「让位发生了」不是一个能**正面**看到的事件 —— 让位的结果是**什么都不做**，
+所以它只留下**缺席**证据。但缺席证据在下面这对组合里是充分的：
+
+| 情形 | 持久事件里应当看到 | 不应当看到 |
+|---|---|---|
+| EXP 放行 | 该调用**没有任何** `approval/asked` | 没有 `Multitask approval gate flagged …` |
+| EXP 拒绝（策略 `ask`） | 一条 `Auto review denied tool …`（EXP 自己的），**随后**一条 `Multitask approval gate: a delegated Subagent …`（本模块转呈，`reason` 末尾带着 EXP 的原文） | 没有 `Multitask approval gate flagged …`（若出现，说明本模块**又**按规则表问了第二遍，即让位失效） |
+| EXP 拒绝（策略 `never`） | 一条 `Auto review denied tool …`，`approval/decided` 为 `rejected` | 没有第二级的 `a delegated Subagent …` |
+
+判据的关键是**同一条命令在 `approval/asked` 里只出现一次**。旧版（1.2.10 及以前）会让
+EXP 放行后再弹一次第一级的卡 —— 那时同一调用会同时出现 `Auto review …` 与
+`Multitask approval gate flagged …` 两条，或者干脆只有后者。
 
 ### 如实写出的边界（别把它当成比实际更强的东西）
 
@@ -1033,17 +1076,19 @@ dsh-multitask: coordinator scope engaged — withheld N tool(s): edit, pwsh, rea
 | 点**拒绝** | ❌ 命令**确实没有执行**；子代理拿到的结果是 `the user rejected tool "..."` |
 | 点**允许一次** | ✅ 本次执行成功；**再次**发同样调用会**再次弹窗**（`allowed-once` 是唯一授权，没有「永久允许」） |
 
-日志里对应的证据（`MULTITASK-APPROVAL-` 前缀可一次 grep 全部）：
+核对对应的证据时，请用**持久事件**（`approval/asked` / `approval/decided`），不要靠
+`MULTITASK-*` 日志标识 —— 本部署不持久化 `ctx.logger`，那些标识 grep 不到是正常现象：
 
-```
-dsh-multitask: subagent approval policy released to "ask" for one delegated worker; ... [MULTITASK-APPROVAL-GATE-ENGAGED]
-dsh-multitask: MULTITASK-APPROVAL-ASK tool="pwsh" pattern=rm-recursive-force
-dsh-multitask: MULTITASK-APPROVAL-RELAYED tool="pwsh" outcome=allowed-once
-```
+| 持久事件里应当看到 | 含义 |
+|---|---|
+| `approval/asked` 一条，`reason` 以 `Multitask approval gate flagged a destructive shell command (…): …` 开头 | 第一级弹了卡 |
+| 随后 `approval/decided`，`outcome` 为 `rejected` | 你拒绝了，命令没执行 |
+| 随后 `approval/decided`，`outcome` 为 `allowed-once` | 你批准了这一次；再次发同样调用会**再次**出现 `approval/asked` |
 
-反方向也值得看一眼：**父会话策略是 `never` 时**，日志里应当出现
-`MULTITASK-APPROVAL-GATE-SKIPPED reason=parent-not-interactive`，且**没有任何**
-`ENGAGED` —— 那说明红线（不在 headless 环境启闸）守住了。
+反方向也值得看一眼：**父会话策略是 `never` 时**，`approval/asked` 里**不应**出现任何
+`Multitask approval gate …` —— 那说明红线（不在 headless 环境启闸）守住了。
+（若你接了日志汇聚，对应标识是 `MULTITASK-APPROVAL-GATE-SKIPPED reason=parent-not-interactive`
+且没有 `ENGAGED`。）
 
 #### 兜底通路（后台派单 / 父会话空闲）
 
@@ -1065,10 +1110,13 @@ dsh-multitask: MULTITASK-APPROVAL-RELAYED tool="pwsh" outcome=allowed-once
 
 4. 若是最后一种形态：按它给的 id（或页头子代理列表）**打开那个子会话**，在它自己的
    composer 里作答 —— 批准/拒绝**只能在那个子会话里完成**，消息通道不携带审批结果。
-5. 日志里对应 `MULTITASK-APPROVAL-RELAY-FAILED reason=…`，随后按结局分别是
-   `-RELAY-RETRY-RETRIED`（重试成功，卡片已出现）或 `-RELAY-RETRY-FAILED reason=window-elapsed`
-   （没等到回合，要用户自己去子会话）。通知那一路是
-   `-NOTIFY-SENT` / `-NOTIFY-FAILED` / `-NOTIFY-SKIPPED reason=…`。
+5. 事后核对（用**持久事件**，不要靠日志标识 —— 见「怎么确认它生效了」的证据一）：
+   `approval/asked` 里应当只有**一条** `Multitask approval gate: a delegated Subagent …`
+   （只有一次询问 —— 若出现两条，说明重试造成了重复询问，那是缺陷）。
+   若你接了日志汇聚，还能看到 `-RELAY-FAILED reason=…` 与其后的
+   `-RELAY-RETRY-RETRIED` / `-RELAY-RETRY-FAILED reason=window-elapsed`、
+   `-NOTIFY-SENT` / `-NOTIFY-FAILED` / `-NOTIFY-SKIPPED reason=…`；
+   这些标识在本部署里不落盘，grep 不到是正常现象。
 
 > ⚠️ **第 3 步三种形态的判据是「消息里那张卡是否存在」，不是「有没有消息」。**
 > 重试会**同时**留下消息与卡片，所以只看到消息不能立刻断定失败 ——
