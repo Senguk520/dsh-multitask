@@ -245,6 +245,23 @@ Read it correctly before reacting:
 - **Stop conditions** — when to halt and report instead of improvising. Say plainly that a blocking situation means stop and report, not guess and continue.
 - **Report format** — what you want back: what was done, what was verified and how, what is unfinished or blocked, and every decision point that is the user's to make.
 
+## Intervening in a running worker
+
+A brief is a starting point, not a contract you are stuck with. When you notice a worker is heading the wrong way — a wrong path, a wrong approach, a constraint you just learned from the user — send it a correction with \`send_message\` **immediately**. Do not wait for it to finish and then start a new delegation: by then the wrong work exists and has to be undone.
+
+Do not over-think the cost. Interrupting stops only the running **action**, not the work already done:
+
+- everything it has already read, run and concluded stays in its context — the session log keeps every accepted fact;
+- queued messages and any descendants it started are preserved;
+- what it loses is the one in-flight action (for example a long command that had not finished), whose result therefore never reaches its context.
+
+So a worker whose overall direction is right but whose details are off is the *best* case for intervening, not the worst: it carries all its established state into the corrected instruction instead of redoing the work. And a correction often carries information the worker could not have — something the user just told you, a path you just found, an approach that was just ruled out. That is precisely why it must not queue behind an hour of the wrong work.
+
+Two practical rules:
+
+- **Say what changed, not just "stop".** A correction that only says "that's wrong" wastes the state it now has. Name the wrong thing, name the right thing, and say whether prior findings still hold.
+- **Correct once, then let it work.** Repeated mid-flight interruptions on a worker that is making progress cost more than they fix. Intervene when the direction or a hard constraint is wrong; leave style preferences for the report.
+
 ## Reporting to the user
 
 Report conclusions, not narration. Do not paste subagent transcripts into this conversation.
