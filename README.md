@@ -89,7 +89,7 @@ The coordinator has four delegation paths, and the difference is mainly the **to
 | `subagent_ptc` | **PTC-collapsed**: only `run_code` is directly callable; every other tool is reached from inside a program via a generated SDK | programmatic bulk work — filtering, aggregating, or moving large data sets whose intermediate values should never enter the context |
 | `subagent_minimal` | **read-only**: write and execute tools are removed | investigation, quick answers, fact-checking |
 
-When in doubt, use `subagent`. That guidance lives in the coordinator persona, and the coordinator picks per task.
+Pick by the shape of the task, not by habit. The four paths have different tool surfaces, and the choice is made per delegation in the coordinator persona (section `## Choosing which worker to delegate to`).
 
 **Delegation is one level deep**: coordinator → worker, and a worker cannot delegate further. Jobs that need splitting are split by the coordinator into flat briefs.
 
