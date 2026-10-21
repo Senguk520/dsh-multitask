@@ -554,6 +554,58 @@ tools.restrict() names unknown global tool "x"; known global tools: …
   静态那层已随上游删除，所以本模块装不上时 minimal worker 完全不收窄（会响亮告警）。
   **它终究不是沙箱**：若某个插件在 minimal worker 创建**之后**才注册一个新的变更类工具，
   那个工具**不会被摘掉**（有意取舍，见 `minimal-guard.mjs` 文件头「如实写出的边界」）。
+- **全工具面 worker 的底噪里有一块纯浪费，`worker-guard.mjs` 专门摘它。**
+  委派深度固定为 1，worker 再往下派一律被拒（逐字 `Error: subagent depth 2 exceeds maxDepth 1`），
+  但拒绝发生在**调用之后**。在那之前，5 个委派工具的完整 schema 一直挂在 worker 目录里，
+  跟着**每一次请求**重发。实测（本机 726 个 worker 会话，读 `request/header` 的 `tools` 数组，
+  非 worker 自述）：**575 个（79.2%）** worker 的目录里挂着 `subagent*`；这 5 个合计
+  **6,266 字符**，占全工具面 worker 底噪（52,445 字符）的 **11.9%**；
+  同时实测到 **184 次** `depth 2 exceeds maxDepth 1` 的拒绝 —— 证明它们确实不可用。
+  本模块把「黑名单 ∩ 可见集」下发为 deny，**不损失任何能力**（判据是「调用必然被拒」，
+  不是「看起来没用」：`interrupt_agent` / `send_message` / `list_agents` 刻意**不摘**）。
+  失败取向与 minimal-guard **相反** —— 它失败最坏是那块 schema 继续重发，功能一件不少，
+  所以静默降级、只记一条告警。
+  ⚠️ **它不解决 PTC。** 实测 PTC worker 的 `tools` 数组只有 `run_code`（2,126 字符），
+  委派工具只出现在 **51,719 字符**的 `## Writing code for run_code` 一节里；
+  那一节是否随可见集收缩**尚未验证**（本机没有「被收窄过的 PTC」样本可对照）。
+  在验证之前，不要把这个模块当成 PTC 的解法。
+
+---
+
+## 委派底噪的构成（实测，供判断该不该动插件）
+
+`request/header` 就是**每一次请求**重发的那份固定底噪。本机实测（按 agent 类型取首个 header）：
+
+| 类型 | 样本 | 工具数 | tools 字符 | system 字符 | 合计 | 约 tokens |
+|---|---|---|---|---|---|---|
+| `subagent_minimal` | 159 | 10 | 5,719 | 7,870 | 13,589 | 4,247 |
+| `subagent`（全工具面） | 491 | 44 | 42,625 | 9,688 | 52,639 | 16,450 |
+| `subagent_ptc`（已塌缩） | 26 | **1** | 2,126 | **61,057** | **63,183** | 19,745 |
+
+**PTC 塌缩后反而最贵**：它的 `tools` 确实降到了 1 项，但 `system` 里多出一节
+`## Writing code for run_code` 独占 **49,551 字符 / 885 行**（人格本体只有 10,049 字符）。
+也就是说 `presentAs('ptc')` 改的是「能不能调」，**没有**改「要不要读」。
+四类里 `subagent_minimal` 最便宜，这是它值得作为纯读任务默认选择的可量化理由。
+
+全工具面 worker 那 55 份 schema 的来源（合计 52,445 字符）：
+
+| 来源 | 工具数 | 字符 | 占比 |
+|---|---|---|---|
+| 插件 `task_board_*` | 17 | 20,244 | 38.6% |
+| 内置核心 | 20 | 17,991 | 34.3% |
+| 委派工具（本次摘除） | 5 | 6,266 | 11.9% |
+| 插件 `ssh_*` | 6 | 4,039 | 7.7% |
+| 目标跟踪 / 子代理控制 / 计划模式 | 7 | 3,905 | 7.4% |
+
+**它不是一次「回归」，而是三周的插件累积**：按天看工具数中位是 42（10-03～10-05）→
+43（10-06）→ 44（10-07～10-10）→ 53（10-11～10-18）→ 55（10-20～10-21），
+没有单一拐点。另外 `subagent` 那一行**从来没有**配过 `toolFilter`（可查最早提交
+`9cdebc8`），所以「上游删掉 `toolFilter` 导致全工具面 worker 失去收窄」这个说法不成立 ——
+失去收窄的只有走静态 deny 的 minimal 那一行，而它已由 `minimal-guard.mjs` 接回。
+
+> **底噪不累积，是「轮数 × 常量」。** 同一 worker 的每步上下文增量中位约 1,278 tokens
+> （实测 475 个多轮 worker，末步上下文 100% 大于首步）。所以省底噪的收益随轮数放大，
+> 而「会话变得更大」这个体感更多来自轮数而不是单条消息。
 
 ---
 
@@ -1631,6 +1683,7 @@ dsh-multitask/
     ├── coordinator-guard.mjs           # ★ 减震器（含「模式隔离」归属判据）
     ├── subagent-mode.mjs               # ★ 多模式子代理：PTC 呈现（零依赖，零 import）
     ├── minimal-guard.mjs               # ★ subagent_minimal 的自适应收窄（零依赖，零 import）
+    ├── worker-guard.mjs                # ★ 摘掉 worker 里「调了必被拒」的委派工具（纯省 token，零依赖）
     ├── approval-gate.mjs               # ★ 审批闸门：危险操作弹窗请用户裁决（零依赖，零 import）
     ├── interrupt-before-send.mjs        # ★ 纠错时序：拦 send_message，先停当前轮次再发送（零依赖，零 import）
     ├── preset-dispatch.mjs             # ★ 跨模式派发：把任务书投给任意已安装的 agent preset
