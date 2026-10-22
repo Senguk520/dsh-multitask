@@ -8,6 +8,22 @@ This is a **mechanism**, not a prompt asking the model to behave. Once the mode 
 
 Zero runtime dependencies. No changes to DSH source.
 
+At a glance:
+
+| Capability | What it gives you |
+|---|---|
+| Narrowed coordinator tool surface | the main conversation cannot write, run commands or search — those tools are genuinely absent, not merely discouraged |
+| Process data never reaches the main conversation | file contents, command output, build logs and dead ends stay inside a worker's context |
+| Four kinds of Subagent | a full-surface worker, a fork that inherits completed turns, a programmatic PTC worker and a read-only worker, chosen by task shape |
+| Dispatch to another mode | hand a brief to any other installed agent preset and receive only its conclusion |
+| Two-level approval gate | safe commands run untouched; dangerous ones raise a card in the main conversation |
+| Corrections take effect immediately | a follow-up message stops the worker's current turn first instead of queueing behind the wrong work |
+| Mode isolation | several modes can share one workspace; each narrows only its own sessions |
+| Cross-session settings | pick a model per worker kind and set the parallelism limit, both in Settings |
+| Automatic workspace permission repair | on Windows the one missing permission is added at session start, and only that one |
+| Read-only metadata tool `file_info` | byte counts and file kinds without reading contents, so the coordinator can verify a claim itself |
+| Zero runtime dependencies | no changes to DSH source |
+
 ---
 
 ## How it differs from other modes
@@ -30,6 +46,16 @@ What the coordinator keeps (a whitelist):
 Anything not on that list is withheld by default — `write`, `edit`, `pwsh`, `web_search`, `web_fetch`, `read_image`, `ssh_*`, `task_board_*`, `plugin_manager`, and so on. The rule is a **complement**: withheld = currently visible − kept. Any tool the host adds later is therefore also withheld from the coordinator by default, with no change needed in this plugin.
 
 The read-only tools are kept on purpose: the coordinator is meant to **verify** a Subagent's claims independently instead of trusting them blindly.
+
+### Mode isolation: it only narrows its own sessions
+
+The narrowing is applied only to sessions whose live preset binding is this preset. A session belonging to another mode in the same workspace keeps its own tool roster and is not touched — so you can run several modes side by side without them eating each other's tools.
+
+Switching a session out of the mode lifts the restriction again, and switching into it before the first turn narrows it before the first request is even made.
+
+`presetId` is that ownership key. If you change it to install variants side by side, each variant narrows only its own sessions; and if it no longer matches the registered preset id, **no** session is narrowed at all — the mode can look installed while quietly doing nothing.
+
+When ownership cannot be read, the guard prefers **not** to narrow rather than risk narrowing a neighbour's session. The cost of a registry hiccup is therefore one possibly un-narrowed turn, never a broken neighbouring mode.
 
 ---
 
@@ -72,7 +98,7 @@ Two things to watch:
 
 When creating a **new session**, pick **"Multitask 减震器模式"** in the mode selector, then just ask for what you want.
 
-> The mode can only be chosen **before a session starts**. A session that is already running cannot switch into it — that is an existing DSH constraint (the tool surface and prompt freeze on the first turn), not a limitation of this plugin.
+> The mode can be chosen **before a session's first turn starts**, and a session whose first turn has not yet started can still be switched into or out of it. What is frozen is a session that has **already started running its first turn** — that is an existing DSH constraint (the tool surface and prompt freeze on the first turn), not a limitation of this plugin.
 
 The coordinator translates your request into **self-contained** task briefs — a Subagent cannot see this conversation, so a brief must carry everything it needs (goal, verified current state, project conventions, safety rails, numbered tasks, conditional branches, stop conditions, report format). Independent briefs are dispatched **in parallel**, and the coordinator keeps working while they run.
 
@@ -85,13 +111,45 @@ The coordinator has four delegation paths, and the difference is mainly the **to
 | Delegation tool | Tool surface | Best for |
 |---|---|---|
 | `subagent` | **full** | the default — writing code, running tests, editing files, execution work |
-| `subagent_fork` | **full** + the **completed turns** of this conversation | review and continuation — when the work must build on what is already established here |
+| `subagent_fork` | **full** + the **completed turns** of this conversation — it does **not** see the turn currently in flight, so a fact stated in the dispatching turn must be repeated in the brief | review and continuation — when the work must build on what is already established here |
 | `subagent_ptc` | **PTC-collapsed**: only `run_code` is directly callable; every other tool is reached from inside a program via a generated SDK | programmatic bulk work — filtering, aggregating, or moving large data sets whose intermediate values should never enter the context |
-| `subagent_minimal` | **read-only**: write and execute tools are removed | investigation, quick answers, fact-checking |
+| `subagent_minimal` | **read-only**: write and execute tools are removed, but it keeps `read` `grep` `glob` `read_image` `file_info` `skill` `todo_write` `present` and **can still search and fetch the web** | investigation, quick answers, fact-checking |
 
 Pick by the shape of the task, not by habit. The four paths have different tool surfaces, and the choice is made per delegation in the coordinator persona (section `## Choosing which worker to delegate to`).
 
 **Delegation is one level deep**: coordinator → worker, and a worker cannot delegate further. Jobs that need splitting are split by the coordinator into flat briefs.
+
+### What a worker does not get
+
+The four kinds also differ in **persona**, not only in tool surface. A fork worker is told that the seeded turns are the coordinator's work and not its own, so it reviews instead of pretending to have done it. A PTC worker is told that its closing message is the fallback channel if `run_code` breaks. The read-only worker is told it may search and fetch the web, so it does not report back that it "cannot look anything up".
+
+On top of that, five delegation tools — `subagent`, `subagent_fork`, `subagent_ptc`, `subagent_minimal`, `subagent_preset` — are removed from a worker's tool catalog outright, for every kind except the read-only worker. A worker therefore cannot delegate: the tool is **not there** rather than present-and-refused. This costs no capability, because the host's fixed depth of 1 would refuse every such call anyway; it only stops that schema being re-sent on every single request. The coordinator is untouched by this, and the read-only worker is narrowed by its own allowlist instead.
+
+This is **not a security boundary** — the real block is the host's depth limit. If it fails to install it degrades silently, leaving only a log line containing `WORKER-GUARD-SKIPPED`, and nothing is lost functionally. Its switch is the `worker-guard` row's `config.enabled` in `presets/multitask/composition.mjs` (which also accepts an additive `config.extraDeny`), and changing it requires a restart.
+
+If a worker's persona cannot be installed at all, that worker keeps the coordinator persona and the log shows `WORKER-PERSONA-SKIPPED`.
+
+### Corrections stop the worker first
+
+When the coordinator sends a follow-up to a running worker, the target's current turn is stopped **first**, and only then is the message delivered — it does not queue until the next step boundary. This matters because a single step can be one long tool call: a build, a dependency pull, a recursive scan. A correction that merely queued would let the wrong instruction run to completion before your new one was even read.
+
+Stopping is not "the task was cancelled". The inbox and any descendants are kept, every fact already accepted is still in the session log, and only the one in-flight action is dropped. A correction to work that was on the right track therefore loses almost nothing — and the message may carry information the worker could not have had.
+
+It only ever acts in the coordinator → worker direction. A message that a worker sends upward is not preceded by an interrupt, because that would cut the main conversation's own turn. If the interrupt fails, or the deployment exposes no interrupt capability, the message is still sent normally and corrections simply revert to queueing: you see an info line, not an error. Its only switch is the `interrupt-before-send` row's `config.enabled` in the composition, and changing it requires a restart.
+
+### The read-only `file_info` tool
+
+It is **this package's own tool** and the only self-authored tool on the coordinator's keep list. Its input is exactly one field: `paths`, an array of one or more path strings (up to 256), resolved by the filesystem backend with relative paths taken against the session working directory.
+
+The output is one entry per requested path — `requestedPath`, `resolvedPath`, `status`, `sizeKnown`, `sizeBytes` when known, and a `note` explaining an odd state — plus a `totals` block (`requested`, `files`, `directories`, `others`, `missing`, `errors`, `bytes`, `unknownSizes`, `complete`).
+
+`status` is one of `file`, `directory`, `other`, `missing` or `error`. A directory is reported **as a directory with no byte count**. A missing or uninspectable path is reported as such and is **never** reported as 0 bytes: when the backend cannot supply a size, `sizeKnown` is `false` and `sizeBytes` is absent rather than fabricated as zero.
+
+`totals.bytes` sums **only** the known sizes, `unknownSizes` counts the rest, and `complete` is true only when every requested path is a known-size regular file — so a partial sum never masquerades as a total.
+
+It never reads file contents and never modifies anything: it only resolves and stats each path. That is exactly why it is safe to keep in a mode whose entire point is keeping data out of the main conversation, and why the coordinator can use it to check a worker's claim ("five files, this many bytes") instead of trusting the report. It also serves the read-only worker, and it is deliberately **not** affected by the `DSH_MULTITASK_MULTI_MODE` switch.
+
+If the filesystem capability is unavailable at load time the tool is simply **not registered** — the model never sees a route that would fail — leaving a log line containing `FILE-INFO-SKIPPED`; success logs `FILE-INFO-ENGAGED`.
 
 ---
 
@@ -111,7 +169,7 @@ Three boundaries:
 
 - **The brief must be fully self-contained.** A cross-mode worker may not even share this mode's tool conventions, so it needs the background written out even more completely than an ordinary worker.
 - **You cannot dispatch to this mode itself.** That would spawn a sub-coordinator, which the depth limit then refuses to let delegate — the call is rejected outright and points you at the four built-in paths.
-- **Workers cannot dispatch further.** `subagent_preset` belongs to the coordinator; a worker calling it is refused for the same depth reason, so splitting always stays with the coordinator.
+- **Workers cannot dispatch further.** `subagent_preset` belongs to the coordinator; the tool refuses a worker's call itself, with its own message ("A delegated worker cannot dispatch further (delegation depth is fixed at 1)"), before any depth limit is consulted — deliberately, so the error names the real cause instead of surfacing a bare `depth 2 exceeds maxDepth 1` that looks unrelated. Splitting therefore always stays with the coordinator.
 
 **A fourth boundary (measured, and worth knowing): a cross-mode worker is not governed by this mode's guards.**
 
@@ -147,6 +205,25 @@ Once installed, DSH's settings gain the following.
 The session header also shows how many Subagents are currently running.
 
 The model card's **shape is derived, never stored**: all four kinds pointing at one route means "use one model for every Subagent", anything else means per-kind. Switching the shape creates no dirty state.
+
+### How the settings page behaves
+
+- The **Save / Discard bar** at the bottom of the Multitask page controls **only the model card**. The parallelism limit writes instantly, so editing it does not light up Save — that is not a broken button.
+- Save and Discard stay **greyed out until the model mapping actually changes**.
+- If the settings were changed elsewhere, a **banner** appears telling you to discard your draft and try again.
+- The model dropdowns are populated from a **live catalogue**. While it loads you see a loading message; if it fails you see an error with a **Retry** button and the only choice is "Inherit coordinator"; and a saved model that is no longer advertised stays selectable with a "(saved but currently unavailable)" suffix, so you can still clear it.
+- In "use one model for every Subagent" mode the first option is the placeholder **"Choose a model"**; picking it resets **all four** kinds to inherit. In per-kind mode each dropdown starts with **"Inherit coordinator (default)"**; selecting it removes that kind's entry.
+- The two numeric rows (recursion depth, parallelism limit) accept **digits only** and are committed when the field loses focus or you press **Enter** — not on every keystroke. They also have **− / +** steppers; typing something invalid turns the box red with inline correction text and the value is **not** written.
+- **"Maximum recursion depth" carries the hint "0 disables Subagents entirely".** Setting it to 0 turns delegation off altogether — the parallelism limit, by contrast, has a floor of 1 and rejects 0.
+- A deployment that stores settings **read-only** shows a banner saying so and disables every control; a deployment that does not serve the settings namespace says exactly that instead of rendering an empty page.
+- All of this page's copy ships in **both English and Simplified Chinese** and follows the DSH UI language.
+- The settings page is not the whole story: `enabled`, `presetId`, `order`, `guardEnabled`, `keep` and `extraDeny` have **no UI at all** and are profile-YAML only — see "Tunables (profile)" below.
+
+### The session-header counter
+
+- The session header shows how many Subagents are currently running, in three truthful states: a **count** when one or more are running, an explicit **"none running"** when the number is zero, and an explicit **"count unavailable"** rather than a guess when the projection cannot be read.
+- It is **hidden entirely inside a sub-session** (a worker does not show a counter for its own siblings' children) and until the model catalogue has loaded.
+- It sits **alongside** the host's own counter rather than replacing it, so seeing two numbers is expected.
 
 ### The Subagent parallelism limit
 
@@ -213,6 +290,31 @@ Authorisation is **one-shot every time**: "Allow once" authorises that call only
 
 Only if that retry also fails (the window elapses, 10 seconds by default) do you need to open the child session named in the message and decide there. **The message is not an approval** — the message channel carries no approval result, so reading it as a go-ahead would bypass the gate; until you answer, that call stays blocked.
 
+### Which commands it stops for
+
+Level 1 is a **pattern table, not an AI review**. It only ever *adds* a prompt: a command no pattern matches is equivalent to not having this module at all. The families it matches:
+
+- **Recursive / forced deletion** — `rm -rf`, `Remove-Item -Recurse` / `-Force`, `del /q`, `rd /s`
+- **Disk and boot operations** — `format X:`, `diskpart` / `fdisk` / `parted` / `mkfs`, `dd of=`, `bcdedit` / `bootrec`
+- **Power state** — `shutdown`, `Restart-Computer`, `Stop-Computer`, `reboot`
+- **Git history and remote destruction** — `push --force` / `--force-with-lease` / `-f`, `reset --hard`, `clean -f`, `filter-branch` / `filter-repo`, `remote remove`, `checkout -- .`
+- **Package publishing** — `npm` / `pnpm` / `yarn` / `bun` `publish` / `unpublish`, `cargo publish` / `yank`, `twine upload`, `dotnet nuget push`, `docker push`
+- **Privilege escalation** — `sudo` / `doas` / `pkexec` / `runas` / `gsudo`, `Start-Process -Verb RunAs`, `Set-ExecutionPolicy`
+- **System mutation** — accounts and groups, the registry, services, scheduled tasks, WMI, the firewall, ownership changes
+- **Remote-code execution** — `Invoke-Expression` / `iex`, piping into a shell, `-EncodedCommand`, `certutil -urlcache`, `bitsadmin`, forced process kill
+
+Deliberately **not** matched, so do not "fix" it into prompting on harmless commands: dry runs such as `git clean -nd`; `icacls` on a path without a mutation flag; bare `net user` and `wmic process list`; `chmod +x`; reading credential files; `ls /etc`. Writing **outside the workspace** is a separate check, made on the write tools' `file_path` rather than on command text.
+
+Quoted text is judged by its context: inside `-Pattern` / `-match` / `-like` / `-eq` / `Select-String` the command text is not treated as code, so searching *for* a dangerous string does not prompt — while the body of `-Command` / `-c` deliberately **is** treated as code, so a dangerous command inside it does prompt.
+
+### What the approval card shows
+
+The card may be shown a path that contains `..`. When that changes where the path really lands, the reason line and both displayed descriptions carry the **resolved target** next to the literal one, together with the id of the rule that matched — so you approve the destination, not just the spelling.
+
+Authorisation is **one-shot**: "Allow once" authorises that call only, and the same call prompts again next time. There is no "always allow".
+
+Level 1 never pre-empts an upstream decision. It runs **after** the downstream handlers and only upgrades an `allow` into an `ask`; if something earlier in the chain already said `ask` or `deny`, that verdict stands and this module's card does not appear — so a write may be stopped by a different prompt than this module's.
+
 ---
 
 ## Common problems
@@ -233,9 +335,24 @@ If a Subagent is still refused, the automatic grant did not land: the folder is 
 
 **You hit the parallelism limit.** See "The Subagent parallelism limit" above; the refusal is the host's. Wait for existing Subagents, or merge tasks into one brief.
 
-**No approval card appeared.** First check that the session's approval policy is `ask` (a headless configuration is `never`, and then this plugin stays entirely out of the way). If you dispatched in the background and the turn has ended, see the last paragraph of "Approving dangerous operations".
+**A worker stopped mid-sentence and the turn looks like it crashed.** A single reply has a hard ceiling on how much it can emit. Hitting it ends the turn with reason `max-tokens`, and from the outside that looks exactly like a crash. **It is not context exhaustion.** The fix is not to shrink what the worker should read; it is to split what it should write. Workers are told to keep one write under roughly 400–500 lines and to resume from the tail of a truncated file rather than starting over, which is why a large deliverable often arrives as a skeleton followed by successive edits. If a worker reports the same construct failing twice, that is a deliberate stop signal, not stubbornness: it will report the location and the verbatim error instead of varying the fix. The recovery is to start a **fresh** worker on that one spot rather than sending the same worker another retry instruction.
+
+**No approval card appeared.** First check that the session's approval policy is `ask` (a headless configuration is `never`, and then this plugin stays entirely out of the way). If you dispatched in the background and the turn has ended, see the paragraph beginning "With a background dispatch whose turn has ended" in "Approving dangerous operations".
 
 **Source edits have no effect.** You must **restart the app**. Bumping `?v=N` in the profile patch alone is a no-op for a row that is already running: the loader only sees that its name changed, so it neither reloads the module nor restarts it. See "Making source edits take effect" in [docs/DESIGN.md](docs/DESIGN.md).
+
+### When the automatic permission repair runs
+
+- **It is Windows-only.** On macOS and Linux the module is completely inert and registers nothing.
+- **It only runs for a root (non-delegated) session whose resolved sandbox mode is `workspace-write`.** A `read-only` or `danger-full-access` session gets no grant, and the skip is logged. This is why a user in another sandbox mode must not wait for a repair that will never run.
+- **The folder it touches is the session's own working directory**, not "the writable root" in the abstract. No cwd means no action.
+- **What it adds:** exactly one `Allow` entry for the **current user's** SID with the single right `TakeOwnership` and no inheritance flags. The owner, the SACL and every existing ACE are left alone. It never widens to *Full control* or *Modify*.
+- **It is safe to let it run every session:** an existing `WRITE_OWNER` short-circuits with no write at all, and after adding the entry the script re-reads the ACL and reports a verification failure if the entry did not land.
+- **It is tried once per workspace per process** (keyed on the lowercased, trailing-slash-stripped working directory). A failed attempt is not retried by a later session in the same process — fix the cause, then restart the app.
+- **It never blocks the session:** the grant is fire-and-forget, so session creation is never held up. The consequence is the one edge case: a command queued in the very first moments can still hit `grantWrite` once before the entry lands.
+- **It can be turned off** with `autoGrantWriteOwner: false` — but only in the `workspace-acl` row's `config` inside `presets/multitask/composition.mjs`, not from the profile patch (the profile patch only rewrites the coordinator row).
+- **Outcome markers** you can grep: `MULTITASK-WORKSPACE-ACL-OK`, `-GRANTED`, `-SKIPPED reason=…`, `-FAILED reason=… dir=…`.
+- If it fails, the causes are **broader than "another owner or not writable"**: a timeout, a spawn failure, or the grant not landing all count, and each is reported. On machines where PowerShell itself is blocked (AppLocker / WDAC / Constrained Language Mode) the repair can never succeed — and that is the case where the fix really is your decision.
 
 ---
 
@@ -250,7 +367,7 @@ With the mode selected, have the coordinator try these:
 | "Delegate to a Subagent to run `git status` and report the conclusion." | ✅ the Subagent runs it and brings back only the conclusion |
 | "Delegate to a Subagent to read package.json and report the file name and size." | ✅ the read-only route always works (`read` / `file_info`) |
 
-With a log sink attached, the log shows which tools were actually withheld (all lines are prefixed `dsh-multitask:`). ⚠️ This deployment does **not** persist that channel (measured: the only occurrences left in session logs are source text echoed in conversation), so failing to grep it does **not** mean nothing was withheld — the judge is that calling those tools fails:
+With a log sink attached, the log shows which tools were actually withheld — grep for `dsh-multitask` **without** the trailing colon, because the informational "engaged / withheld N tools" lines use the plain `dsh-multitask:` prefix while the guard warnings carry their module name, e.g. `dsh-multitask/coordinator-guard:`, `dsh-multitask/minimal-guard:`, `dsh-multitask/subagent-mode:` or `dsh-multitask/worker-persona:`. Grepping for `dsh-multitask:` alone will **miss exactly the warnings that tell you a guard failed to engage**. ⚠️ This deployment does **not** persist that channel (measured: the only occurrences left in session logs are source text echoed in conversation), so failing to grep it does **not** mean nothing was withheld — the judge is that calling those tools fails:
 
 ```
 dsh-multitask: coordinator scope engaged — withheld N tool(s): edit, pwsh, read_image, ssh_exec, ...
@@ -311,11 +428,13 @@ The remaining switches live in the `config` of the corresponding rows in `preset
 | Row | Effect of disabling |
 |---|---|
 | `subagent-mode` | the PTC presentation is off, and `subagent_ptc` degrades to the same native surface as `subagent` |
-| `minimal-guard` | the read-only worker is **not narrowed at all** — it sees every tool the composition registers, including write-capable ones and anything other plugins add. There is no static layer behind it any more (DSH 0.2.1-rc.2 removed the delegation row's `toolFilter`), so this switch is a **security downgrade**, not a convenience |
+| `minimal-guard` | the read-only worker is **not narrowed at all** — it sees every tool the composition registers, including write-capable ones and anything other plugins add. There is no static layer behind it any more (DSH 0.2.1-rc.2 removed the delegation row's `toolFilter`), so this switch is a **security downgrade**, not a convenience. Because the worker guard deliberately skips the read-only worker, switching `minimal-guard` off also makes the five delegation tools visible to it again |
+| `worker-guard` | the five delegation tools are no longer removed from worker catalogs; only tokens are wasted, since the host's depth limit still refuses every call. It also accepts an additive `config.extraDeny` |
+| `interrupt-before-send` | corrections go back to queueing at the next step boundary instead of stopping the target's current turn |
 | `approval-gate` | dangerous operations no longer prompt (back to default DSH behaviour) |
 | `workspace-acl` | `WRITE_OWNER` is no longer granted automatically (or use `config.autoGrantWriteOwner: false`) |
 
-The environment variable `DSH_MULTITASK_MULTI_MODE=0` disables the `subagent_ptc` and `subagent_minimal` paths and the PTC presentation plugin in one step, without touching the original `subagent` / `subagent_fork`; it is read at module load, so it needs an app restart.
+The environment variable `DSH_MULTITASK_MULTI_MODE=0` removes the `subagent_ptc` and `subagent_minimal` delegation paths (and their two keep-list entries) in one step, without touching the original `subagent` / `subagent_fork`. It does **not** unmount the PTC presentation row: `subagent-mode` — the row that performs the collapse — is mounted unconditionally. Because no `multitask_ptc` worker then exists, the collapse has nothing to act on, so the practical effect is as if the presentation were off, but the row itself is still there. To turn the presentation off for real, disable the `subagent-mode` row. Only `0`, `false` and `off` disable the variable's switch — any other value, including a typo, leaves it enabled. It is read at module load, so it needs an app restart.
 
 ### The approval-gate row's switches
 
@@ -326,7 +445,7 @@ The profile patch cannot reach this row's `config` — the host half applies onl
 | `classify` | `true` | Master switch for Level 1 (the deterministic rule table). `false` = dangerous commands are no longer stopped to ask; the Level-2 relay still runs |
 | `relay` | `true` | Master switch for Level 2 (the relay). `false` = a Subagent's request no longer reaches the main conversation |
 | `relayRetryWindowMs` | `10000` | How long to wait for the parent session to open a turn when the turn was just closed (ms). `0` disables the retry (back to notice-only) |
-| `notifyOnRelayFailure` | `true` | The fallback notice when the relay fails. `false` turns it off (the retry still runs) |
+| `notifyOnRelayFailure` | `true` | The fallback notice when the relay fails. `false` turns it off: the relay still proceeds when the parent turn is **already open**, but when the turn is **closed** the notice is the only thing that can wake the parent session, so the retry cannot run and the request stays blocked until you answer in the child session |
 | `extraDangerPatterns` | `[]` | Extra danger patterns, each `{ id, re }` or a bare string / regex. It can only **add** a prompt, never remove one |
 | `safePatterns` | `[]` | Extra "match but do not ask" allow-patterns. ⚠️ This is a **prompt-suppressing** channel: a mistake silently lets a dangerous command through |
 | `shellTools` | `['pwsh', 'bash']` | Extra tool names whose command text should be classified (a wrong name does not error, it silently misses) |
@@ -343,7 +462,7 @@ The temp directory is the **scratch paper every process shares** — DSH itself 
 - **writing into** the temp directory (a `write` / `edit` whose `file_path` lands under an allowed root);
 - **deleting only inside** it (under the strict conditions below).
 
-The default roots are derived from `TEMP` / `TMP` / `TMPDIR` and `%LOCALAPPDATA%\Temp` (no `node:os` import — this package's preset modules are dependency-free), plus `/tmp`. Add your own cache directory by listing it in this array.
+The default roots are derived from `TEMP` / `TMP` / `TMPDIR` and `%LOCALAPPDATA%\Temp` (no `node:os` import — this package's preset modules are dependency-free), and `/tmp` is added on every platform. Setting this field **replaces** that whole list: if you list only your own cache directory, the platform temp directory is no longer exempt. To extend rather than replace, list the temp roots again together with your own. An empty array turns the exemption off entirely, so even the temp directory prompts.
 
 **The deletion exemption is deliberately strict** — four conditions, all required: no shell metacharacters (`,`, newline, and `;` `|` `&` `` ` `` `$` `>` `<`); at least one absolute path argument; **every** path argument under an allowed root; and no relative path arguments, with no `..` segment anywhere in a path. So:
 
@@ -382,13 +501,16 @@ dsh-multitask/
 ├── package.json                        # dsh.bundle.patch → inserts the host row on install; dsh.client → the browser half
 ├── cordis.patch.yml                    # inserts the plugin row into the profile roster
 ├── lib/
-│   ├── index.js                        # host half: declares the bundled preset with agentPresets
+│   ├── index.js                        # host half: declares the bundled preset with agentPresets and registers the two worker backends
+│   ├── worker-providers.js             # registers the two self-built worker backends multitask_ptc and multitask_minimal
 │   └── client.js                       # browser half: the Multitask settings page + two General rows
 ├── presets/multitask/
 │   ├── composition.mjs                 # the preset composition + coordinator persona + the four worker personas
 │   ├── coordinator-guard.mjs           # the shock absorber (including the mode-isolation ownership check)
 │   ├── subagent-mode.mjs               # PTC presentation: collapses a marked Subagent onto run_code
 │   ├── minimal-guard.mjs               # adaptive narrowing for the read-only worker
+│   ├── worker-guard.mjs                # removes the five delegation tools from a worker's catalog (it only saves tokens; the host's depth limit is the real block)
+│   ├── worker-persona.mjs              # routes a worker's provider name to its persona text (so each of the four kinds gets its own persona)
 │   ├── approval-gate.mjs               # the approval gate for dangerous operations
 │   ├── interrupt-before-send.mjs        # correction timing: interrupt the target's turn before relaying
 │   ├── preset-dispatch.mjs             # cross-mode dispatch: hands a brief to any installed agent preset
