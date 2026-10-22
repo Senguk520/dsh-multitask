@@ -1,6 +1,35 @@
-# dsh-multitask — Multitask 减震器模式
+<div align="center">
 
-[English](README.md) · [设计与实测记录](docs/DESIGN.md) · MIT License
+<img src="docs/image/title.png" alt="dsh-multitask" width="854">
+
+</div>
+
+# dsh-multitask
+
+<p align="center"><b>给 DeepSeek Harness 的「减震器模式」—— 主对话永远不碰你的代码库。</b></p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/dsh-multitask"><img src="https://img.shields.io/npm/v/dsh-multitask.svg" alt="npm 版本"></a>
+  <a href="https://www.npmjs.com/package/dsh-multitask"><img src="https://img.shields.io/npm/dm/dsh-multitask.svg" alt="npm 下载量"></a>
+  <img src="https://img.shields.io/badge/许可证-MIT-blue.svg" alt="许可证 MIT">
+  <img src="https://img.shields.io/badge/DSH-%3E%3D0.2.0--rc.1-6f42c1.svg" alt="DSH &gt;= 0.2.0-rc.1">
+  <img src="https://img.shields.io/badge/node-%3E%3D20-339933.svg" alt="Node &gt;= 20">
+  <img src="https://img.shields.io/badge/运行时依赖-0-brightgreen.svg" alt="零运行时依赖">
+  <a href="https://github.com/Senguk520/dsh-multitask/stargazers"><img src="https://img.shields.io/github/stars/Senguk520/dsh-multitask.svg" alt="GitHub Star"></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/DSH-插件-brightgreen.svg" alt="DSH 插件">
+  <img src="https://img.shields.io/badge/agent%20preset-multitask-blueviolet.svg" alt="agent preset: multitask">
+  <img src="https://img.shields.io/badge/语言-JavaScript-yellow.svg" alt="JavaScript">
+  <img src="https://img.shields.io/badge/平台-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg" alt="平台">
+  <img src="https://img.shields.io/badge/状态-稳定-brightgreen.svg" alt="状态 稳定">
+  <img src="https://img.shields.io/badge/MIT-许可证-blue.svg" alt="MIT">
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh.md">中文</a> · <a href="docs/DESIGN.md">设计与实测记录</a> · <a href="LICENSE">MIT 许可证</a>
+</p>
 
 一个装进 **DeepSeek Harness（DSH）** 的工作模式：**主对话只做三件事** —— 理解你的需求、把需求翻译成任务书下发给子代理、汇总子代理的结论。读文件、跑命令、构建、搜索、调试所产生的一切过程性数据，都在**子代理的上下文**里消化，永不进入主对话。主对话的上下文因此长期只留高价值信息。
 

@@ -1,6 +1,35 @@
-# dsh-multitask — the Multitask "shock absorber" mode
+<div align="center">
 
-[中文](README.zh.md) · [Design notes and measured evidence](docs/DESIGN.md) · MIT License
+<img src="docs/image/title.png" alt="dsh-multitask" width="854">
+
+</div>
+
+# dsh-multitask
+
+<p align="center"><b>The Multitask "shock absorber" mode for DeepSeek Harness — the main conversation never touches your codebase.</b></p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/dsh-multitask"><img src="https://img.shields.io/npm/v/dsh-multitask.svg" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/dsh-multitask"><img src="https://img.shields.io/npm/dm/dsh-multitask.svg" alt="npm downloads"></a>
+  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT">
+  <img src="https://img.shields.io/badge/DSH-%3E%3D0.2.0--rc.1-6f42c1.svg" alt="DSH &gt;= 0.2.0-rc.1">
+  <img src="https://img.shields.io/badge/node-%3E%3D20-339933.svg" alt="Node &gt;= 20">
+  <img src="https://img.shields.io/badge/dependencies-0-brightgreen.svg" alt="zero runtime dependencies">
+  <a href="https://github.com/Senguk520/dsh-multitask/stargazers"><img src="https://img.shields.io/github/stars/Senguk520/dsh-multitask.svg" alt="GitHub stars"></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/DSH-plugin-brightgreen.svg" alt="DSH plugin">
+  <img src="https://img.shields.io/badge/agent%20preset-multitask-blueviolet.svg" alt="agent preset: multitask">
+  <img src="https://img.shields.io/badge/language-JavaScript-yellow.svg" alt="JavaScript">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg" alt="platform">
+  <img src="https://img.shields.io/badge/status-stable-brightgreen.svg" alt="status: stable">
+  <img src="https://img.shields.io/badge/MIT-license-blue.svg" alt="MIT">
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh.md">中文</a> · <a href="docs/DESIGN.md">Design notes and measured evidence</a> · <a href="LICENSE">MIT License</a>
+</p>
 
 A work mode for **DeepSeek Harness（DSH）** in which **the main conversation does exactly three things**: understand what you asked for, turn it into task briefs, and report back what the Subagents concluded. Every piece of process data — file contents, command output, build logs, search results, dead ends — is digested inside a **Subagent's context** and never enters the main one. The main conversation therefore holds only high-value information.
 
