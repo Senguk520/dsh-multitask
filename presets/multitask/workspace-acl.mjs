@@ -228,6 +228,97 @@ function sandboxModeOf(ctx, session) {
 }
 
 /**
+ * 判断一个目录是否属于「**本模块绝不触碰**」的那一类，并给出原因。
+ *
+ * ── 为什么必须有这道护栏（真实事故，2026-10-21）────────────────────────────
+ *
+ * 本模块做的是一件**小**事（给工作区补一条 `WRITE_OWNER`），但它解锁的是一个**大**动作：
+ * 宿主 `AclSandbox.init()` 的 `grantWrite()` 原本在一个只授了 *Modify* 的目录上会以
+ * `Win32 5` 失败、**什么都写不进去**；本模块补齐 `WRITE_OWNER` 之后，那次调用就成功了，
+ * 于是宿主**一次写入三样东西**（`info = 20` 把 DACL 与 SACL 合成一次写）：
+ *
+ *   1. 能力 SID 的允许 ACE；
+ *   2. **`Everyone:(CI)(DENY)(DC)`** —— 拒删子项；
+ *   3. **`Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)`** —— 低完整性标签。
+ *
+ * 第 2 项会**向下继承到每一个子目录**，而且它是**显式 deny**：deny 先于 allow 求值，
+ * 所以连所有者的 `FullControl` 也压不住它。实测（本机）：
+ *
+ *     icacls "C:\Users\asus\.dsh\profiles\desktop"
+ *       Everyone:(CI)(DENY)(DC)
+ *       Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)
+ *
+ * 也就是说，**只要某个会话的 cwd 落在 DSH 自己的目录上**，本模块就会替宿主把这两样
+ * 打到 DSH 身上 —— 而这个目录里装着 `node_modules` 与 `cordis.patch.yml`。子目录被拒删
+ * 的直接后果就是「换包 / 清理失败」，表现正是普通权限起不来、管理员可以
+ * （管理员能夺所有权绕过 deny）。这条路径**在本机已被走到过**：实测有 5 个根会话
+ * 把 `C:\Users\asus\.dsh\profiles\desktop` 当作工作区。
+ *
+ * ⚠️ 归因要说准，别把责任推错方向：
+ *
+ *   · 上面那三样**不是本模块写的** —— 本模块只写一条 `TakeOwnership`，
+ *     且 `test/workspace-acl-rules.mjs` 的 W1/W2 静态钉住了「绝不含 FullControl /
+ *     Modify、绝不删 ACE、绝不改所有者、绝不动 SACL」；
+ *   · 但对 *Modify-only* 的目录，**本模块是那次写入能从失败变成成功的原因**；
+ *   · 对一个本来就有 *FullControl* 的目录（例如 `C:\Users\asus\.dsh\profiles\desktop`），
+ *     宿主自己就能写成功，本模块的 `Test-WriteOwner` 会判 `HAS-WRITE-OWNER` 并**不改动
+ *     任何东西** —— 所以那处痕迹是宿主独立留下的。
+ *
+ * 结论：这是**本模块缺少「哪些目录不该碰」这道判断**的缺陷。授权本身是加法的、
+ * 无害的；真正危险的是它为宿主那次三合一写入开了门，而门后是 DSH 自己。
+ *
+ * ── 判据为什么是这四条 ───────────────────────────────────────────────────────
+ *
+ * 全都指向同一件事：**这个目录一旦被沙箱盖章，坏的是「能不能启动 / 能不能更新」**，
+ * 而不是「某个 worker 能不能写文件」。所以宁可跳过（退回「shell 起不来」的旧状态，
+ * 那是可解释、可绕过的），也绝不在这些位置动手。
+ *
+ * @param dir - 候选工作区目录（会话 cwd）。
+ * @returns 敏感路径的原因标识；不敏感时返回 undefined。
+ */
+export function sensitiveReasonFor(dir) {
+  if (typeof dir !== 'string' || dir.trim() === '') return 'empty-path'
+  const normalized = dir.replace(/[\\/]+$/, '')
+  if (normalized === '') return 'empty-path'
+  const lower = normalized.toLowerCase()
+
+  // ① 盘符根。`H:\` 只授 `Authenticated Users:(M)`，正是需要 WRITE_OWNER 的那种目录 ——
+  //    也正因如此它最危险：盖章会继承到整块盘。
+  if (/^[a-z]:$/.test(lower)) return 'drive-root'
+
+  // ② 目录里装着**正在运行的程序本身** → 这是安装目录。
+  //    用「cwd 是不是 execPath 的祖先」来判定，不必知道安装路径长什么样：
+  //    execPath 形如 `G:\DSH\resources\runtime\...\node.exe`，于是 `G:\DSH` 会被判出。
+  const exec = process.execPath
+  if (typeof exec === 'string' && exec !== '') {
+    const execLower = exec.toLowerCase()
+    if (execLower.startsWith(lower + '\\') || execLower.startsWith(lower + '/')) return 'contains-running-app'
+  }
+
+  // ③ DSH 的状态目录（`~/.dsh`，含 profiles 与 sessions）以及它的**祖先**
+  //    （`C:\Users\asus`、`C:\Users`、`C:\` …）。祖先一并挡掉：给祖先打低完整性标签
+  //    等于把范围放大到整个用户目录。
+  const home = typeof process.env.USERPROFILE === 'string' ? process.env.USERPROFILE : ''
+  if (home !== '') {
+    const homeLower = home.toLowerCase().replace(/[\\/]+$/, '')
+    const stateLower = homeLower + '\\.dsh'
+    if (lower === stateLower || lower.startsWith(stateLower + '\\')) return 'dsh-state-dir'
+    if (homeLower === lower || homeLower.startsWith(lower + '\\')) return 'ancestor-of-dsh-state'
+  }
+
+  // ④ 系统目录。
+  for (const name of ['SystemRoot', 'windir', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramData']) {
+    const value = process.env[name]
+    if (typeof value !== 'string' || value === '') continue
+    const sysLower = value.toLowerCase().replace(/[\\/]+$/, '')
+    if (lower === sysLower || lower.startsWith(sysLower + '\\')) return 'system-dir'
+  }
+
+  return undefined
+}
+
+
+/**
  * 跑一次性 PowerShell，返回 `{ stdout, exitCode, timedOut }`。**本模块唯一的副作用出口。**
  *
  * 动态 import 是刻意的：保持本模块的静态导入面为空（仓库既有的
@@ -384,6 +475,28 @@ export function apply(ctx, config) {
         try {
           ctx.logger?.info?.(
             `dsh-multitask: MULTITASK-WORKSPACE-ACL-SKIPPED reason=sandbox-mode-${String(mode ?? 'unreadable')} dir=${JSON.stringify(cwd)}`,
+          )
+        } catch {
+          // 同上。
+        }
+        return
+      }
+
+      // ── 护栏：DSH 自己的目录、它的祖先、盘符根、安装目录、系统目录一律不碰 ──
+      //
+      // ⚠️ 这一条是 2026-10-21 事故的直接修复，别删。理由见 `sensitiveReasonFor()`
+      // 的注释：本模块只写一条无害的 `TakeOwnership`，但它会让宿主那次**三合一**写入
+      // （能力 ACE + `Everyone:DENY(DC)` + Low 完整性标签）从「失败」变成「成功」。
+      // 打在 DSH 自己的目录上，后果是普通权限起不来、只有管理员能进。
+      //
+      // 方向必须是「跳过」而不是「照做但告警」：跳过最坏退回「shell 起不来」
+      // —— 那是可解释、可绕过的旧状态；照做的代价是 DSH 装不回来。
+      const sensitive = sensitiveReasonFor(cwd)
+      if (sensitive !== undefined) {
+        try {
+          ctx.logger?.info?.(
+            `dsh-multitask: MULTITASK-WORKSPACE-ACL-SKIPPED reason=sensitive-path-${sensitive} dir=${JSON.stringify(cwd)}` +
+              ' — this directory holds DSH itself or its state; granting WRITE_OWNER here would let the sandbox stamp it',
           )
         } catch {
           // 同上。

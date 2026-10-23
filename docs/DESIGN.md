@@ -1916,6 +1916,72 @@ DSH 的 ACL 沙箱给工作区授权时，**一次**调用同时写三样东西�
 **仍然失败时**，只有两种可能：目录**属于别的账户**，或它在当前进程**不可写** ——
 此时那条 `WRITE_OWNER` 根本不会出现（`icacls <目录>` 里看不到 `(WO`）。
 
+### ⚠️ 护栏：DSH 自己的目录绝不能被盖章（2026-10-21 事故）
+
+这一节记的是一次真实事故，以及它暴露出的**设计缺陷**。它比上面任何一段都重要，
+因为它的后果是「DSH 起不来」，而不是「某个 worker 干活失败」。
+
+**事故现象：** 装好插件后能正常运行；后来主机断电重连，DSH **用普通权限进不去**，
+只有以管理员身份才能启动。清理花了两个小时。
+
+**机理（逐条有据）：**
+
+本模块做的是**小**事 —— 给工作区补一条 `TakeOwnership`。但它解锁的是**大**动作：
+宿主 `AclSandbox.init()` 的 `grantWrite()` 原本在只授 *Modify* 的目录上会以 `Win32 5`
+失败、**什么都写不进去**；本模块补齐 `WRITE_OWNER` 后，那次调用就成功了，于是宿主
+**一次写入三样东西**（`info = 20` 把 DACL 与 SACL 合成一次写）：
+
+1. 能力 SID 的允许 ACE；
+2. **`Everyone:(CI)(DENY)(DC)`** —— 拒删子项，且**向下继承到每一个子目录**；
+3. **`Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)`** —— 低完整性标签。
+
+第 2 项是关键：它是**显式 deny**，而 deny 先于 allow 求值 —— **连所有者的 `FullControl`
+也压不住它**。子目录被拒删，换包 / 清理 / 更新就会失败，表现正是「普通权限起不来、
+管理员可以」（管理员能夺所有权绕过 deny）。
+
+**这条路径在本机已经被走到过。** 实测有 **5 个根会话**把
+`C:\Users\asus\.dsh\profiles\desktop` 当作工作区，而那个目录现在带着：
+
+```
+icacls "C:\Users\asus\.dsh\profiles\desktop"
+  Everyone:(CI)(DENY)(DC)
+  S-1-4-215111706-563640003:(OI)(CI)(W,D,DC)
+  Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)
+```
+
+而且两样东西**已经继承进了** `node_modules` 与 `cordis.patch.yml`。
+
+**归因要说准，别把责任推错方向：**
+
+- 上面那三样**不是本模块写的** —— 本模块只写一条 `TakeOwnership`，
+  且 W1/W2 静态钉住了「绝不含 FullControl / Modify、绝不删 ACE、绝不改所有者、绝不动 SACL」；
+- 但对 *Modify-only* 的目录，**本模块正是那次写入能从失败变成成功的原因**；
+- 对一个本来就有 *FullControl* 的目录（`C:\Users\asus\.dsh\profiles\desktop` 就是），
+  宿主自己就能写成功，本模块会判 `HAS-WRITE-OWNER` 并**不改动任何东西** ——
+  所以那处痕迹是宿主独立留下的。
+
+结论：**本模块缺少「哪些目录不该碰」这道判断。** 授权本身是加法的、无害的；
+危险的是它为宿主那次三合一写入开了门，而门后是 DSH 自己。
+
+**修法：`sensitiveReasonFor()` 护栏。** 命中下列任一条就**跳过**（不是「照做但告警」——
+跳过最坏退回「shell 起不来」，那是可解释、可绕过的旧状态；照做的代价是 DSH 装不回来）：
+
+| 原因标识 | 判据 | 为什么 |
+|---|---|---|
+| `drive-root` | `H:\` / `C:\` | 盖章会继承到整块盘 |
+| `contains-running-app` | cwd 是 `process.execPath` 的祖先 | 那是安装目录，里面有正在运行的程序 |
+| `dsh-state-dir` | `~/.dsh` 及其子目录 | 里面是 profiles / node_modules / sessions |
+| `ancestor-of-dsh-state` | `C:\Users\asus`、`C:\Users` … | 给祖先盖章等于把范围放大到整个用户目录 |
+| `system-dir` | `%SystemRoot%` / `%ProgramFiles%` / `%ProgramData%` | 系统目录 |
+
+`W15`/`W16`/`W18` 钉住它，`workspace-acl-guard-mutation.mjs` 变异验证 **5/5**。
+
+> **一个容易看漏的教训：** `W18`（「敏感目录上连一次子进程都不许启动」）第一版只等
+> 300ms 就断言「没有授权日志」。而 `ensureWriteOwner` 是 fire-and-forget，真实
+> powershell 往返要几百毫秒到数秒 —— 于是「把护栏改成告警但仍照做」那种变异**假通过了**。
+> 等满 4000ms 之后它才稳定变红。**断言「某事没有发生」时，等待时间必须覆盖它本该发生的时长**，
+> 否则测的是时序运气，不是行为。
+
 **协调者与 worker 应当怎么做。** 三条人格里已写明（`composition.mjs` 的
 `COORDINATOR_PERSONA` / `WORKER_PERSONA` / `FORK_PERSONA`）：认出它、**别在循环里重试**、
 **别自己去跑任何权限命令**、也**绝不把目录放宽到 Full control**；若仍被拒，
