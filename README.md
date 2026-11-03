@@ -373,15 +373,37 @@ If a Subagent is still refused, the automatic grant did not land: the folder is 
 ### When the automatic permission repair runs
 
 - **It is Windows-only.** On macOS and Linux the module is completely inert and registers nothing.
-- **It only runs for a root (non-delegated) session whose resolved sandbox mode is `workspace-write`.** A `read-only` or `danger-full-access` session gets no grant, and the skip is logged. This is why a user in another sandbox mode must not wait for a repair that will never run.
+- **It runs for any session whose resolved sandbox mode is `workspace-write`, delegated Subagents included.** A `read-only` or `danger-full-access` session gets no grant, and the skip is logged.
+  > Earlier it only handled root sessions, on the grounds that Subagents share the parent's cwd. But when the parent is not yet in Multitask at creation time (it is switched in before the first turn, or the worker comes from cross-mode dispatch), the parent's one chance is already gone and every worker was skipped — so nobody granted anything. The criterion is now "has this cwd been handled": a parent that already granted costs one set lookup, and a parent that missed is covered by the first worker that appears. Switching the preset in before the first turn also triggers a check.
 - **The folder it touches is the session's own working directory**, not "the writable root" in the abstract. No cwd means no action.
-- **What it adds:** exactly one `Allow` entry for the **current user's** SID with the single right `TakeOwnership` and no inheritance flags. The owner, the SACL and every existing ACE are left alone. It never widens to *Full control* or *Modify*.
+- **What it adds:** exactly one `Allow` entry for the **current user's** SID with the single right `TakeOwnership` and no inheritance flags. The owner, the SACL and every existing ACE are left alone. It never widens to *Full control* or *Modify*. This describes the **root directory** step; the inheritance and label pass over existing subdirectories is the second step, described in the next subsection.
 - **It is safe to let it run every session:** an existing `WRITE_OWNER` short-circuits with no write at all, and after adding the entry the script re-reads the ACL and reports a verification failure if the entry did not land.
 - **It is tried once per workspace per process** (keyed on the lowercased, trailing-slash-stripped working directory). A failed attempt is not retried by a later session in the same process — fix the cause, then restart the app.
 - **It never blocks the session:** the grant is fire-and-forget, so session creation is never held up. The consequence is the one edge case: a command queued in the very first moments can still hit `grantWrite` once before the entry lands.
 - **It can be turned off** with `autoGrantWriteOwner: false` — but only in the `workspace-acl` row's `config` inside `presets/multitask/composition.mjs`, not from the profile patch (the profile patch only rewrites the coordinator row).
 - **Outcome markers** you can grep: `MULTITASK-WORKSPACE-ACL-OK`, `-GRANTED`, `-SKIPPED reason=…`, `-FAILED reason=… dir=…`.
 - If it fails, the causes are **broader than "another owner or not writable"**: a timeout, a spawn failure, or the grant not landing all count, and each is reported. On machines where PowerShell itself is blocked (AppLocker / WDAC / Constrained Language Mode) the repair can never succeed — and that is the case where the fix really is your decision.
+
+#### Existing subdirectories are not stamped retroactively: that needs a second pass
+
+The host's three entries **inherit only at creation time** and are never propagated back into subdirectories that already exist. A workspace carried over from an older version therefore stays **half-done** for a long time: the root has all three, while the existing `.git` / `docs` / `lib` / `presets` / `test` have none of them; only directories created after the root was fixed are complete. That is exactly what was measured — the root complete, those seven older directories with none, a newly created `research` complete.
+
+**The symptom differs from the one above — do not confuse them.** Once the root has `WRITE_OWNER` the session itself starts, but the sandbox shell runs at **Low integrity with a restricted token** (the restricting list holds only the logon SID / `Everyone` / the capability SID / the temp-directory SID, and **not `Authenticated Users`**), so creating a file inside an unstamped existing directory is refused. The canonical one-liner is:
+
+```
+fatal: Unable to create '.../.git/index.lock': Permission denied
+```
+
+usually followed by `[sandbox: file access denied under workspace-write mode]`. **The approval card has nothing to do with it** — approval only decides whether to ask, it does not permit stepping outside the sandbox, and approving once does not make that write land.
+
+**The repair is automatic again, and it runs serially right after the previous step:** once the root's `WRITE_OWNER` is in place, the same module runs three `icacls` actions over the existing objects (the path still comes only from an environment variable, never spliced into the script): first grant the current user `(WO)` on the whole tree (writing the integrity label needs `WRITE_OWNER` on the object), then `/inheritance:e` so existing objects re-inherit the parent's inheritable entries (that is where the capability ACE comes from — **the capability SID is never hardcoded**), and finally `/setintegritylevel` to write the same Low label the host uses. The order cannot be reversed: without `(WO)`, neither of the last two can be written.
+
+- **A read-only screen comes first:** it reads `icacls` for each **direct** subdirectory, and if all of them already carry a `Mandatory Label` it prints `SUB-OK` and returns, **without a single write**. After the first repair a session only pays for those few read-only calls.
+- **It can be switched off on its own** with `config.autoRepairStampedChildren: false`, **independent of** `autoGrantWriteOwner` (one covers the root, the other the existing objects).
+- **The cost, stated plainly:** the first run on an old workspace walks the whole tree and adds one `(WO,S)` ACE to every existing object; a big tree (`node_modules`) is noticeably slower the first time and short-circuits afterwards thanks to the screen above. The default limit is `120` seconds.
+- **A failure is fail-open:** it is logged, never thrown, and never allowed to block the session — the worst case is the behaviour you have today (subdirectories still refused).
+- **Outcome markers** you can grep: `MULTITASK-WORKSPACE-ACL-SUB-OK`, `-SUB-REPAIRED`, `-SUB-SKIPPED`, `-SUB-FAILED`.
+- **It does not invent policy:** the capability SID arrives by inheriting the one on the root, and `Everyone:(CI)(DENY)(DC)` is inherited along with it — which is exactly what the host does for a **new** workspace, not a new rule added by this plugin.
 
 ---
 
@@ -461,7 +483,7 @@ The remaining switches live in the `config` of the corresponding rows in `preset
 | `worker-guard` | the five delegation tools are no longer removed from worker catalogs; only tokens are wasted, since the host's depth limit still refuses every call. It also accepts an additive `config.extraDeny` |
 | `interrupt-before-send` | corrections go back to queueing at the next step boundary instead of stopping the target's current turn |
 | `approval-gate` | dangerous operations no longer prompt (back to default DSH behaviour) |
-| `workspace-acl` | `WRITE_OWNER` is no longer granted automatically (or use `config.autoGrantWriteOwner: false`) |
+| `workspace-acl` | `WRITE_OWNER` is no longer granted automatically, and existing subdirectories are no longer stamped (or use `config.autoGrantWriteOwner: false` / `config.autoRepairStampedChildren: false` to switch off one half at a time) |
 
 The environment variable `DSH_MULTITASK_MULTI_MODE=0` removes the `subagent_ptc` and `subagent_minimal` delegation paths (and their two keep-list entries) in one step, without touching the original `subagent` / `subagent_fork`. It does **not** unmount the PTC presentation row: `subagent-mode` — the row that performs the collapse — is mounted unconditionally. Because no `multitask_ptc` worker then exists, the collapse has nothing to act on, so the practical effect is as if the presentation were off, but the row itself is still there. To turn the presentation off for real, disable the `subagent-mode` row. Only `0`, `false` and `off` disable the variable's switch — any other value, including a typo, leaves it enabled. It is read at module load, so it needs an app restart.
 
@@ -543,7 +565,7 @@ dsh-multitask/
 │   ├── approval-gate.mjs               # the approval gate for dangerous operations
 │   ├── interrupt-before-send.mjs        # correction timing: interrupt the target's turn before relaying
 │   ├── preset-dispatch.mjs             # cross-mode dispatch: hands a brief to any installed agent preset
-│   ├── workspace-acl.mjs               # workspace ACL: grants WRITE_OWNER (the only module that changes system state)
+│   ├── workspace-acl.mjs               # workspace ACL: grants WRITE_OWNER and stamps existing subdirectories (the only module that changes system state, in two writes)
 │   └── file-info.mjs                   # the read-only metadata tool file_info
 ├── docs/
 │   ├── DESIGN.md                       # design reasoning, upstream evidence, known boundaries

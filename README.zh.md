@@ -373,15 +373,37 @@ Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(<工作区路径>)
 ### 自动补权限什么时候会跑
 
 - **只在 Windows 上跑。** macOS 与 Linux 上这个模块整段不动作，也不注册任何东西。
-- **只对根会话（非委派）且解析出的沙箱模式是 `workspace-write` 的会话跑。** `read-only` 或 `danger-full-access` 的会话不会补授权，跳过这件事本身会记一行日志。所以处在别的沙箱模式里的用户不要等一次永远不会发生的修复。
+- **对解析出的沙箱模式是 `workspace-write` 的会话跑，包括委派子代理。** `read-only` 或 `danger-full-access` 的会话不会补授权，跳过这件事本身会记一行日志。
+  > 早先这里只处理根会话，理由是会与子代理共享 cwd。但「父会话创建时还不是 Multitask、首轮前才切进来」的场景里（以及跨模式派发），父会话那一次已经错过了，而子代理又被主动跳过 —— 结果谁都不补。现在判据改成「这个 cwd 处理过没有」：父会话补过就只查一次去重表，没补过则由第一个出现的 worker 补上。首轮前切换 preset 也会触发一次检查。
 - **它动的那个目录就是会话自己的工作目录**，不是抽象的「可写根」。没有 cwd 就没有动作。
-- **它加的是什么**：**当前用户** SID 的一条 `Allow` 条目，权限只有 `TakeOwnership` 一项，不带任何继承标志。所有者、SACL 以及每一条既有 ACE 都不动。它**绝不会**放宽到 *Full control* 或 *Modify*。
+- **它加的是什么**：**当前用户** SID 的一条 `Allow` 条目，权限只有 `TakeOwnership` 一项，不带任何继承标志。所有者、SACL 以及每一条既有 ACE 都不动。它**绝不会**放宽到 *Full control* 或 *Modify*。这里说的是**根目录**那一步；既存子目录的继承与标签补齐是紧接着的第二步，见下一个小节。
 - **让它每个会话都跑是安全的**：已经有 `WRITE_OWNER` 就短路，一次写入都不做；补完之后脚本会复读 ACL，条目没落地就如实报验证失败。
 - **每个进程里每个工作区只尝试一次**（键是小写化、去掉尾部斜杠的工作目录）。失败过的那次不会被同一进程里的后续会话重试 —— 先修掉原因，再重启应用。
 - **它从不阻塞会话**：授权是 fire-and-forget 的，会话创建永远不会被它拖住。代价就是那个边角情况：在最开始那几毫秒里排队的命令，仍有可能先撞上一次 `grantWrite`。
 - **可以关掉它**：`autoGrantWriteOwner: false` —— 但只能写在 `presets/multitask/composition.mjs` 里 `workspace-acl` 那一行的 `config` 内，profile patch 够不到（profile patch 只重写协调者那一行）。
 - **可以 grep 的结果标记**：`MULTITASK-WORKSPACE-ACL-OK`、`-GRANTED`、`-SKIPPED reason=…`、`-FAILED reason=… dir=…`。
 - 它失败时，原因**不止「所有者是别人 / 不可写」**：超时、spawn 起不来、授权没落地都算，而且每一种都会写进日志。在 PowerShell 本身被禁用的机器上（AppLocker / WDAC / 约束语言模式），这个修复永远不可能成功 —— 那种情况才是真正需要你拍板的。
+
+#### 既存子目录不会被自动补上：那段路要单独走一遍
+
+宿主那三样授权**只在对象创建时继承**，从不向既有子目录回溯。于是一个从旧版本沿用的工作区会长期处在**半残**状态：根上三项齐全，而既存的 `.git` / `docs` / `lib` / `presets` / `test` 一条都没有；只有根修好之后新建的子目录才齐全。实测到的正是这个样子 —— 根三样齐全，七个旧目录零项，而新建的 `research` 齐全。
+
+**症状与上一条不同，别混。** 根上有 `WRITE_OWNER` 之后会话本身能起来，但沙箱 shell 跑在 **Low 完整性 + 受限令牌**下（restricting 列表只有 logon SID / `Everyone` / 能力 SID / 临时目录 SID，**不含 `Authenticated Users`**），往没盖章的既存目录里建文件会被拒，最典型的一条是：
+
+```
+fatal: Unable to create '.../.git/index.lock': Permission denied
+```
+
+后面通常还跟着 `[sandbox: file access denied under workspace-write mode]`。**审批卡与它无关** —— 审批只决定「要不要问人」，不代表允许越出沙箱，批准一次也不会让那条写入落地。
+
+**修复同样自动，且紧随上一步串行发生**：给根补完 `WRITE_OWNER` 之后，同一个模块再对既存对象走三条 `icacls`（路径仍然只从环境变量读，绝不拼进脚本）：先给整棵树加当前用户的 `(WO)`（写完整性标签需要对象上的 `WRITE_OWNER`），再用 `/inheritance:e` 让既有对象重新继承父目录的可继承条目（能力 ACE 由此获得，**不硬编码能力 SID**），最后用 `/setintegritylevel` 补上与宿主一致的 Low 标签。顺序不可反：没有 `(WO)`，后两条都写不进去。
+
+- **先只读快筛，再动手**：逐个**直接**子目录读一次 `icacls`，全都带 `Mandatory Label` 就打印 `SUB-OK` 早退，**一次写入都不做**。修好之后，每个会话只付这几次只读调用。
+- **可以单独关掉这一段**：`config.autoRepairStampedChildren: false`，与 `autoGrantWriteOwner` **相互独立**（一个管根、一个管既存对象）。
+- **代价（如实说）**：老工作区第一次会遍历整棵树，给既存对象各加一条 `(WO,S)` ACE；带 `node_modules` 的大树第一次会明显变慢，之后靠上面那条快筛短路。默认上限 `120` 秒。
+- **失败是 fail-open 的**：只记日志，绝不抛、绝不阻塞会话 —— 最坏退回「子目录继续被拒」这个今天的行为。
+- **可以 grep 的结果标记**：`MULTITASK-WORKSPACE-ACL-SUB-OK`、`-SUB-REPAIRED`、`-SUB-SKIPPED`、`-SUB-FAILED`。
+- **它不发明策略**：能力 SID 靠继承根上那一份获得，`Everyone:(CI)(DENY)(DC)` 也一并继承下来 —— 这与宿主对**新**工作区的行为完全一致，不是本插件新增的规则。
 
 ---
 
@@ -479,7 +501,7 @@ worker 把前提不成立指出来，而不是绕过去硬做。
 | `worker-guard` | 五个委派工具不再从 worker 的工具目录里被摘掉；损失的只是 token，因为宿主的深度限制仍然会拒绝每一次这类调用。该行还接受可加的 `config.extraDeny` |
 | `interrupt-before-send` | 纠错退回「排到下一个步骤边界」，而不是停掉目标当前这一轮 |
 | `approval-gate` | 危险操作不再弹窗（回到 DSH 默认行为） |
-| `workspace-acl` | 不再自动补 `WRITE_OWNER`（也可用 `config.autoGrantWriteOwner: false`） |
+| `workspace-acl` | 不再自动补 `WRITE_OWNER`，也不再给既存子目录补齐盖章（也可分别用 `config.autoGrantWriteOwner: false` / `config.autoRepairStampedChildren: false` 单独关掉其中一段） |
 
 环境变量 `DSH_MULTITASK_MULTI_MODE=0` 一次摘掉 `subagent_ptc` / `subagent_minimal` 两条委派路径（以及它们在保留集里的两项），不影响原有的 `subagent` / `subagent_fork`。它**不会**卸下 PTC 呈现那一行：真正执行塌缩的 `subagent-mode` 是无条件挂载的。只是没有 `multitask_ptc` worker 之后，塌缩没有作用对象，所以实际效果等同于呈现停用，但那一行仍然在。想把呈现真正关掉，就停用 `subagent-mode` 那一行。这个变量的关闭值只有 `0`、`false`、`off` 三个 —— 其他任何值（包括拼错）都视为启用。它在模块加载时读取，需要重启应用。
 
@@ -561,7 +583,7 @@ dsh-multitask/
 │   ├── approval-gate.mjs               # 审批闸门：危险操作弹窗
 │   ├── interrupt-before-send.mjs        # 纠错时序：拦 send_message，先停当前轮次再发送
 │   ├── preset-dispatch.mjs             # 跨模式派发：把任务书投给任意已安装的模式
-│   ├── workspace-acl.mjs               # 工作区 ACL：补 WRITE_OWNER（唯一改系统状态的模块）
+│   ├── workspace-acl.mjs               # 工作区 ACL：补 WRITE_OWNER + 给既存子目录补齐盖章（唯一改系统状态的模块，共两段写入）
 │   └── file-info.mjs                   # 只读元数据工具 file_info
 ├── docs/
 │   ├── DESIGN.md                       # 设计推导、上游依据、已知边界

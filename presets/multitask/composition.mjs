@@ -206,6 +206,13 @@ Do not collapse this into one habitual path. A coordinator that sends everything
 
 These are defaults for picking the best fit, and the judgement of which one a given task belongs to stays yours — but "which one does this task actually suit" is a question to answer each time, not a habit to fall back on.
 
+When the team tools are in your catalog (\`spawn_teammate\`, \`wait_agent\`, \`team_task_*\` and the team build of \`send_message\`), the same choice also decides how long that work stays addressable — so pick by lifetime as well as by surface:
+
+- **Work you will come back to belongs to a NAMED member.** Start it with \`spawn_teammate\` and keep addressing that member in later turns. The reason is mechanical, not stylistic: with the team tools installed, \`send_message\` reaches named teammates only and no longer reaches an ordinary subagent, so a \`subagent\` started this turn is one you cannot correct or extend in the next. One-off, short-lived work keeps its four paths: \`subagent\`, \`subagent_ptc\`, \`subagent_minimal\`, and \`subagent_fork\` for "continue what we were doing".
+- **A member gets the same self-contained brief as any other worker.** A member does not see this conversation either, so goal, verified state, conventions, safety rails, numbered tasks, conditional branches, stop conditions and the report format all belong in the brief, exactly as they do for the four paths above. "It can message me" is not a substitute for a step you left out.
+- **Reach for \`wait_agent\` only when there is nothing else to advance.** It does report the next teammate state change, message or task-board update — but with no active teammate it returns \`noProgress\` immediately instead of blocking, so it is not a polling primitive, and a loop around it spends turns and produces nothing. If another brief, a verification or the report is available, do that first and let the members run.
+- **State the file scope a member may change.** Name the files or directories in the brief. Treat that scope as advisory, not as a lock: overlapping write scopes are recorded and warned about, but nothing enforces them, so the only thing keeping two members off the same file is what you wrote down.
+
 ## Dispatching to another installed mode
 
 The four paths above are this mode's OWN workers. All four run **under this mode's own preset**: the host composes a child from its parent's preset, so a \`subagent\` you start is a Multitask worker with a full tool surface — it is NOT a \`standard\`-mode worker, and no instruction in a brief can change that. It is a structural property of how delegation composes, not a setting you can pass.
@@ -1643,8 +1650,9 @@ export function buildPlugins(options) {
 
     // ── ★ 工作区 ACL：让子代理的 shell 在新工作区里开箱即用 ──────────────────
     //
-    // 只做一件事：会话开始时，检查该会话的工作区目录是否具备 DSH ACL 沙箱所需的
-    // `WRITE_OWNER`；缺了就**只补这一项**（非继承的 `TakeOwnership`），然后停止。
+    // 只做两件事：① 会话开始时，检查该会话的工作区目录是否具备 DSH ACL 沙箱所需的
+    // `WRITE_OWNER`；缺了就**只补这一项**（非继承的 `TakeOwnership`）。② 之后串行
+    // 一次，把**既存**子目录的继承条目与 Low 标签补齐（见下）。
     //
     // ── 为什么需要它（以及为什么它必须在这里，而不是靠用户手工修）─────────────
     //
@@ -1670,6 +1678,20 @@ export function buildPlugins(options) {
     //  本模块刻意比它克制。）而且 `WRITE_OWNER` 是**所有者给自己的** ——
     // 目录所有者本来就能随时夺回所有权，所以这条 ACE 不扩大任何人的实际权力。
     //
+    // ── 既存子目录：宿主不会回溯盖章，所以要补一次（2026-11-03）─────────────
+    //
+    // 三样授权只在**对象创建时**继承。实测本仓库：根三项齐全，而 `.git` / `docs` /
+    // `lib` 等既存目录一条都没有 —— 沙箱里 `git add` 报
+    // `Unable to create '.git/index.lock': Permission denied`，于是「老用户的工作区」
+    // 根修好了、子目录继续坏。所以补完根的 `WRITE_OWNER` 之后，再**串行**做一次整树
+    // 补齐：`/grant *<当前用户 SID>:(WO) /T` → `/inheritance:e /T` →
+    // `/setintegritylevel (OI)(CI)Low /T`。这是**镜像**根上宿主既有的条目，不是插件
+    // 自己发明策略：能力 SID 不硬编码，靠继承拿到。
+    //
+    // 写之前先快筛：直接子目录都已带 `Mandatory Label` 时一次写入都不做。代价是一次
+    // 整树 `/T`（大仓库秒级到十几秒，超时 120s）。可关：
+    // `config.autoRepairStampedChildren: false`（与 `autoGrantWriteOwner` 独立）。
+    //
     // ── 与其余守卫的关系 ─────────────────────────────────────────────────────
     //
     // 它只碰**工作区目录的 ACL**，与工具面 / 呈现模式 / 审批策略无关，所以单开一行。
@@ -1680,7 +1702,13 @@ export function buildPlugins(options) {
     {
       id: 'workspace-acl',
       name: local('./workspace-acl.mjs'),
-      config: { enabled: true },
+      config: {
+        enabled: true,
+        // 「切进本模式」那条广播判据用的 id。必须与 `definition.id` 同源 ——
+        // 漂移会让「首轮前切换 preset」这条路径重新漏掉补授权，且只在日志里留一句
+        // SKIPPED，外在表现仍是「子代理的 shell 起不来」。
+        presetId: PRESET_ID,
+      },
     },
   ]
 }
