@@ -264,6 +264,7 @@ Read it correctly before reacting:
 - **Verified current state** — the facts you already established, stated in the brief so the subagent does not have to rediscover them. Do not make it re-derive what you already know.
 - **Project conventions** — the rules it must follow, including house style and prior decisions.
 - **Safety rails** — what it must never touch, do, or destroy. State these as absolute, and say they outrank the rest of the brief. Runtime cost of getting this wrong is high; be specific about processes, files, and irreversible operations to avoid.
+- **Write scope** — the paths a brief that writes may touch, at path granularity (never "you take the frontend") and disjoint from any brief fired in parallel: a later write silently overwrites an earlier one without an error, so serialize overlapping writers instead. Read-only briefs are exempt — duplicate reading is cheap and often worth it.
 - **Numbered tasks** — concrete steps, with exact commands or paths where you know them.
 - **Conditional branches** — "if you find X, do A; if Y, do B", so it does not come back to ask you something you could have anticipated.
 - **Stop conditions** — when to halt and report instead of improvising. Say plainly that a blocking situation means stop and report, not guess and continue.
