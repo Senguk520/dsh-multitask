@@ -46,6 +46,12 @@
  *
  * 这与同生态里的 `dsh-liangshen` preset 的 `tool-catalog.mjs` 是同一个手法。
  *
+ * ⚠️ 但「可见」不等于「可摘」：`restrict()` 只认 `restrictableNames`（继承面），
+ * 而注册在该 agent **自己 scope** 上的名字（own 层：团队工具的 `spawn_teammate` /
+ * `team_task_*` 等）只进可见集。这类名字一旦写进 deny，`restrict()` 会抛错并让
+ * **整条收窄失效**（fail open）—— 所以下发前必须再用 `restrictableNames` 过一遍，
+ * 把摘不掉的扣下来（见 `sync()`）。
+ *
  * ── 时机为什么必须在组装瀑布之外 ────────────────────────────────────────────
  *
  * `SystemPrompt.assemble()` 会**先**收集工具提供方并渲染各 section 的文本，
@@ -267,6 +273,37 @@ function visibleToolNames(ctx, agent) {
   return []
 }
 
+/**
+ * 读该 scope 里**可以被 restrict 的**工具名集合。
+ *
+ * ⚠️ 这个名字集合与「可见集」不是一回事：`dsh-tools` 的 `view()` 只把**继承面**
+ * 的名字放进 `restrictableNames`，而注册在该 agent **自己 scope** 上的名字只进
+ * `visible` —— 写进 deny 会抛 `unknown global tool`。
+ *
+ * 读不到（该方法不存在或抛错）时返回 `undefined`，调用方据此**退回不看这个约束**
+ * （而不是当作空集，那会把所有名字都判成不可 restrict，等于什么都不摘）。
+ *
+ * ⚠️ 本函数与 `worker-guard.mjs` 里的同名实现**必须逐字一致**，改一处必须改另一处。
+ * 两个文件各留一份而不是互相 import，是遵守本仓库的「零 import」约定
+ * （相对 import 不继承入口的 `?v=N` query，会让改文本后取回旧模块 —— 见
+ * `subagent-mode.mjs` 里那条同样的说明）。
+ *
+ * @param tools - agent 的 scoped tools 服务。
+ * @param agent - 目标 agent。
+ * @returns 可 restrict 的名字集合；读不到时为 `undefined`。
+ */
+function restrictableNameSet(tools, agent) {
+  if (typeof tools?.view !== 'function') return undefined
+  try {
+    const view = tools.view(agent)
+    const names = view?.restrictableNames
+    if (names === undefined || names === null || typeof names[Symbol.iterator] !== 'function') return undefined
+    return new Set(names)
+  } catch {
+    return undefined
+  }
+}
+
 /** 规范化一个 preset id：只接受非空字符串。 */
 function normalizePresetId(value) {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
@@ -486,21 +523,47 @@ export function apply(ctx, config) {
       return
     }
 
+    // ── 剔掉「结构上摘不掉」的名字（本轮修复的缺陷）───────────────────────────
+    //
+    // `restrict()` 只接受**继承面**的名字（`restrictableNames`）。注册在该 agent
+    // **自己 scope** 上的名字（own 层 —— 例如团队工具的 `send_message` / `list_agents`）
+    // 以及保留传输名 `run_code` 都不在其中，一旦出现在 deny 里，`restrict()` 会直接
+    // 抛 `names unknown global tool`，于是 catch 分支让**整条收窄不生效**（fail open）：
+    // 会话看着是 Multitask，`write` / `pwsh` 却全都在。
+    //
+    // 这一类的正确处置是**扣下不发**：它们结构上就摘不掉，与其让整条收窄陪葬，
+    // 不如把能摘的摘掉、再留一条日志说明哪些名字没摘（否则「为什么它还看得见」
+    // 在日志里无从查起）。
+    //
+    // 读不到 `restrictableNames`（没有 view / 字段不存在 / 抛错）时**不筛**：那属于
+    // 「读不到事实」，不是「摘不掉」，按现状语义原样下发，也不额外告警。
+    const restrictable = restrictableNameSet(tools, agent)
+    // `undefined`（读不到 restrictableNames）时退回现状语义：两个分支都直接沿用 deny。
+    const unpickable = restrictable === undefined ? [] : deny.filter((toolName) => !restrictable.has(toolName))
+    const withheld = restrictable === undefined ? deny : deny.filter((toolName) => restrictable.has(toolName))
+    if (unpickable.length > 0) {
+      // warnOnce 拿整条消息做去重键；被扣下的名字集合在同一次会话里是稳定的，
+      // 所以这行实际上只会出现一次（换了名字集合才再报一条）。
+      warn(`these tool(s) are registered in this agent's own scope (scope-local), so tools.restrict() structurally cannot remove them and they stay visible: ${[...unpickable].sort().join(', ')}`)
+    }
+    if (withheld.length === 0) return
+
     try {
-      const dispose = tools.restrict({ deny })
+      const dispose = tools.restrict({ deny: withheld })
       if (typeof dispose !== 'function') {
         warn('the tool registry did not confirm the coordinator restriction; this session keeps the full roster')
         return
       }
-      live.set(agent, { deny: new Set(deny), dispose })
+      live.set(agent, { deny: new Set(withheld), dispose })
       const key = keyOf(agent)
       if (key !== undefined) tracked.set(key, agent)
       ctx.logger?.info?.(
-        `dsh-multitask: coordinator scope engaged — withheld ${deny.length} tool(s): ${[...deny].sort().join(', ')}`,
+        `dsh-multitask: coordinator scope engaged — withheld ${withheld.length} tool(s): ${[...withheld].sort().join(', ')}`,
       )
     } catch (error) {
-      // restrict() 会在名字未知时抛错。走到这里说明「可见集 − 保留集」里
-      // 混进了注册表不认识的名字，这是 roster 竞态，不是正常状态 —— 必须报出来。
+      // `restrict()` 会在名字未知时抛错。scope-local 那一类已在上方被扣下，所以走到
+      // 这里说明「可见集 − 保留集」里混进了注册表**刚**撤掉的名字 —— 这是 roster
+      // 竞态，不是正常状态 —— 必须报出来（仍然宽松回退，不拦会话）。
       warn(`engaging the coordinator restriction failed: ${error instanceof Error ? error.message : String(error)} — this session keeps the full roster`)
     }
   }

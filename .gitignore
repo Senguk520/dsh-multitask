@@ -6,3 +6,6 @@ test/
 .cursor/
 docs/remember.md
 
+research/
+docs/AGENT-TEAM-COMPAT.md
+.tmp-*
