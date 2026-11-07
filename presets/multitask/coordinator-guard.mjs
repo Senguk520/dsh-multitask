@@ -482,6 +482,47 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 装一条协调者限制 —— 快路与慢路共用的**唯一出口**。
+   *
+   * 抽出来是为了让两条路径的失败语义完全一致（catch 后不写 live/tracked，保持
+   * fail-open：这一轮没装上，下一个窗口还会重试）。
+   *
+   * @param agent - 目标 agent。
+   * @param tools - 该 agent 的 scoped tools 服务。
+   * @param withheld - 要摘掉的名字。
+   * @returns 是否真的装上了。
+   */
+  const install = (agent, tools, withheld) => {
+    try {
+      const dispose = tools.restrict({ deny: withheld })
+      if (typeof dispose !== 'function') {
+        warn('the tool registry did not confirm the coordinator restriction; this session keeps the full roster')
+        return false
+      }
+      live.set(agent, { deny: new Set(withheld), dispose })
+      const key = keyOf(agent)
+      if (key !== undefined) tracked.set(key, agent)
+      ctx.logger?.info?.(
+        `dsh-multitask: coordinator scope engaged — withheld ${withheld.length} tool(s): ${[...withheld].sort().join(', ')}`,
+      )
+      return true
+    } catch (error) {
+      // `restrict()` 会在名字未知时抛错。走到这里说明「可见集 − 保留集」里混进了
+      // 注册表**刚**撤掉的名字 —— 这是 roster 竞态，不是正常状态 —— 必须报出来
+      // （仍然宽松回退，不拦会话）。
+      warn(`engaging the coordinator restriction failed: ${error instanceof Error ? error.message : String(error)} — this session keeps the full roster`)
+      return false
+    }
+  }
+
+  /** 目标 deny 集与已装的是否完全一致（顺序无关）。 */
+  const sameDeny = (installed, target) => {
+    if (!(installed instanceof Set) || installed.size !== target.length) return false
+    for (const name of target) if (!installed.has(name)) return false
+    return true
+  }
+
+  /**
    * 重算并装上一个协调者的限制。
    *
    * 先卸再读再装，是**故意**的：`schemas()` 返回的是**已经过限制**的可见面，
@@ -519,7 +560,59 @@ export function apply(ctx, config) {
       return
     }
 
-    // 先卸掉旧限制，才能读到未过滤的全量可见面。
+    // ── 快路：目标与已装的一致时，一次调用都不发 ──────────────────────────────
+    //
+    // `view().restrictableNames` 由**继承面的全部名字**在 `admits()` 过滤**之前**填满
+    // （宿主 dsh-tools/lib/index.js:3066-3070），所以
+    //     restrictableNames ∩ (¬keep ∪ extraDeny)
+    // 与「先 release 再读 schemas()」算出来的 deny **逐字等价**，却完全不需要 release。
+    //
+    // 为什么必须这么做：`release()`（dispose）与 `restrict()` 都会同步 emit
+    // `tools/change`，而 `tools/change` 的处理是「遍历全部在册会话重算」。
+    // 每装一次限制就自打两次广播，于是放大成阶乘级 —— 重算闸门只能封顶，
+    // 只有「目标没变就零调用」才能从源头掐断。
+    const scoped = agent?.ctx?.tools
+    const restrictableAll = restrictableNameSet(scoped, agent)
+    if (restrictableAll !== undefined && restrictableAll.size > 0) {
+      const target = []
+      for (const name of restrictableAll) {
+        // `run_code` 是保留传输名：`restrict()` 拒绝它，且它本来就不在
+        // `restrictableNames` 里，这里只是防御。
+        if (name === 'run_code') continue
+        if (extraDeny.has(name) || !keep.has(name)) target.push(name)
+      }
+      // 与慢路同款留痕：注册在 agent 自己 scope 上的名字（团队工具等）不在
+      // `restrictableNames` 里，restrict() 结构上摘不掉 —— 收窄照样装，但必须
+      // 报出来（否则「为什么它还看得见」在日志里无从查起）。
+      // 这里用可见面反推，代价只是一次 schemas()，不产生任何 emit。
+      const unpickable = visibleToolNames(ctx, agent).filter((name) => !restrictableAll.has(name))
+      if (unpickable.length > 0) {
+        warn(`these tool(s) are registered in this agent's own scope (scope-local), so tools.restrict() structurally cannot remove them and they stay visible: ${[...unpickable].sort().join(', ')}`)
+      }
+      if (target.length === 0) {
+        // 目标为空 = 这个 scope 不该被收窄：必须卸净（否则残留的过滤会跟着
+        // scope key 复用到下一个 agent 上）。
+        release(agent)
+        return
+      }
+      const installed = live.get(agent)
+      if (installed !== undefined && sameDeny(installed.deny, target)) {
+        // 只补账，不做任何会 emit 的动作。
+        const key = keyOf(agent)
+        if (key !== undefined && !tracked.has(key)) tracked.set(key, agent)
+        return
+      }
+      if (typeof scoped?.restrict !== 'function') {
+        warn('the agent scope exposes no tools.restrict(); the shock absorber cannot be engaged and this session keeps the full roster')
+        return
+      }
+      release(agent)
+      install(agent, scoped, target)
+      return
+    }
+
+    // ── 慢路：读不到 `view().restrictableNames`（旧宿主 / 测试桩）──────────────
+    // 下面的逻辑与本补丁之前**逐字相同**，只把尾段的安装换成 `install()`。
     release(agent)
 
     const visible = visibleToolNames(ctx, agent)
@@ -564,24 +657,7 @@ export function apply(ctx, config) {
     }
     if (withheld.length === 0) return
 
-    try {
-      const dispose = tools.restrict({ deny: withheld })
-      if (typeof dispose !== 'function') {
-        warn('the tool registry did not confirm the coordinator restriction; this session keeps the full roster')
-        return
-      }
-      live.set(agent, { deny: new Set(withheld), dispose })
-      const key = keyOf(agent)
-      if (key !== undefined) tracked.set(key, agent)
-      ctx.logger?.info?.(
-        `dsh-multitask: coordinator scope engaged — withheld ${withheld.length} tool(s): ${[...withheld].sort().join(', ')}`,
-      )
-    } catch (error) {
-      // `restrict()` 会在名字未知时抛错。scope-local 那一类已在上方被扣下，所以走到
-      // 这里说明「可见集 − 保留集」里混进了注册表**刚**撤掉的名字 —— 这是 roster
-      // 竞态，不是正常状态 —— 必须报出来（仍然宽松回退，不拦会话）。
-      warn(`engaging the coordinator restriction failed: ${error instanceof Error ? error.message : String(error)} — this session keeps the full roster`)
-    }
+    install(agent, tools, withheld)
   }
 
   /**
