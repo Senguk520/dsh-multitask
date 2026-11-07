@@ -1614,12 +1614,16 @@ profile patch 里那份 `subagentModels` 挂在 `dsh-multitask` 那一行的 `co
 - 每次 `tools/post-execute` 刷新该 worker 的最后活动时间。**刻意不看调用内容**：一次长
   `read`、一次整树命令都是「它还在动」的确证，判据越粗越不会误杀。
 - 每 `tickMs` 巡检一次；`now - at > stallTimeoutMs` 时**先从在册表删掉**，再调
-  `subagents.interrupt(id, { kind: 'ancestor', agent: 父agent })`（父 agent 取不到时只给
-  `kind`，由宿主按会话血缘判定）。先删后停，保证同一个 worker 只被处理一次。
+  `subagents.interrupt(id, { kind: 'ancestor', agent: 父agent })`。父 agent 取不到时**不调**
+  `interrupt`，只记 `[MULTITASK-WATCHDOG-NO-PARENT]` 日志（`{kind:'ancestor'}` 缺 `agent`
+  会让宿主抛 TypeError：`dsh-subagent/lib/index.js:1258-1261` 直接读 `authority.agent`）。
+  先删后停，保证同一个 worker 只被处理一次。
 - 停下会触发宿主的 `subagent-settled` 通知 ⇒ 父会话被唤醒 ⇒ 卡死从「静默」变成一条
   **可见的汇报**。这是本模块真正的目的：不是让 worker 少跑，而是让卡死有声音。
 - 日志标记（可 grep）：`[MULTITASK-WATCHDOG-STALLED] child=<id> idle=<ms>ms`；首次纳入打
-  `[MULTITASK-WATCHDOG-ENGAGED]`，跳过时打 `[MULTITASK-WATCHDOG-SKIPPED] … [reason=…]`。
+  `[MULTITASK-WATCHDOG-ENGAGED]`，跳过时打 `[MULTITASK-WATCHDOG-SKIPPED] … [reason=…]`；
+  判出停滞却解析不到父 agent（因此**没有**停人）时打
+  `[MULTITASK-WATCHDOG-NO-PARENT] child=<id> idle=<ms>ms`。
 - 配置：`stallTimeoutMs`（默认 `300000` = 5 分钟 —— 够长，长到不误杀正在长思考 / 长命令里
   的 worker；够短，短到卡死不至于把等待拖成整晚）、`tickMs`（默认 `30000`）、
   `interruptOnStall`（默认 `true`，置 `false` 时只报警不停人）。三项都由 `composition.mjs`

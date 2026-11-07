@@ -77,6 +77,9 @@ export const ENGAGED_MARKER = '[MULTITASK-WATCHDOG-ENGAGED]'
 /** 跳过一条 agent/created 时打的标记（每进程一次 / 每个理由一次）。 */
 export const SKIPPED_MARKER = '[MULTITASK-WATCHDOG-SKIPPED]'
 
+/** 判出了停滞、却因为解析不到父 agent 而**不敢**调 interrupt 时打的标记。 */
+export const NO_PARENT_MARKER = '[MULTITASK-WATCHDOG-NO-PARENT]'
+
 /**
  * 默认停滞阈值：5 分钟。
  *
@@ -320,13 +323,20 @@ export function apply(ctx, config) {
           continue
         }
         const parentAgent = entry.parentId === undefined ? undefined : agentById(ctx, entry.parentId)
-        // `authority` 用 `ancestor` 形状：上游据此做**血缘**校验。取得到父 agent 就传它，
-        // 取不到就只给 kind —— 由宿主自己按会话血缘判定（不猜一个 agent 对象）。
+        // `authority` 用 `ancestor` 形状：上游据此做**血缘**校验，而它**必须**带上 `agent` ——
+        // 宿主在 `kind === 'ancestor'` 时会直接读 `authority.agent`
+        // （`dsh-subagent:1258-1261`），缺了就是 TypeError。硬凑一个 `{ kind }` 只会在下面
+        // 被 catch 吞成 `[reason=interrupt-threw]`：worker 继续卡、父会话不被唤醒 ——
+        // 恰好是「父会话说没就没了」这种最需要兜底的场景**必然**失败。
+        // 所以父 agent 取不到时**不调 interrupt**（不猜一个 agent 对象），只把这件事记下来：
+        // 停滞的判定（上面那条 `[MULTITASK-WATCHDOG-STALLED]`）照记，两条日志合起来才是事实。
         if (parentAgent === undefined || parentAgent === null) {
-          subagents.interrupt(entry.id, { kind: 'ancestor' })
-        } else {
-          subagents.interrupt(entry.id, { kind: 'ancestor', agent: parentAgent })
+          warn(
+            `${NO_PARENT_MARKER} child=${entry.id} idle=${idle}ms \u2014 the parent agent could not be resolved, so the stalled worker was not interrupted`,
+          )
+          continue
         }
+        subagents.interrupt(entry.id, { kind: 'ancestor', agent: parentAgent })
       } catch (error) {
         // 停不掉不是致命错误：最坏是这条停滞继续静默，而不是把插件弄坏。
         skip(
