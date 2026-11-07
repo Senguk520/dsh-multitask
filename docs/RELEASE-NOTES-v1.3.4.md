@@ -1,7 +1,7 @@
 # v1.3.4
 
 > 建立在 v1.3.3 之上的修复版。1.3.0 – 1.3.3 这四个版本号**都从未对外发布**
-> （详见 `RELEASE-NOTES-v1.3.3.md` 开头），本版修的是三个人都能撞到的问题中的两个。
+> （详见 `RELEASE-NOTES-v1.3.3.md` 开头），本版修的是三个人都能撞到的问题中的三个。
 
 ## 本版要点
 
@@ -11,6 +11,9 @@
 - **派单之后不再"一边等一边刷"。** 协调者派完单会反复去看 worker 跑到哪了，用过程数据把等待
   填满、烧掉主对话的上下文。现在它**结束回合**，worker 回报时由运行时以**新回合**唤醒它 ——
   结论不会丢。人格与工具说明两处一起改，不再是两句话互相矛盾、交给模型自行裁决。
+- **worker 静默卡死不再是"没人知道"的状态。** 插件在父侧给被委派的子代理计时，超时（默认
+  5 分钟无任何工具活动）主动停掉它 —— 停下会唤醒父会话，于是"卡住"变成一条可见的汇报，而
+  不是永远等下去。
 
 ## 修复
 
@@ -67,9 +70,32 @@
   跳过 `isDelegatedChild`（worker 要的是「干活然后回报」），且要求归属本 preset。
   遮蔽装不上时**静默降级**回宿主原语义 —— 绝不抛错，最坏只是多刷几轮，不会让会话起不来。
 
+### 子代理静默卡死（P1.5：父会话零事件）
+
+**症状**：worker 陷在同一处反复改（典型是花括号增生），既不退回、也不报错、更不再产出；
+父会话**收不到任何事件**。协调者按新纪律结束了回合，于是整个任务停在半空 —— 界面上看不出
+任何异常，只能靠人肉轮询发现。
+
+**根因**：宿主 `dsh-subagent/lib/index.js:2978-2981` 那一行 Config 只有 `maxDepth` 与
+`maxActiveSubagents` —— **没有**步数上限、空闲超时或看门狗；而父会话的两条通道
+（`subagent/end` `:199-206`、结算通知 `:2040-2062`）都只在子代理**真正 idle 时**才发。
+卡死的 worker 永远不 idle，所以两条都是哑的。`dsh-repeat-tool-reminder` 只认**同参数**重复
+（`thresholds [3,5,8]`），「同一处来回改、每轮内容不同」会被当成新链重置，且只提醒不终止。
+
+**修法**：新增 `presets/multitask/subagent-watchdog.mjs`。父侧按「最后一次工具活动」给每个
+被委派的 worker 计时（`tools/post-execute` 刷新），每 `tickMs`（默认 30 秒）巡检；超过
+`stallTimeoutMs`（默认 5 分钟）就**先摘记录、再** `subagents.interrupt(id, { kind: 'ancestor' })`
+（拿得到父 agent 时连同 `agent` 一起传）。停下会触发宿主的 `subagent-settled` 通知 ⇒
+父会话被唤醒，「卡住」于是成了一条**可见的汇报**。日志标记
+`[MULTITASK-WATCHDOG-STALLED] child=<id> idle=<ms>ms`；`interruptOnStall` 默认 `true`，
+可由 profile 覆盖。它**不自动重派** —— 该不该重派由看得见报告的协调者决定。
+
+**实测**：`node test/subagent-watchdog.mjs` **5/5 全绿**（W1 停滞即停、W2 活跃不误杀、
+W3 不碰别的模式、W4 释放后不再处理、W5 服务缺席 fail-open）。
+
 ## 验证方式
 
-四条本地回归全绿（脚本在 `test/`，**本地专属、不随包分发** —— `test/` 整个目录被
+五条本地回归全绿（脚本在 `test/`，**本地专属、不随包分发** —— `test/` 整个目录被
 `.gitignore` 忽略，也不进 `npm pack` 产物）：
 
 | 脚本 | 结果 | 守什么 |
@@ -78,6 +104,7 @@
 | `test/repo-consistency.mjs` | **52/52** | 仓库一致性：静态 / 离线，不加载 DSH、不写文件 |
 | `test/coordinator-guard-fanout.mjs` | **6/6**（`--prove` **7/7**） | 重算扇出：一次 `tools/change` 不得自激放大 |
 | `test/coordinator-prompt-contract.mjs` | **14/14** | 派单后收尾：人格文本 + 同名段遮蔽 |
+| `test/subagent-watchdog.mjs` | **5/5** | 停滞看门狗：卡死会被停、活跃不误杀、别的模式不碰 |
 
 `coordinator-guard-fanout.mjs` 带**反向验证**（`--prove`）：把 pass 闸门去掉后用例必须变红，
 否则说明它们是恒真的。另外 `approval-gate-integration` / `preset-dispatch` /
@@ -101,7 +128,7 @@ dsh plugin --profile <profile> add dsh-multitask
 
 ## English summary
 
-Fixes the two things users actually hit.
+Fixes the three things users actually hit.
 
 **P0 — the `dsh web` freeze.** `tools.restrict()` in the host (`dsh-tools/lib/index.js:2991-3005`)
 is called without `notify: false`, so both installing and removing a restriction emit
@@ -125,6 +152,17 @@ is correct, the report arrives as a new turn, never fill the wait with process d
 host sentence), and a new `presets/multitask/coordinator-prompt.mjs` registers a **same-named**
 `tool:subagent` section in the coordinator's scope to shadow the host one — the documented mechanism
 at `dsh-system-prompt/lib/index.js:245-249`, with `worker-persona.mjs:264-268` as precedent.
+
+**P1.5 — silent worker stalls.** The host has no step cap, idle timeout or watchdog for
+subagents (`dsh-subagent/lib/index.js:2978-2981` only declares `maxDepth` and
+`maxActiveSubagents`), and the parent's only two channels — `subagent/end` (`:199-206`) and the
+settlement notice (`:2040-2062`) — fire only when the child is genuinely idle. A worker stuck in
+one spot therefore produces no events at all, and the parent session that ended its turn is never
+woken. New `presets/multitask/subagent-watchdog.mjs` times every delegated worker on the parent
+side (refreshed on `tools/post-execute`); after `stallTimeoutMs` (default 5 minutes) without any
+tool activity it interrupts the child, which triggers `subagent-settled` and wakes the parent — a
+stall becomes a visible report instead of an endless wait. It never re-dispatches: that decision
+stays with the coordinator, who can see the report and the files.
 
 **Upgrade**: `dsh plugin --profile <profile> add dsh-multitask`, then restart the app. If you patched
 `coordinator-guard.mjs` by hand, restore the official file first — a leftover hand patch stacks on top

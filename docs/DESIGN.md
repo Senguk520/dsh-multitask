@@ -1586,6 +1586,59 @@ profile patch 里那份 `subagentModels` 挂在 `dsh-multitask` 那一行的 `co
 - 反过来若这里抛错 → **该会话起不来**，那比多刷几轮严重得多，所以刻意 fail-open：
   绝不抛错、绝不阻塞会话创建。
 
+### 子代理停滞看门狗（P1.5：把"静默卡死"变成可见事件）
+
+**现象**：worker 陷在同一处反复改（典型是花括号增生 —— `A ? { … } : { … }` 越改越乱），
+既不退回、也不报错，更不再产出任何东西。而父会话**收不到任何事件**：协调者按上一节的
+纪律结束了回合，就再也不会被叫醒。整个任务停在半空，界面上看不出异常 —— 只能靠人肉
+轮询发现。
+
+**机制出处**：
+
+- 宿主**没有任何**子代理步数上限、空闲超时或看门狗。`dsh-subagent/lib/index.js:2978-2981`
+  那一行 Config 只有 `maxDepth` 与 `maxActiveSubagents` 两个数：一个限制深度、一个限制
+  并发，**都与「跑了多久 / 有没有产出」无关**。
+- 父会话只有两条通道能知道子代理结束了：`subagent/end`（`dsh-subagent/lib/index.js:199-206`）
+  与结算通知（同文件 `:2040-2062`）。这两条都在子代理**真正 idle 时**才发 —— 卡死的 worker
+  恰恰永远不 idle，于是两条通道一起哑掉。
+- `dsh-repeat-tool-reminder` 不是替代品：它只认**同参数**的重复调用（`thresholds [3,5,8]`），
+  「同一处来回改、每轮内容都不同」会被它当成一条新链并重置计数；而且它只提醒，**不终止**。
+
+**修法**：新增 `presets/multitask/subagent-watchdog.mjs`，**在父侧**计时 —— 判据只能是
+「多久没有活动」，而活动信号（`tools/post-execute`）在父 preset 的 scope 上就能收到：
+
+- `agent/created` 时把「被委派出来的、且父会话组的是本 preset」的 worker 记进在册表。
+  归属判据与 `coordinator-guard.mjs` 同形：先看父 agent 的**活绑定**，读不出来才退回子代理
+  会话头的 `agentPreset`；两者都不成立就**不纳入**（拿不准时宁可不管 —— 把别的协调者正在
+  等待的 worker 停掉，等于替另一个会话做决定）。
+- 每次 `tools/post-execute` 刷新该 worker 的最后活动时间。**刻意不看调用内容**：一次长
+  `read`、一次整树命令都是「它还在动」的确证，判据越粗越不会误杀。
+- 每 `tickMs` 巡检一次；`now - at > stallTimeoutMs` 时**先从在册表删掉**，再调
+  `subagents.interrupt(id, { kind: 'ancestor', agent: 父agent })`（父 agent 取不到时只给
+  `kind`，由宿主按会话血缘判定）。先删后停，保证同一个 worker 只被处理一次。
+- 停下会触发宿主的 `subagent-settled` 通知 ⇒ 父会话被唤醒 ⇒ 卡死从「静默」变成一条
+  **可见的汇报**。这是本模块真正的目的：不是让 worker 少跑，而是让卡死有声音。
+- 日志标记（可 grep）：`[MULTITASK-WATCHDOG-STALLED] child=<id> idle=<ms>ms`；首次纳入打
+  `[MULTITASK-WATCHDOG-ENGAGED]`，跳过时打 `[MULTITASK-WATCHDOG-SKIPPED] … [reason=…]`。
+- 配置：`stallTimeoutMs`（默认 `300000` = 5 分钟 —— 够长，长到不误杀正在长思考 / 长命令里
+  的 worker；够短，短到卡死不至于把等待拖成整晚）、`tickMs`（默认 `30000`）、
+  `interruptOnStall`（默认 `true`，置 `false` 时只报警不停人）。三项都由 `composition.mjs`
+  给默认值，**可由 profile 按同一 `id` 覆盖**；`enabled: false` 时整行不动作。
+
+**降级与已知边界**：
+
+- `interrupt` 不存在（老版本宿主）或抛错 → **只记一条日志就退场**（fail-open，退回宿主原
+  语义：卡死仍然静默）。绝不抛错 —— 把正常会话弄坏，比漏停一个 worker 严重得多。
+- 「无活动」是**代理判据**，不是「卡死」的证明：一个长时间不调工具的正常长任务（长思考、
+  等外部事件）会被判早。所以本模块只做「停下并把这件事交回父会话」，**不自动重派** ——
+  重派会让同一个写入动作做两遍，而该不该重派要看报告与文件现状，那是协调者看得见、本模块
+  看不见的东西。
+- 若被判停的 worker 卡在**不可取消**的工具里，`subagent-settled` 也可能不来 —— 此时父会话
+  仍不会被唤醒，只剩日志（`[MULTITASK-WATCHDOG-STALLED]`）可查，**仍需人看**。
+- 清理是双通道的：定时器已 `unref()`（否则进程退不出去），并在 `ctx.on('dispose')` 与
+  `ctx.effect` 上各挂一次停表（`stop` 幂等）。两条通道都缺席时最坏是进程里多一个定时器，
+  不会阻塞会话。
+
 ---
 
 ## 卸载
