@@ -837,6 +837,22 @@ Write in the user's language.`
  */
 
 /**
+ * 看门狗的三项默认值。
+ *
+ * ⚠️ 与 `lib/index.js` 的 `WATCHDOG_DEFAULTS` 是**同一组数字**（那边是设置的缺省，
+ * 这边是 `buildPlugins()` 无参调用时的兜底）。保存面板写下的值经 `watchdog`
+ * 入参进来；**没有它时行为与加入本参数之前逐字等价**。
+ *
+ * ⚠️ 必须定义在 `definition` **之前**：`definition.plugins` 在模块求值时就调用
+ * `buildPlugins()`（无参），那时 `normalizeWatchdog()` 会读这组常量 —— 放到后面
+ * 会撞 TDZ（`Cannot access 'DEFAULT_WATCHDOG' before initialization`）。
+ */
+const DEFAULT_WATCHDOG = Object.freeze({ stallTimeoutMs: 300000, tickMs: 30000, mode: 'interrupt' })
+
+/** 超时处理三态 —— 与 `lib/index.js` / 设置面板三处一致。 */
+const WATCHDOG_MODES = ['interrupt', 'log', 'off']
+
+/**
  * 本 preset 的 id —— 减震器判「这个会话是不是我的」时用的就是它。
  *
  * 定义在这里（而不是各文件各写一份字面量）是**刻意的**：`definition.id` 必须与守卫
@@ -926,6 +942,36 @@ function normalizeModelMap(modelMap) {
 }
 
 /**
+ * 把宿主传进来的「看门狗设置」收敛成可以直接展开进行 `config` 的三项。
+ *
+ * 入参来自设置面板（经 `lib/index.js` 的 `readWatchdog()` 收敛过一次），但这里
+ * 仍然再挡一道：`buildPlugins()` 是公开的组装函数，测试与 `definition.plugins`
+ * 都直接调用它。任何非正数 / 未知 `mode` 都落回默认值，**绝不抛错** —— 这一行
+ * 装不上会让整个 preset 挂载失败（模式从新会话列表消失）。
+ *
+ * @param watchdog - `{ stallTimeoutMs, tickMs, mode }`，可为空。
+ * @returns `{ stallTimeoutMs, tickMs, mode }`。
+ */
+function normalizeWatchdog(watchdog) {
+  return {
+    stallTimeoutMs: positiveMs(watchdog?.stallTimeoutMs, DEFAULT_WATCHDOG.stallTimeoutMs),
+    tickMs: positiveMs(watchdog?.tickMs, DEFAULT_WATCHDOG.tickMs),
+    mode: WATCHDOG_MODES.includes(watchdog?.mode) ? watchdog.mode : DEFAULT_WATCHDOG.mode,
+  }
+}
+
+/**
+ * 把配置里的毫秒数收敛成正数；非法值退回默认值。
+ *
+ * @param value - 配置值。
+ * @param fallback - 默认值。
+ * @returns 一个正数（毫秒）。
+ */
+function positiveMs(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
+}
+
+/**
  * 为一类 worker 生成要**展开进**行 `config` 的片段。
  *
  * ── 为什么未指定时返回的不是 `{ agentOptions: undefined }` ──────────────────
@@ -995,12 +1041,20 @@ function noOptions() {
  * 这一点是硬约束 —— 本地回归（`test/repo-consistency.mjs` 与既有的 13 条隔离用例）里，
  * 大量断言都是无参调用本函数。
  *
+ * ── 关于可选的 `watchdog`（子代理停滞看门狗的阈值）───────────────────────────
+ *
+ * 同样**不传参时与加入本参数之前逐字等价**：`subagent-watchdog` 那一行拿到
+ * `300000 / 30000 / interrupt`，也就是今天写死在 composition 里的那组值。
+ * 设置面板保存后，宿主半（`lib/index.js` 的 `readWatchdog()`）把新值从这里传进来。
+ *
  * @param options - 可选的注入项。
  * @param options.modelMap - `类型键 -> { provider, model, reasoningEffort? }`。
+ * @param options.watchdog - `{ stallTimeoutMs, tickMs, mode }`（毫秒）。
  * @returns 供 preset 注册表挂载的插件行数组。
  */
 export function buildPlugins(options) {
   const modelMap = normalizeModelMap(options?.modelMap)
+  const watchdog = normalizeWatchdog(options?.watchdog)
   return [
     // ── 身份：协调者人格 + Multitask 工作纪律 ─────────────────────────────────
     //
@@ -1724,23 +1778,34 @@ export function buildPlugins(options) {
     //
     // 只纳入「被委派出来的子代理」且「父会话组的是本 preset」的 worker（方向闸门在
     // 模块内部，判据与 `coordinator-guard.mjs` / `coordinator-prompt.mjs` 同形）。
-    // `stallTimeoutMs` 就是默认的 5 分钟：够长，长到不会误杀长思考 / 长命令里的
-    // worker；够短，短到卡死不至于把等待拖成整晚。
+    // `stallTimeoutMs` 默认的 5 分钟：够长，长到不会误杀长思考 / 长命令里的 worker；
+    // 够短，短到卡死不至于把等待拖成整晚。
     //
-    // ⚠️ **阈值只能改这一行的 `config` 并重启应用**：profile 里的 `cordis.patch.yml`
-    // **够不到 preset 声明内部的这些行** —— 宿主半（`lib/index.js` 的
-    // `applyGuardOverrides`）只按 id 匹配 `coordinator-guard` / `workspace-acl` 两行、
-    // 只透传 `presetId` / `enabled` / `keep` / `extraDeny`，没有"按任意 id 合并 config"
-    // 这条路；而宿主 `dsh-app-boot` 写明 patch 只作用于 entry 列表、且是**整份 config
-    // 替换**（指不到已存在 entry 只打一条 stderr warning）。所以想按环境调阈值，正确
-    // 做法是加一个环境变量在 `lib/index.js` 里透传，而不是写 profile patch。
+    // ★ **阈值可以在 Multitask 设置面板调整（保存后新建会话生效）**：
+    //   面板 → `lib/index.js` 的 `readWatchdog()` → `buildPlugins({ watchdog })` → 本行
+    //   `config`。下面的默认值只作**兜底**（`buildPlugins()` 无参调用时行为不变）。
+    //
+    //   ⚠️ 不要指望 profile 的 `cordis.patch.yml` 改这里：它**够不到 preset 声明内部
+    //   的这些行** —— 宿主半（`lib/index.js` 的 `applyGuardOverrides`）只按 id 匹配
+    //   `coordinator-guard` / `workspace-acl` 两行、只透传 `presetId` / `enabled` /
+    //   `keep` / `extraDeny`，没有"按任意 id 合并 config"这条路；而宿主 `dsh-app-boot`
+    //   写明 patch 只作用于 entry 列表、且是**整份 config 替换**（指不到已存在 entry
+    //   只打一条 stderr warning）。
     //
     // 失败取向同样是「绝不阻塞会话」：服务缺席、`interrupt` 不存在或抛错，一律只记
     // 一条日志 —— 最坏退回今天的行为（卡死仍然静默），绝不是把正常会话弄坏。
     {
       id: 'subagent-watchdog',
       name: local('./subagent-watchdog.mjs'),
-      config: { enabled: true, presetId: PRESET_ID, stallTimeoutMs: 300000, tickMs: 30000, interruptOnStall: true },
+      config: {
+        // 三态 → 模块的两个开关：`off` 整行不动作；`log` 只报警不停人；
+        // `interrupt`（默认）既报警又停人。
+        enabled: watchdog.mode !== 'off',
+        presetId: PRESET_ID,
+        stallTimeoutMs: watchdog.stallTimeoutMs,
+        tickMs: watchdog.tickMs,
+        interruptOnStall: watchdog.mode === 'interrupt',
+      },
     },
 
     // ── ★ 工作区 ACL：让子代理的 shell 在新工作区里开箱即用 ──────────────────

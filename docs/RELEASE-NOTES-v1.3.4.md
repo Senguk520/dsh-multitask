@@ -87,8 +87,9 @@
 `stallTimeoutMs`（默认 5 分钟）就**先摘记录、再** `subagents.interrupt(id, { kind: 'ancestor' })`
 （拿得到父 agent 时连同 `agent` 一起传）。停下会触发宿主的 `subagent-settled` 通知 ⇒
 父会话被唤醒，「卡住」于是成了一条**可见的汇报**。日志标记
-`[MULTITASK-WATCHDOG-STALLED] child=<id> idle=<ms>ms`；`interruptOnStall` 默认 `true`，
-要改就改 `composition.mjs` 那一行的 `config` 并重启（profile patch 够不到 preset 内部的行）。
+`[MULTITASK-WATCHDOG-STALLED] child=<id> idle=<ms>ms`；`interruptOnStall` 默认 `true`。
+**面板可调停滞阈值 / 巡检间隔 / 超时处理（三态），保存后新建会话生效**（已开跑会话沿用启动值；
+profile patch 够不到 preset 内部的行，阈值只能走面板）。
 它**不自动重派** —— 该不该重派由看得见报告的协调者决定。
 
 **实测**：`node test/subagent-watchdog.mjs` **7/7 全绿**（W1 停滞即停、W2 活跃不误杀、
