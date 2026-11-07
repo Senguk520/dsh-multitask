@@ -201,24 +201,27 @@ function belongsToPreset(agent, presetId) {
 /**
  * 取该 agent scope 上的 `systemPrompt` 服务。
  *
- * 先试 `agent.ctx.systemPrompt`，再试 `agent.ctx.get('systemPrompt')`（某些上下文
- * 只暴露 `get`）。取不到返回 `undefined` —— 调用方据此**安静跳过**，而不是抛错。
+ * **只从 `agent.ctx` 取**（先试 `agent.ctx.systemPrompt`，再试
+ * `agent.ctx.get('systemPrompt')` —— 某些上下文只暴露 `get`），与
+ * `worker-persona.mjs` 的取法逐字一致。
+ *
+ * ⚠️ **绝不能退回插件级 `ctx`**。插件级上下文是 preset scope，而子代理的 scope 链
+ * **也包含 preset scope**：一旦走到这条回退，`section()` 就会注册在 worker 和协调者
+ * **共用的那一层**上，worker 也会被塞进「END YOUR TURN」—— 可能让它提前收工。
+ * 本段的语义是「只给协调者」，所以取不到就是取不到：返回 `undefined`，由调用方
+ * **安静跳过**（fail-open，最坏退回宿主原语义），而不是抛错。
  *
  * @param agent - 目标 agent。
- * @param ctx - 本模块的上下文，作为第二个来源。
  * @returns systemPrompt 服务，或 `undefined`。
  */
-function systemPromptOf(agent, ctx) {
-  for (const carrier of [agent?.ctx, ctx]) {
-    if (carrier === undefined || carrier === null) continue
-    try {
-      const direct = carrier.systemPrompt
-      if (direct !== undefined && direct !== null) return direct
-      const viaGet = carrier.get?.('systemPrompt')
-      if (viaGet !== undefined && viaGet !== null) return viaGet
-    } catch {
-      // 换下一个来源；读不到不是致命错误。
-    }
+function systemPromptOf(agent) {
+  try {
+    const direct = agent?.ctx?.systemPrompt
+    if (direct !== undefined && direct !== null) return direct
+    const viaGet = agent?.ctx?.get?.('systemPrompt')
+    if (viaGet !== undefined && viaGet !== null) return viaGet
+  } catch {
+    // 读不到不是致命错误。
   }
   return undefined
 }
@@ -299,7 +302,7 @@ export function apply(ctx, config) {
       return
     }
 
-    const service = systemPromptOf(agent, ctx)
+    const service = systemPromptOf(agent)
     if (service === undefined || typeof service.section !== 'function') {
       // fail-open：服务缺席时最坏退回宿主原语义（多刷几轮），绝不因此让会话起不来。
       skip('the agent scope exposes no systemPrompt.section(); the coordinator keeps the host wording. [reason=no-system-prompt]')

@@ -581,11 +581,17 @@ export function apply(ctx, config) {
         if (name === 'run_code') continue
         if (extraDeny.has(name) || !keep.has(name)) target.push(name)
       }
-      // 与慢路同款留痕：注册在 agent 自己 scope 上的名字（团队工具等）不在
-      // `restrictableNames` 里，restrict() 结构上摘不掉 —— 收窄照样装，但必须
-      // 报出来（否则「为什么它还看得见」在日志里无从查起）。
+      // 与慢路同款留痕，但判据必须与慢路**逐字对齐**：只报我们**本想摘却摘不掉**
+      // 的名字 —— 即「不在 `restrictableNames` 里」（结构上摘不掉）**且**「本来就
+      // 落在我们要 deny 的范围里」（¬keep ∪ extraDeny）。
+      //
+      // 少掉第二个条件就会造假警：注册在 agent 自己 scope 上的 keep 类工具
+      // （`file_info`、团队工具 `send_message` / `list_agents`）本来就要留着，
+      // 把它们报成「scope-local、摘不掉」会误导取证 —— 日志在喊，实际什么事都没有。
       // 这里用可见面反推，代价只是一次 schemas()，不产生任何 emit。
-      const unpickable = visibleToolNames(ctx, agent).filter((name) => !restrictableAll.has(name))
+      const unpickable = visibleToolNames(ctx, agent).filter(
+        (name) => !restrictableAll.has(name) && (extraDeny.has(name) || !keep.has(name)),
+      )
       if (unpickable.length > 0) {
         warn(`these tool(s) are registered in this agent's own scope (scope-local), so tools.restrict() structurally cannot remove them and they stay visible: ${[...unpickable].sort().join(', ')}`)
       }
@@ -723,8 +729,14 @@ export function apply(ctx, config) {
   //
   // 声明 prepend 与 concurrency-safe，使它不会拖慢无关的只读调用。
   ctx.on('tools/post-execute', (exec, _result, next) => {
-    pass(() => sync(exec?.agent))
-    // `next()` 刻意留在闸门**之外**：它推进的是瀑布里别人的后续处理，
+    try {
+      pass(() => sync(exec?.agent))
+    } catch (error) {
+      // 兜底：重算的任何意外都**不得**截断 post-execute 瀑布 —— 截断会让本次工具调用的
+      // 结果变成 undefined，宿主读 `result.kind` 时抛错（整片工具不可用的那种故障）。
+      warn(`recomputing the coordinator restriction after a tool call failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    // `next()` 仍然在闸门**之外**，且**必定**执行：它推进的是瀑布里别人的后续处理，
     // 把下游塞进 pass 会让闸门一直开到别人的工作结束（下游一 emit tools/change
     // 就会被误判成重入）。
     return next()
