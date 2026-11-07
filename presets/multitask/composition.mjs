@@ -40,7 +40,7 @@
  *
  *   - `subagent_ptc`     —— 程序化批量处理。由 `subagent-mode.mjs` 对该子代理 scope
  *                           调 `presentAs('ptc')`，把整张工具面**塌缩**成
- *                           `run_code` + 一份生成的 SDK（详见该文件与 docs/DESIGN.md）。
+ *                           `run_code` + 一份生成的 SDK（详见该文件与 docs/DESIGN_zh.md）。
  *   - `subagent_minimal` —— 只读调研 / 快速问答。由 `minimal-guard.mjs` 做**自适应**
  *                           收窄（`可见集 − 允许集`），用它来摘掉写入/执行类工具，
  *                           以及别的插件装进来的 `ssh_*` / `task_board_*` 等。
@@ -97,7 +97,7 @@
  *      `workspace-acl` 那两行）。
  *      它在模块加载时读取，所以改动需要重启应用生效。
  *   2. 直接给下面的行加 `disabled: true`（或删掉它）。改 composition.mjs 需配合
- *      递增 profile patch 里的 `?v=N` 才会重新加载，见 docs/DESIGN.md「改源码后如何生效」。
+ *      递增 profile patch 里的 `?v=N` 才会重新加载，见 docs/DESIGN_zh.md「改源码后如何生效」。
  *   3. 只想关掉 PTC **呈现**、但保留 `subagent_ptc` 这个工具本身：
  *      把 `subagent-mode` 那行的 `config.enabled` 改成 `false`。
  *      （关掉后 `subagent_ptc` 仍可用，只是退化成与 `subagent` 同样的原生工具面。）
@@ -106,7 +106,7 @@
  *      ⚠️ 关掉它**没有安全收益**，只是让那个 worker 重新拿到 `ssh_*` / `task_board_*`
  *      一类别的插件装进来的工具 —— 留着它是默认且推荐的状态。
  *
- * 设计要点、已知边界与未确证项见 docs/DESIGN.md 的「多模式子代理」一节。
+ * 设计要点、已知边界与未确证项见 docs/DESIGN_zh.md 的「多模式子代理」一节。
  */
 
 /**

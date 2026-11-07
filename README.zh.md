@@ -30,7 +30,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.zh.md">中文</a> · <a href="docs/DESIGN.md">设计与实测记录</a> · <a href="LICENSE">MIT 许可证</a>
+  <a href="README.md">English</a> · <a href="README.zh.md">中文</a> · <a href="docs/DESIGN_zh.md">设计与实测记录</a> · <a href="LICENSE">MIT 许可证</a>
 </p>
 
 一个装进 **DeepSeek Harness（DSH）** 的工作模式：**主对话只做三件事** —— 理解你的需求、把需求翻译成任务书下发给子代理、汇总子代理的结论。读文件、跑命令、构建、搜索、调试所产生的一切过程性数据，都在**子代理的上下文**里消化，永不进入主对话。主对话的上下文因此长期只留高价值信息。
@@ -370,7 +370,7 @@ Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(<工作区路径>)
 
 **审批弹窗没出现** —— 先确认当前会话的审批策略是 `ask`（headless 配置是 `never`，那时本插件完全不介入）；若你是后台派单且回合已经结束，见「危险操作的审批」里「**后台派单 + 你的回合已结束**」那一段。
 
-**改了源码却不生效** —— 必须**重启应用**。只递增 profile patch 里的 `?v=N` 对已经在运行的条目是空操作：loader 只看到 name 变了，既不会重新加载模块，也不会重启。细节见 [docs/DESIGN.md](docs/DESIGN.md) 的「改源码后如何生效」。
+**改了源码却不生效** —— 必须**重启应用**。只递增 profile patch 里的 `?v=N` 对已经在运行的条目是空操作：loader 只看到 name 变了，既不会重新加载模块，也不会重启。细节见 [docs/DESIGN_zh.md](docs/DESIGN_zh.md) 的「改源码后如何生效」。
 
 ### 自动补权限什么时候会跑
 
@@ -426,7 +426,7 @@ fatal: Unable to create '.../.git/index.lock': Permission denied
 dsh-multitask: coordinator scope engaged — withheld N tool(s): edit, pwsh, read_image, ssh_exec, ...
 ```
 
-审批闸门的前置条件与验证步骤（含后台派单的兜底通路）写在 [docs/DESIGN.md](docs/DESIGN.md) 的「验证它真的生效了」与「审批闸门」两节。
+审批闸门的前置条件与验证步骤（含后台派单的兜底通路）写在 [docs/DESIGN_zh.md](docs/DESIGN_zh.md) 的「验证它真的生效了」与「审批闸门」两节。
 
 ---
 
@@ -588,7 +588,8 @@ dsh-multitask/
 │   ├── workspace-acl.mjs               # 工作区 ACL：补 WRITE_OWNER + 给既存子目录补齐盖章（唯一改系统状态的模块，共两段写入）
 │   └── file-info.mjs                   # 只读元数据工具 file_info
 ├── docs/
-│   ├── DESIGN.md                       # 设计推导、上游依据、已知边界
+│   ├── DESIGN.md                       # 同一份文档的英文版
+│   ├── DESIGN_zh.md                    # 设计推导、上游依据、已知边界（本 README 链接的那份）
 │   └── test_image/                     # README 引用的实测截图
 ├── README.md（英文）/ README.zh.md（中文）
 └── LICENSE
@@ -616,7 +617,7 @@ dsh-multitask/
 - **规则表是模式匹配，会漏判新型危险命令。** 所以真正的闸门是第二级转呈，第一级只负责「安全的不用打扰用户」。
 - **上游改版可能让某个守卫失效**，失效取向一律是「回到没有该守卫的行为」，不是权限被放大。
 
-更完整的边界、未确证项、以及每条结论的实测依据，都在 [docs/DESIGN.md](docs/DESIGN.md)。
+更完整的边界、未确证项、以及每条结论的实测依据，都在 [docs/DESIGN_zh.md](docs/DESIGN_zh.md)。
 
 ## License
 

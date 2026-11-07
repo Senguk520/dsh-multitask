@@ -19,6 +19,7 @@
     "presets",
     "cordis.patch.yml",
     "docs/DESIGN.md",
+    "docs/DESIGN_zh.md",
     "README.md",
     "README.zh.md",
     "LICENSE"

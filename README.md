@@ -570,7 +570,8 @@ dsh-multitask/
 │   ├── workspace-acl.mjs               # workspace ACL: grants WRITE_OWNER and stamps existing subdirectories (the only module that changes system state, in two writes)
 │   └── file-info.mjs                   # the read-only metadata tool file_info
 ├── docs/
-│   ├── DESIGN.md                       # design reasoning, upstream evidence, known boundaries
+│   ├── DESIGN.md                       # design reasoning, upstream evidence, known boundaries (the English edition, linked from this README)
+│   ├── DESIGN_zh.md                    # the same document in Chinese
 │   └── test_image/                     # the screenshots the READMEs embed
 ├── README.md (English) / README.zh.md (Chinese)
 └── LICENSE
