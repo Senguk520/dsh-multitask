@@ -136,10 +136,11 @@ jobs:
             exit 1
           fi
 
-      # 正常路径下 bump.yml 已经把 banner 里的版本号和 package.json 一起提交了。
-      # 但「手工指定版本号」那条路（提交信息以 `chore(release):` 开头）会绕过
-      # bump.yml —— 图可能就停在旧号上。而 README 是发进包里的，一张写着旧版本号
-      # 的横幅会跟着这次发布一起出去，且不会有任何提示。所以这里做成硬失败：
+      # 这是发布前最后一道闸门。前两层在 bump.yml：正常推送时由 bump job 顺手改，
+      # 手工指定版本时由 sync-banner job 补一条提交。理论上到这里图已经是对的 ——
+      # 但「理论上」正是需要校验的地方：同步 job 可能失败，标签也可能被人在本地
+      # 直接打在一条还没同步的提交上。README 是要发进包里的，一张写着旧版本号的
+      # 横幅会跟着这次发布一起出去，且不会有任何提示。所以这里做成硬失败：
       # 宁可卡住一次发布，也不发一个自相矛盾的 README。
       - name: 校验 banner 版本号与 package.json 一致
         run: node .github/scripts/banner.mjs --check

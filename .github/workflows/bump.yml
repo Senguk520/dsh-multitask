@@ -21,6 +21,7 @@
 #   把提交信息写成以 `chore(release):` 开头 —— 本工作流会跳过这类提交（见下面 job
 #   上的 if）。于是可以自己改 package.json 的 version，再用这个前缀写提交信息推上去。
 #   这个前缀同时是**我们自己那条 bump 提交的记号**，所以它一身两用。
+#   （这种提交里 banner 印的版本号没人改，由下面的 `sync-banner` job 补。）
 #
 # ── 为什么文档改动也要涨版本 ────────────────────────────────────────────────
 #   本包把 `README.md` / `README.zh.md` / `docs/DESIGN.md` 都发进 npm 包里
@@ -55,7 +56,8 @@
 #     指定版本（见上面那条）。
 #   · 每次推送到 main 之后，bot 都会在其后追加一条
 #     `chore(release): bump version to x.y.z` 提交，所以**下次推送前先拉一下**，
-#     否则本地会比远端旧。
+#     否则本地会比远端旧。手工指定版本时追加的那条叫
+#     `chore(banner): sync banner version to x.y.z`。
 # ─────────────────────────────────────────────────────────────────────────────
 name: Bump version
 
@@ -145,6 +147,65 @@ jobs:
           for attempt in 1 2 3; do
             if git push origin HEAD:main; then
               echo "::notice::已把版本号推进到 $AFTER 并推回 main"
+              exit 0
+            fi
+            echo "推送被拒（第 ${attempt} 次），rebase 到最新 main 重试"
+            if [ "$attempt" = "3" ]; then
+              echo "::error::三次推送均失败，main 上存在持续竞争" >&2
+              exit 1
+            fi
+            git fetch origin main
+            git rebase origin/main
+          done
+
+  # ── 手工指定版本号时，把 banner 补上 ────────────────────────────────────────
+  #   上面那个 job 遇到 `chore(release):` 开头的提交会**整条跳过** —— 这是刻意的：
+  #   那种提交里的版本号是人写的，不该再被自动 +1。
+  #   可图不会因此跟着变：package.json 已经是新号，banner 还停在上一个号上，而且
+  #   没有任何东西会提醒你。这个 job 就补这个缺口，**只在 bump 被跳过时才跑**：
+  #     · 有漂移 → 补一条只改 banner 的提交推回 main；
+  #     · 没漂移（比如那条 chore(release) 提交压根没动版本号）→ 什么都不做。
+  #
+  #   为什么单独开一个 job 而不是塞进上面：上面 job 的 if 是它自己的语义，拆开后
+  #   两条路径各自的行为一眼能看懂，日志也不会混在一起。
+  sync-banner:
+    needs: bump
+    # `always()` 是必需的：needs 里的 job 被跳过时，默认会把这个 job 一起跳过。
+    # 后两道判断与上面同源：bot 自己推的提交不进这个 job。
+    if: always() && needs.bump.result == 'skipped' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0 # 同上面的理由：推送被拒时要 rebase
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: banner 落后就补一条提交
+        run: |
+          # 先只看有没有漂移。这里把输出丢掉是有意的：`--check` 对漂移会打一条
+          # ::error::，而这条路径下面会自己修好，不该在日志里留下一段像故障的红字。
+          if node .github/scripts/banner.mjs --check >/dev/null 2>&1; then
+            echo "banner 已经和 package.json 一致，无需补提交"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          node .github/scripts/banner.mjs --write
+          VERSION="$(node -p "require('./package.json').version")"
+          git commit -am "chore(banner): sync banner version to $VERSION"
+
+          # 与上面同一种处理：并发的人手 push 会让这次推送被拒，rebase 后重试。
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "::notice::banner 已同步到 v$VERSION 并推回 main"
               exit 0
             fi
             echo "推送被拒（第 ${attempt} 次），rebase 到最新 main 重试"
