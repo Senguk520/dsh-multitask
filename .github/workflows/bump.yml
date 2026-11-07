@@ -27,6 +27,16 @@
 #   （见 package.json 的 `files`）—— 它们**就是发布物的一部分**，改了就该有个新版本。
 #   所以这里不设 `paths-ignore`。
 #
+# ── README 顶部那张横幅也跟着涨 ────────────────────────────────────────────
+#   README 里的 banner（`docs/image/*.svg`）印着版本号，由 `.github/scripts/
+#   banner.mjs` 改写。两条路径都覆盖到了：
+#     · 正常推送 → `bump` job 在 `npm version patch` 之后顺手改图，跟版本号进
+#       **同一个提交** —— 不会多出一条提交，也不会出现「号涨了、图还停在旧号」。
+#     · 手工指定版本（`chore(release):` 提交，bump 会整条跳过）→ 由下面的
+#       `sync-banner` job 检测漂移后补一条只改图的提交。
+#   任一步失败就让整次运行失败：一张写着旧版本号的图是**静默错误** —— 图片照常
+#   显示，没人会注意到它不对，所以不能只靠人眼。
+#
 # ── 为什么这里不会自己触发自己（死循环）────────────────────────────────────
 #   用内置的 `GITHUB_TOKEN` 推送的提交**不会触发新的工作流运行** —— 这是 GitHub
 #   刻意的设计，专门用来防止「工作流触发工作流」的无限递归。所以本工作流推完
@@ -95,9 +105,11 @@ jobs:
 
       # 发布物是纯 JS，语法错误没有构建步骤会拦住它 —— 在这里花几秒挡一次。
       # 注意 `node --check` 对 `.js` 也按 ESM 解析（本包 package.json 里 type: module）。
+      # `.github/scripts/*.mjs` 是 CI 自己跑的小工具（banner 同步、入包核对），
+      # 它们同样没有构建步骤兜底，一并检查。
       - name: 入口文件语法检查
         run: |
-          for file in lib/index.js lib/client.js presets/multitask/*.mjs; do
+          for file in lib/index.js lib/client.js presets/multitask/*.mjs .github/scripts/*.mjs; do
             node --check "$file"
           done
           echo "语法检查通过"
@@ -120,6 +132,11 @@ jobs:
             echo "::error::npm version patch 之后版本号仍是 $BEFORE，未提交" >&2
             exit 1
           fi
+
+          # README 顶部横幅里的版本号写在这里，与上面的 bump 进同一个提交。
+          # 它不是「顺手做的美化」：banner 停在旧号上不会有任何报错，所以必须和
+          # package.json 绑死。失败就中断这次 bump（此时还没有提交，main 保持原样）。
+          node .github/scripts/banner.mjs --write
 
           git commit -am "chore(release): bump version to $AFTER"
 

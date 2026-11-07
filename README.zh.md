@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="docs/image/title.png" alt="dsh-multitask" width="854">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/image/title-dark.svg">
+  <img src="docs/image/title.svg" alt="dsh-multitask" width="854">
+</picture>
 
 </div>
 

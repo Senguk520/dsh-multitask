@@ -136,6 +136,14 @@ jobs:
             exit 1
           fi
 
+      # 正常路径下 bump.yml 已经把 banner 里的版本号和 package.json 一起提交了。
+      # 但「手工指定版本号」那条路（提交信息以 `chore(release):` 开头）会绕过
+      # bump.yml —— 图可能就停在旧号上。而 README 是发进包里的，一张写着旧版本号
+      # 的横幅会跟着这次发布一起出去，且不会有任何提示。所以这里做成硬失败：
+      # 宁可卡住一次发布，也不发一个自相矛盾的 README。
+      - name: 校验 banner 版本号与 package.json 一致
+        run: node .github/scripts/banner.mjs --check
+
       - name: 有依赖就装上（本包目前零依赖，这一步会跳过）
         run: |
           if [ -f package-lock.json ]; then
