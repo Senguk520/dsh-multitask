@@ -1623,7 +1623,12 @@ profile patch 里那份 `subagentModels` 挂在 `dsh-multitask` 那一行的 `co
 - 配置：`stallTimeoutMs`（默认 `300000` = 5 分钟 —— 够长，长到不误杀正在长思考 / 长命令里
   的 worker；够短，短到卡死不至于把等待拖成整晚）、`tickMs`（默认 `30000`）、
   `interruptOnStall`（默认 `true`，置 `false` 时只报警不停人）。三项都由 `composition.mjs`
-  给默认值，**可由 profile 按同一 `id` 覆盖**；`enabled: false` 时整行不动作。
+  那一行的 `config` 给默认值；**要改就改那一行并重启应用** —— profile 的 `cordis.patch.yml`
+  **够不到 preset 声明内部的行**（`lib/index.js` 的 `applyGuardOverrides` 只按 id 匹配
+  `coordinator-guard` / `workspace-acl`，只透传 `presetId` / `enabled` / `keep` / `extraDeny`），
+  而且它的语义是**整份 config 替换**而不是合并：就算够得到，也会把 `enabled` / `presetId` 一起
+  抹掉，看门狗随即以 `no-preset-id` 静默跳过。想按环境调阈值，正确做法是由 `lib/index.js`
+  读一个环境变量再透传（与多模式开关同一条路）。`enabled: false` 时整行不动作。
 
 **降级与已知边界**：
 

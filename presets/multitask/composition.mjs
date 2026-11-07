@@ -93,7 +93,8 @@
  *   1. 环境变量 `DSH_MULTITASK_MULTI_MODE=0` —— 两条新行与呈现插件一起停用。
  *      之所以用环境变量而不是 config 字段：profile patch 只能按 id 覆盖 roster 里
  *      **已存在**的行，够不到 preset 声明内部的这些行（`lib/index.js` 只把
- *      `keep` / `extraDeny` / `guardEnabled` 透传给减震器那一行）。
+ *      `presetId` / `enabled` / `keep` / `extraDeny` 透传给 `coordinator-guard` 与
+ *      `workspace-acl` 那两行）。
  *      它在模块加载时读取，所以改动需要重启应用生效。
  *   2. 直接给下面的行加 `disabled: true`（或删掉它）。改 composition.mjs 需配合
  *      递增 profile patch 里的 `?v=N` 才会重新加载，见 docs/DESIGN.md「改源码后如何生效」。
@@ -1726,9 +1727,13 @@ export function buildPlugins(options) {
     // `stallTimeoutMs` 就是默认的 5 分钟：够长，长到不会误杀长思考 / 长命令里的
     // worker；够短，短到卡死不至于把等待拖成整晚。
     //
-    // ⚠️ **可由 profile 覆盖**：宿主把 profile 里同一 `id` 的 `config` 与这里的默认值
-    // 合并，所以 `subagent-watchdog` 那一行写上 `stallTimeoutMs` / `tickMs` /
-    // `interruptOnStall` 就能按环境调（与其余行同一套覆盖机制）。
+    // ⚠️ **阈值只能改这一行的 `config` 并重启应用**：profile 里的 `cordis.patch.yml`
+    // **够不到 preset 声明内部的这些行** —— 宿主半（`lib/index.js` 的
+    // `applyGuardOverrides`）只按 id 匹配 `coordinator-guard` / `workspace-acl` 两行、
+    // 只透传 `presetId` / `enabled` / `keep` / `extraDeny`，没有"按任意 id 合并 config"
+    // 这条路；而宿主 `dsh-app-boot` 写明 patch 只作用于 entry 列表、且是**整份 config
+    // 替换**（指不到已存在 entry 只打一条 stderr warning）。所以想按环境调阈值，正确
+    // 做法是加一个环境变量在 `lib/index.js` 里透传，而不是写 profile patch。
     //
     // 失败取向同样是「绝不阻塞会话」：服务缺席、`interrupt` 不存在或抛错，一律只记
     // 一条日志 —— 最坏退回今天的行为（卡死仍然静默），绝不是把正常会话弄坏。

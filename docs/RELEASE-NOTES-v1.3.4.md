@@ -88,10 +88,12 @@
 （拿得到父 agent 时连同 `agent` 一起传）。停下会触发宿主的 `subagent-settled` 通知 ⇒
 父会话被唤醒，「卡住」于是成了一条**可见的汇报**。日志标记
 `[MULTITASK-WATCHDOG-STALLED] child=<id> idle=<ms>ms`；`interruptOnStall` 默认 `true`，
-可由 profile 覆盖。它**不自动重派** —— 该不该重派由看得见报告的协调者决定。
+要改就改 `composition.mjs` 那一行的 `config` 并重启（profile patch 够不到 preset 内部的行）。
+它**不自动重派** —— 该不该重派由看得见报告的协调者决定。
 
-**实测**：`node test/subagent-watchdog.mjs` **5/5 全绿**（W1 停滞即停、W2 活跃不误杀、
-W3 不碰别的模式、W4 释放后不再处理、W5 服务缺席 fail-open）。
+**实测**：`node test/subagent-watchdog.mjs` **7/7 全绿**（W1 停滞即停、W2 活跃不误杀、
+W3 不碰别的模式、W4 释放后不再处理、W5 服务缺席 fail-open；W6 瀑布契约：处理器必须把
+下游结果原样传回；W7 源码钉子：防止改回普通监听）。
 
 ## 验证方式
 
@@ -104,7 +106,7 @@ W3 不碰别的模式、W4 释放后不再处理、W5 服务缺席 fail-open）�
 | `test/repo-consistency.mjs` | **52/52** | 仓库一致性：静态 / 离线，不加载 DSH、不写文件 |
 | `test/coordinator-guard-fanout.mjs` | **6/6**（`--prove` **7/7**） | 重算扇出：一次 `tools/change` 不得自激放大 |
 | `test/coordinator-prompt-contract.mjs` | **14/14** | 派单后收尾：人格文本 + 同名段遮蔽 |
-| `test/subagent-watchdog.mjs` | **5/5** | 停滞看门狗：卡死会被停、活跃不误杀、别的模式不碰 |
+| `test/subagent-watchdog.mjs` | **7/7** | 停滞看门狗：卡死会被停、活跃不误杀、别的模式不碰 |
 
 `coordinator-guard-fanout.mjs` 带**反向验证**（`--prove`）：把 pass 闸门去掉后用例必须变红，
 否则说明它们是恒真的。另外 `approval-gate-integration` / `preset-dispatch` /
