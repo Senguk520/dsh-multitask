@@ -800,7 +800,8 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 - **父会话空闲时，转呈要靠「唤醒 + 重试」这一条路兜住，它有一个窗口上限。**
   `approval.request` 要求父会话有一个打开的回合，否则抛错。这种「回合刚好关着」的个例
   **不是随机故障**：后台派单时协调者派完就不等了，父会话的回合随之结束，子代理后面才动手 ——
-  所以它在一部分请求上稳定复现。
+  所以它在一部分请求上稳定复现。这一前提现在由人格与同名段遮蔽**显式**保证
+  （见「协调者何时结束回合」），不再是宿主的默认行为。
   本模块的处置是：转呈失败 → 发通知（那条通知会把空闲的父会话唤醒）→ 等回合打开 → 重试一次。
   于是这类个例通常**几毫秒**就回到正常路径（主对话里出现一张审批卡）。
   仍然有三条边界：① 只在**通知确实送达**时才等（没有送达就没东西会去唤醒父会话）；
@@ -1503,6 +1504,87 @@ profile patch 里那份 `subagentModels` 挂在 `dsh-multitask` 那一行的 `co
 由宿主半读进 composition 的委派行 `agentOptions`，所以它**只影响 Multitask 会话
 委派出的子代理**；standard 会话里的子代理不受它管辖。这正是要求里的
 「要分清楚」。
+
+### 重算必须有界（跨会话扇出的根因与两层修法）
+
+**现象**：在册会话一多，一次 `tools/change` 就能把主线程占死 —— `dsh web` 卡死，
+`SIGTERM` 也无响应，最后只能强杀进程。实测（N = 12 个在册会话）修复前的一次
+`tools/change` 打出 **`restrict=179`**，直接触发熔断（CAP = 220）。
+
+**机制出处**：
+
+- 宿主 `tools.restrict()`（`dsh-tools/lib/index.js:2991-3005`）**没有传 `notify: false`**，
+  所以**装**和**卸**限制都会同步 `emit('tools/change')`。
+- 而 `tools/change` 的处理是「遍历全部在册会话重算」。于是**每次重算自打两次广播**，
+  而每次广播又让所有在册会话各重算一次 —— 放大因子是 `2^(N-1)·(N-1)!` 量级。
+  旧 `sync()` 还「先 `release` 再 `restrict`」，正好把这两次广播都用满。
+- 快路的依据在 `dsh-tools:3066-3070`：`view().restrictableNames` 是在 `admits()` 过滤
+  **之前**填满的，也就是说它已经是**继承面全集**，不必先卸一遍再读。
+
+**修法（两层，彼此独立）**：
+
+1. **有界 pass 闸门**（`coordinator-guard.mjs` 的 `pass()`）。五个入口
+   （`agent/created`、`tools/post-execute`、`agent-preset/selected`、`tools/change`、
+   切模式时的 `release`）**全部**过闸；pass 期间由 `release()` / `restrict()` 自己打回来的
+   `tools/change` **只置 dirty、不递归**；pass 结束后按 dirty 补跑**至多 2 轮**全量核对
+   （`sync()` 幂等，多跑无害），仍未 settle 就打一条
+   `MULTITASK-GUARD-UNSETTLED`。`passDepth` **必须在 `finally` 里复位**：cordis 的 `emit`
+   是同步的，body 一旦抛错而闸门没解锁，之后所有入口都会被判成「重入」而只置 dirty，
+   守卫就**永久停摆**。
+2. **快路**：`deny = restrictableNames ∩ (¬keep ∪ extraDeny)` —— 直接按继承面全集算差集，
+   与「先卸再读可见面」**等价**。目标集合与已装集合相同时**零 `release` / 零 `restrict` /
+   零 `emit`**，自激的源头被整段拿掉。
+
+**实测**：修复前 N = 12 时一次 `tools/change` → `restrict=179` 并触发熔断；
+修复后同样场景 `restrict=0 dispose=0 emit=0`。`scope-local` 名字的诊断告警**保留** ——
+结构上摘不掉的名字仍会 warn 一次（T14 由红转绿）。
+
+**失效时的降级方向**：
+
+- 闸门失效（`finally` 没复位）= 守卫永久停摆，且**工具面偏宽也不会报警**，这是最坏的一种。
+  降级方向是「宁可多跑一次全量核对，也不要锁死」：异常路径一律复位，拿不准时按**未重入**处理。
+- 快路读不到 `view().restrictableNames`（旧宿主、测试桩）→ 退回慢路（先 `release` 再读可见面）。
+  正确性不变，只是回到「每次重算两次广播」；这时闸门是**唯一**的防线 —— 两层修法不能只留一层。
+- 宿主将来给 `restrict()` 补上 `notify: false`（或不再因体积变更广播 `tools/change`），
+  闸门与快路就退化成纯提速，原样保留即可。
+
+### 协调者何时结束回合（软硬两半：人格 + 同名段遮蔽）
+
+**现象**：派单之后协调者不停 —— 它反复去看 worker「跑到哪了」（`list_agents` /
+`job_output`），用过程数据把等待填满。一个本该一轮结束的动作被拖成好几轮，
+把上下文烧在**没有任何结论**的信息上。
+
+**机制出处**：
+
+- 宿主 `dsh-tool-subagent/lib/index.js:509-518` **无条件**注入一段系统提示
+  （段名 `tool:subagent`、order `2800`），其中一句是
+  「… continue useful work while they run」。该行的 Config 只有 `provider` / `toolName` /
+  `modelSelectionSettings` / `agentOptions` / `agentPreset` / `allowedAgentPresets` /
+  `maxDepth` —— **没有任何开关能关掉这段**。
+- 协调者人格 `composition.mjs` 的第 3 步同样写着「keep working while they run」；
+  修之前全仓库**没有任何一条**写着「无事可推进就结束回合」。
+- 段落可以**按名字被更近的作用域遮蔽**：`dsh-system-prompt/lib/index.js:245-249` 明写
+  "A scoped section shadows a global section with the same name"。同款先例是
+  `worker-persona.mjs:264-268` —— 在**子代理 scope** 上用同名段盖掉上游那份。
+
+**修法（两半，缺一不可）**：
+
+- **软的一半**：协调者人格新增 `## Ending your turn after a dispatch`
+  （`composition.mjs:185-193`）。它讲四件事：结束回合是**正确**动作；结论不会丢 ——
+  worker 回报时运行时以**新回合**唤醒它；禁止拿过程数据填等待；以及**本条覆盖宿主那句**
+  （"continue useful work" 只意味着「不要阻塞在派单上」，不意味着「必须继续产出回合」）。
+- **硬的一半**：新增 `presets/multitask/coordinator-prompt.mjs`，在**协调者 scope** 上注册
+  **同名段** `tool:subagent`（order `2800`）遮蔽宿主那份。目的不是重复人格，而是让**落点**
+  与人格一致，而不是把两句矛盾的话一起交给模型裁决。判据与 `coordinator-guard.mjs` 同形：
+  跳过 `isDelegatedChild`（worker 要的是「干活然后回报」，不是「结束回合」），
+  且要求归属本 preset（活绑定优先，会话头 `agentPreset` 只作退路）。
+
+**失效时的降级方向**：
+
+- 遮蔽没装上（`systemPrompt` 服务缺席、`section()` 不存在或抛错）→ **静默降级**回宿主原语义
+  （「边做边瞄」）。人格那半仍在，只是变成唯一防线，最坏结果是多刷几轮 —— 仍是可用会话。
+- 反过来若这里抛错 → **该会话起不来**，那比多刷几轮严重得多，所以刻意 fail-open：
+  绝不抛错、绝不阻塞会话创建。
 
 ---
 

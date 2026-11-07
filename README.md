@@ -129,7 +129,7 @@ When creating a **new session**, pick **"Multitask 减震器模式"** in the mod
 
 > The mode can be chosen **before a session's first turn starts**, and a session whose first turn has not yet started can still be switched into or out of it. What is frozen is a session that has **already started running its first turn** — that is an existing DSH constraint (the tool surface and prompt freeze on the first turn), not a limitation of this plugin.
 
-The coordinator translates your request into **self-contained** task briefs — a Subagent cannot see this conversation, so a brief must carry everything it needs (goal, verified current state, project conventions, safety rails, numbered tasks, conditional branches, stop conditions, report format). Independent briefs are dispatched **in parallel**, and the coordinator keeps working while they run.
+The coordinator translates your request into **self-contained** task briefs — a Subagent cannot see this conversation, so a brief must carry everything it needs (goal, verified current state, project conventions, safety rails, numbered tasks, conditional branches, stop conditions, report format). Independent briefs are dispatched **in parallel**, and the coordinator then ends its turn — the runtime wakes it with a new turn when a worker reports, so nothing is lost and the context stays clean.
 
 ---
 
