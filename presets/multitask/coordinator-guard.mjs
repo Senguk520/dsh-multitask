@@ -96,6 +96,22 @@
  * 它们不受 scope 过滤，所以「已经切走、本守卫够不到」的 agent 也能在这一刻被
  * 解除限制。没有这条，切换后那 21 个工具会一直缺着。
  *
+ * ── 重算必须**有界**：pass 闸门，以及为什么 finally 复位不可省 ────────────────
+ *
+ * 五个监听入口最后都落到 `sync()`，而 `sync()` 是「先卸再读再装」：`dispose()` 与
+ * `tools.restrict()` **在宿主里都会同步 emit `tools/change`**（`ScopedLayers` 的行为）。
+ * 于是每处理一个 agent 就自打两次广播，而 `tools/change` 的处理又正是「遍历**全部在册**
+ * agent 做全量 sync」—— 两者合起来是一次自激振荡：N≥2 个在册会话时，一次
+ * `tools/change` 会引发 ≈ `2^(N-1)·(N-1)!` 次**同步** sync，主线程占死（`dsh web`
+ * 卡死、SIGTERM 无响应）。
+ *
+ * 所以每个入口的 body 都包进 `pass()`：pass 期间自打回来的 `tools/change` 只置 dirty、
+ * 不递归；pass 结束后按 dirty 补跑至多 2 轮全量核对（`sync()` 幂等，多跑无害）。
+ *
+ * ⚠️ `passDepth` **必须**在 `finally` 里复位：cordis 的 `emit` 是同步的，body 一旦抛错
+ * 而闸门没解锁，之后**所有**入口都会被判成「重入」而只置 dirty，守卫就永久停摆 ——
+ * 工具面从此既不收窄、也不再自愈，而且没有任何日志。
+ *
  * @module dsh-multitask/presets/multitask/coordinator-guard
  */
 
@@ -598,13 +614,30 @@ export function apply(ctx, config) {
     for (const agent of [...tracked.values()]) sync(agent)
   }
 
+  // 一次「重算 pass」的重入闸门：pass 期间由 release()/restrict() 自己 emit 回来的
+  // tools/change 只置 dirty，不递归；pass 结束后补跑 ≤2 轮全量核对（幂等）。
+  let passDepth = 0
+  let dirty = false
+  const pass = (body) => {
+    if (passDepth > 0) { dirty = true; return }
+    passDepth = 1
+    try {
+      body()
+      for (let round = 0; dirty && round < 2; round += 1) { dirty = false; resync(undefined) }
+      if (dirty) { dirty = false; warn('recompute pass did not settle after 2 merged rounds; a tool-surface change may be applied one window late  [MULTITASK-GUARD-UNSETTLED]') }
+    } finally {
+      passDepth = 0
+      dirty = false            // cordis 的 emit 是同步的：异常不解锁会让闸门永久卡死
+    }
+  }
+
   // ── 主路径：agent 一出现就装，赶在首次 prompt 组装之前 ──
   //
   // payload 刻意解构：`agent/created` 传的是 payload **对象**，不是 agent 本身。
   // 把第一个参数当 agent 读，会得到一个没有 session、没有 ctx 的对象，
   // 限制就被静默跳过 —— 这是同生态插件里被明确记录过的坑。
   ctx.on('agent/created', ({ agent }) => {
-    sync(agent)
+    pass(() => sync(agent))
   })
 
   // ── 自愈路径：每次工具调用结束后重算 ──
@@ -614,7 +647,10 @@ export function apply(ctx, config) {
   //
   // 声明 prepend 与 concurrency-safe，使它不会拖慢无关的只读调用。
   ctx.on('tools/post-execute', (exec, _result, next) => {
-    sync(exec?.agent)
+    pass(() => sync(exec?.agent))
+    // `next()` 刻意留在闸门**之外**：它推进的是瀑布里别人的后续处理，
+    // 把下游塞进 pass 会让闸门一直开到别人的工作结束（下游一 emit tools/change
+    // 就会被误判成重入）。
     return next()
   }, { prepend: true })
 
@@ -624,7 +660,7 @@ export function apply(ctx, config) {
   // 广播（dsh-agent-preset-registry 监听 `session/event` 后转发）。两个参数分别是
   // 会话 id 与新的 preset id —— 这里只关心前者。
   ctx.on('agent-preset/selected', (sessionId) => {
-    resync(sessionId)
+    pass(() => resync(sessionId))
   })
 
   // ── 工具面变化：兜底重判 ──
@@ -632,7 +668,7 @@ export function apply(ctx, config) {
   // `tools/change` 是**无参数**广播（dsh-tools 在工具层变化时 emit，注册表
   // recompose 之后也会 emit），所以走全量核对分支。
   ctx.on('tools/change', () => {
-    resync(undefined)
+    pass(() => resync(undefined))
   })
 
   // ── 释放：agent 离开时必须卸掉限制 ──
@@ -640,6 +676,6 @@ export function apply(ctx, config) {
   // 限制层是按 scope key 存活的。scope key 被回收后复用到新 agent 上，
   // 会继承一条本该消失的过滤 —— 那就是「新会话莫名少了一堆工具」的成因。
   ctx.on('agent/disposed', ({ agent }) => {
-    release(agent)
+    pass(() => release(agent))
   })
 }
