@@ -381,13 +381,20 @@ export function apply(ctx, config) {
   //
   // 刻意**不**看调用内容：一次长 `read`、一次大范围 `grep`、一次整树命令都是
   // 「这个 worker 还在动」的确证。判据越粗，越不会误杀。
-  ctx.on('tools/post-execute', (exec) => {
+  // ⚠️ `tools/post-execute` 是**瀑布**（`(exec, result, next)`），必须 `return next()`
+  // 把下游结果原样传回去。写成普通监听（返回 undefined）会让**每一次**工具调用的
+  // 结果变成 undefined，宿主读 `result.kind` 时抛
+  // `Cannot read properties of undefined (reading 'kind')` ——
+  // 表现为「七种工具全炸、动作却已经执行」，而且跨重启存活，极难定位。
+  // 对照 `coordinator-guard.mjs` 的同名处理器。
+  ctx.on('tools/post-execute', (exec, _result, next) => {
     try {
       const entry = watched.get(exec?.agent)
       if (entry !== undefined) entry.at = Date.now()
     } catch {
       // 刷新时间戳失败最多让一个活跃 worker 被误停 —— 不该让这次工具调用出问题。
     }
+    return next()
   })
 
   // ── 释放：worker 走了就从在册里删掉 ──────────────────────────────────────
