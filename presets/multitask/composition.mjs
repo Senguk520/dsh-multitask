@@ -179,8 +179,18 @@ Read-only inspection (read / grep / glob) is yours specifically so you can INDEP
 
 1. Understand what the user actually wants. If a genuine decision is theirs to make, or something material is ambiguous and cannot be settled by inspection, ask with ask_user_question. Do not ask what you can find out.
 2. Translate it into one or more SELF-CONTAINED task briefs. A subagent does not see this conversation, so a brief that assumes shared context is a failed brief.
-3. Fire independent briefs in parallel — start several delegations in one message, then keep working while they run.
+3. Fire independent briefs in parallel — start several delegations in one message. Then do only the coordinator's own work: write the next brief, verify a claim a worker already reported, or answer the user.
 4. Read the conclusions, verify what matters, and report to the user.
+
+## Ending your turn after a dispatch
+
+Ending the turn is the CORRECT action once a dispatch is done. When nothing is left for you to advance — no brief to write, no reported claim waiting for verification, no answer owed to the user — END YOUR TURN NOW. Do not go looking for something to fill the wait with: a turn that idles while workers run costs the user time and adds nothing to this conversation.
+
+Nothing is lost by ending early. The runtime notifies you when a worker finishes, and its report arrives as a NEW TURN. Ending the turn hands control back and leaves the work running; it does not cancel a delegation, discard a result, or skip a step you would have taken.
+
+Never spend the wait on process data. Do not call \`list_agents\`, \`job_list\` or \`job_output\` to watch how far a worker has got — their state tells you nothing you can act on, and polling only turns a report that will arrive on its own into a slower, noisier copy of itself. Do not read, grep or redo the files a worker owns either: that duplicates work inside the expensive context this conversation exists to protect. \`read\`, \`grep\` and \`glob\` are yours for verifying a conclusion that has ALREADY been delivered, not for shadowing one that has not.
+
+One instruction conflict to settle here. The \`subagent\` tool injects its own prompt section saying to "continue useful work while they run". That sentence means "do not block on a delegation" — it does NOT mean you must keep producing turns until a worker reports. Where the two disagree, THIS section overrides it: when nothing is left to advance, ending the turn IS the useful action.
 
 ## Choosing which worker to delegate to
 
@@ -1647,6 +1657,43 @@ export function buildPlugins(options) {
         // 不写进来协调者就看不见它（保留集是白名单，`deny = 可见集 − 保留集`）。
         keep: ['subagent_preset', ...(MULTI_MODE_ENABLED ? ['subagent_ptc', 'subagent_minimal'] : [])],
       },
+    },
+
+    // ── ★ 协调者的提示段落：派完单就该结束回合 ────────────────────────────────
+    //
+    // ── 为什么需要这一行（人格里已经写了优先级，这里还要再动手）────────────────
+    //
+    // 宿主 `dsh-tool-subagent`（`lib/index.js:509-518`）会**无条件**注入一段系统提示，
+    // 名为 `tool:subagent`、order 2800，正文含
+    //
+    //     "…start several delegations in one assistant message and continue useful
+    //      work while they run."
+    //
+    // 最后半句被模型读成「派完单要一直产出回合」，于是协调者用 `list_agents` /
+    // `job_list` / `job_output` 和翻 worker 的文件把等待填满。人格里那句「没活可推进
+    // 就结束回合」是**一条消息**，而这段是**工具自带的说明**，模型通常更信后者。
+    //
+    // 该段的 Config 只有 `provider` / `toolName` / `modelSelectionSettings` /
+    // `agentOptions` / `agentPreset` / `allowedAgentPresets` / `maxDepth`——
+    // **没有任何开关能关掉它**，所以只能从作用域下手。
+    //
+    // ── 为什么「同名段」能盖掉它（机制出处）───────────────────────────────────
+    //
+    // `dsh-system-prompt/lib/index.js:245-249` 明写 "A scoped section shadows a global
+    // section with the same name; duplicates within one layer throw"（合并见
+    // `dsh-scope/lib/index.js:177-181`）。更近的作用域赢，所以只要在**协调者自己的
+    // scope** 上注册一个同名 `tool:subagent`，宿主那份就被遮蔽。
+    //
+    // 这不是新机制：`worker-persona.mjs:264-268` 已经在**子代理 scope** 上用同名段
+    // `deployment:persona-prefix` 盖掉上游那份，本行照同一个先例做。
+    //
+    // ⚠️ 方向闸门在模块内部：只对**非子代理、且归属本 preset** 的 agent 生效。
+    // worker 必须保留宿主原语义（干完活再停），装错了会直接削弱执行力。失败取向是
+    // 「绝不阻塞会话」：`systemPrompt` 缺席或注册被拒时安静退回宿主原语义。
+    {
+      id: 'coordinator-prompt',
+      name: local('./coordinator-prompt.mjs'),
+      config: { enabled: true, presetId: PRESET_ID },
     },
 
     // ── ★ 工作区 ACL：让子代理的 shell 在新工作区里开箱即用 ──────────────────
