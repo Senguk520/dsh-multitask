@@ -7,7 +7,6 @@
 
 </div>
 
-# dsh-multitask
 
 <p align="center"><b>给 DeepSeek Harness 的「减震器模式」—— 主对话永远不碰你的代码库。</b></p>
 

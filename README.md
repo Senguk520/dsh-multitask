@@ -7,7 +7,6 @@
 
 </div>
 
-# dsh-multitask
 
 <p align="center"><b>The Multitask "shock absorber" mode for DeepSeek Harness — the main conversation never touches your codebase.</b></p>
 
