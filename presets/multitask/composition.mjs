@@ -1087,6 +1087,44 @@ const LIST_AGENTS_ROWS = LIST_AGENTS_SUBPATH
   ? [{ id: 'tool-subagent-list-agents', name: LIST_AGENTS_ROW_NAME }]
   : []
 
+/**
+ * 可以透传给 `@deepseek-ai/dsh-compaction-basic` 的字段，及其合法性判据。
+ *
+ * 这五项是上游 `POLICY_CONFIG_KEYS`（`compaction-basic/src/config.ts`）里与
+ * 「预留多少、摘要多长、何时触发」有关的那一组。**刻意不把 `auto` /
+ * `summarizationProvider` / `summarizationModel` 放进来**：前者关掉压缩等于关掉
+ * 长会话的生命线，后两者属于另一个问题（压缩用哪个模型），不该夹在「修预算」里。
+ *
+ * ⚠️ **必须声明在 `definition` 之前**：`definition.plugins` 在模块求值时就会调用
+ * `buildPlugins()` → `normalizeCompaction()`，而这里用的是 `const`（不提升）。
+ * 旧版 `normalizeCompaction` 靠「无配置提前 return」侥幸躲过了这个顺序问题，
+ * 现在缺省预算无条件生效，声明顺序就成了硬约束（踩过：`Cannot access
+ * 'COMPACTION_FIELDS' before initialization`）。
+ */
+const COMPACTION_FIELDS = Object.freeze({
+  headroomTokens: (value) => Number.isSafeInteger(value) && value > 0,
+  maxTokens: (value) => Number.isSafeInteger(value) && value > 0,
+  retainTokens: (value) => Number.isSafeInteger(value) && value > 0,
+  thresholdRatio: (value) => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1,
+  retainRatio: (value) => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1,
+})
+
+/**
+ * 本包给子代理压缩的**缺省预算**（同样必须在 `definition` 之前，理由同上）。
+ *
+ * 两个数各自的理由不同，不要合并成「都改小」：
+ *
+ * - `headroomTokens: 8192` —— 真正修 issue #5 的那一个：它决定压缩**何时**
+ *   触发，推导见下方 `normalizeCompaction()`（对大窗口单调无影响）。
+ * - `maxTokens: 65536` —— 与上游缺省**保持一致**。它是摘要输出的上限，不参与
+ *   压力预算；显式写死是为了不让它跟着被调小的 headroom 缩到 8192，否则
+ *   大窗口模型的摘要上限会被顺手改小（那才是真的误伤）。
+ */
+export const COMPACTION_DEFAULTS = Object.freeze({
+  headroomTokens: 8192,
+  maxTokens: 65536,
+})
+
 /** preset 的显示元数据（供新会话界面的模式选择器使用）。 */
 export const definition = {
   id: PRESET_ID,
@@ -1186,60 +1224,72 @@ function normalizeWatchdog(watchdog) {
 }
 
 /**
- * 可以透传给 `@deepseek-ai/dsh-compaction-basic` 的字段，及其合法性判据。
- *
- * 这五项是上游 `POLICY_CONFIG_KEYS`（`compaction-basic/src/config.ts`）里与
- * 「预留多少、摘要多长、何时触发」有关的那一组。**刻意不把 `auto` /
- * `summarizationProvider` / `summarizationModel` 放进来**：前者关掉压缩等于关掉
- * 长会话的生命线，后两者属于另一个问题（压缩用哪个模型），不该夹在「修预算」里。
- */
-const COMPACTION_FIELDS = Object.freeze({
-  headroomTokens: (value) => Number.isSafeInteger(value) && value > 0,
-  maxTokens: (value) => Number.isSafeInteger(value) && value > 0,
-  retainTokens: (value) => Number.isSafeInteger(value) && value > 0,
-  thresholdRatio: (value) => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1,
-  retainRatio: (value) => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1,
-})
-
-/**
  * 把宿主传进来的「压缩设置」收敛成可以直接展开进 `compaction-basic` 行 `config` 的片段。
  *
- * ── 为什么这一项必须能配（issue #5）──────────────────────────────────────────
+ * ── 上游到底怎么算这笔账（`compaction-basic/lib/index.js` 实测行号）─────────────
  *
- * `compaction-basic` 的缺省值是 `headroomTokens = 65536`、`maxTokens = headroomTokens`
- * （`config.ts` 里 `config.maxTokens ?? headroomTokens`）。而压力预算算的是
+ *     headroomTokens = config.headroomTokens ?? 65536        // 第 63 行
+ *     maxTokens      = config.maxTokens ?? headroomTokens    // 第 64 行
+ *     messageBudget  = contextWindow − reservedCompletionTokens          // 128
+ *     pressureBudget = messageBudget − headroomTokens                    // 130
+ *     pressureBudget <= 0  ⇒  throw TargetPressureConfigError            // 131
+ *     thresholdTokens = floor(min(contextWindow × thresholdRatio,         // 132
+ *                                 pressureBudget))
+ *     retainTokens = retainTokens ?? floor(messageBudget × retainRatio)  // 133
  *
- *     contextWindow − headroomTokens − maxTokens
+ * 两条必须记住的事实：
  *
- * 在 128k 的本地模型上就是 `128000 − 65536 − 65536 = −3072` ⇒ 负预算 ⇒
- * `TargetPressureConfigError` ⇒ **紧急压缩**，而且每一轮都重演。
+ * 1. **公式里没有 `maxTokens`。** 它只是摘要生成的输出上限，与「何时压缩」无关。
+ *    早期按 `contextWindow − headroom − maxTokens` 估算的说法是错的。
+ * 2. 预算为负时上游是**抛配置错误**，不是「每一步都在紧急压缩」；预算为正但被
+ *    钳制时，表现才是压缩来得比预期早。
+ *
+ * ── 为什么把 headroom 调小是**单调安全**的 ──────────────────────────────────
+ *
+ * headroom 在整个模块里只出现在 pressureBudget 这一处。于是
+ *
+ *     threshold(H) = min(0.8 × W, W − R − H)      （R = 请求的输出预留）
+ *
+ * H 减小 ⇒ `W − R − H` 增大 ⇒ threshold **增大或不变**，绝不会提前压缩。
+ * 而当窗口大到 `W − R − 65536 ≥ 0.8 × W` 时（1M 窗口、R = 65536 时为
+ * 868928 ≥ 800000，成立），threshold 本来就被 0.8 × W 封顶着：
+ * **大窗口模型改不改 headroom，压缩触发点一模一样。**
+ *
+ * 所以这里不需要知道模型窗口、也不需要按模型分别配置：一个偏小的 headroom
+ * 对小窗口是修复，对大窗口是无操作。这正是不走 `modelPolicies` 的原因。
+ *
+ * ── 缺省与覆盖的规则 ────────────────────────────────────────────────────────
+ *
+ * - 用户什么都没写：`headroomTokens = 8192`、`maxTokens = 65536`。
+ * - 用户只写了 headroom：`maxTokens` **跟随用户的 headroom**（与上游第 64 行
+ *   的缺省语义一致），而不是跟我们的 65536。
+ * - 用户写了 maxTokens：一律用用户的。
+ * - 其余三项（retainTokens / thresholdRatio / retainRatio）只在用户写了才带，
+ *   不写就继续由上游缺省决定。
  *
  * 宿主 `cordis.patch.yml` 里对 `compaction-basic` 的修正**到不了这里**：本 preset
  * 把压缩放在 `isolate: { compaction: true }` 的组里，组内是一个独立的 realm，
  * 宿主那条按 id 的 patch 只作用于入口列表，指不进 preset 声明内部（详见
- * `subagent-watchdog` 行上方同一条注释）。
- *
- * 所以「预留多少」必须由本包自己带进来：用户值经 `lib/index.js` 的
- * `readCompaction()` 规范化后从这里进入 `compaction-basic` 那一行。
- *
- * ── 为什么不给默认值 ─────────────────────────────────────────────────────────
- *
- * 不传 / 传空时**不产生 `config` 键**（返回 `noOptions()`），于是行为与加入本参数
- * 之前逐字等价：上游自己的默认值说了算。给本包一个「更安全的默认」听起来更好，
- * 但那是**替用户改压缩策略**：不同模型的窗口差一个数量级，猜错就是把长会话截短。
- * 面板把这件事讲清楚，值交给用户填。
+ * `subagent-watchdog` 行上方同一条注释）。所以预算必须由本包自己带进来。
  *
  * @param compaction - `{ headroomTokens?, maxTokens?, retainTokens?, thresholdRatio?, retainRatio? }`。
- * @returns 供 `...` 展开的对象；没有任何合法字段时无键。
+ * @returns 供 `...` 展开的对象；始终带 `config`（缺省预算也是配置）。
  */
 function normalizeCompaction(compaction) {
-  if (compaction === null || typeof compaction !== 'object' || Array.isArray(compaction)) return noOptions()
+  const source = compaction !== null && typeof compaction === 'object' && !Array.isArray(compaction)
+    ? compaction
+    : noOptions()
   const config = noOptions()
   for (const [field, isValid] of Object.entries(COMPACTION_FIELDS)) {
-    const value = compaction[field]
+    const value = source[field]
     if (isValid(value)) config[field] = value
   }
-  return Object.keys(config).length === 0 ? noOptions() : { config }
+  const userHeadroom = config.headroomTokens
+  config.headroomTokens = userHeadroom === undefined ? COMPACTION_DEFAULTS.headroomTokens : userHeadroom
+  if (config.maxTokens === undefined) {
+    config.maxTokens = userHeadroom === undefined ? COMPACTION_DEFAULTS.maxTokens : userHeadroom
+  }
+  return { config }
 }
 
 /**
@@ -1331,9 +1381,10 @@ function noOptions() {
  *
  * ── 关于可选的 `compaction`（子代理 realm 的压缩预算）────────────────────────
  *
- * 同样**不传参时与加入本参数之前逐字等价**：`compaction-basic` 那一行拿到的是
- * 空片段，也就是上游自己的默认值（65536 / 65536）。传了才展开成 `config`，
- * 理由与「为什么必须能配」见 `normalizeCompaction()`。
+ * **不传参也会带上一组缺省预算**（`COMPACTION_DEFAULTS`：8192 / 65536）——这是
+ * 本包替子代理选的值，不是上游缺省（65536 / 跟随 headroom）。为什么这组缺省
+ * 既能修好小窗口、又对大窗口模型无影响，推导见 `normalizeCompaction()`。
+ * 用户传了 `compaction` 就按那里的覆盖规则合并。
  *
  * @param options - 可选的注入项。
  * @param options.modelMap - `类型键 -> { provider, model, reasoningEffort? }`。
@@ -1451,9 +1502,9 @@ export function buildPlugins(options) {
     // ⚠️ `isolate: { compaction: true }` 是一道**双向**的墙：
     //   · 出去：本组用的压缩实例与宿主那一份互不干扰；
     //   · 进来：宿主 `cordis.patch.yml` 里对 `compaction-basic` 的修正**进不来**。
-    // 所以「预留多少 token」必须由本包自己带进 `compaction-basic`（见
-    // `normalizeCompaction`）：上游默认的 65536+65536 在 ≤128k 窗口的模型上是负预算，
-    // 会退化成每轮都触发紧急压缩（issue #5）。
+    // 所以预算必须由本包自己带进 `compaction-basic`（见 `normalizeCompaction`）：
+    // 上游缺省 headroom 65536 在小窗口模型上会把压力预算算到零以下，直接抛
+    // `TargetPressureConfigError`（issue #5）。本包缺省改成 8192 / 65536。
     {
       id: 'compaction',
       name: 'cordis:group',
@@ -1463,7 +1514,7 @@ export function buildPlugins(options) {
         {
           id: 'compaction-basic',
           name: '@deepseek-ai/dsh-compaction-basic',
-          // 未配置时**不产生 `config` 键** ⇒ 与加入本参数之前逐字等价。
+          // 始终带 `config`：缺省预算由本包给出（见 `COMPACTION_DEFAULTS`）。
           ...compaction,
         },
         { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },

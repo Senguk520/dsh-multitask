@@ -226,7 +226,7 @@ Once installed, DSH's settings gain the following.
 | Model used by Subagents | `multitask.subagentModels[]` | the default model for each of the four worker kinds, plus that model's **reasoning effort** (the choices come from the model catalogue; a model that advertises none shows no control). Either "use one model for every Subagent" or per-kind; the default is "inherit coordinator". Applies only to sessions created **afterwards** |
 | Subagent parallelism limit | `subagent.maxActiveSubagents` | **the same field** as the row in Settings → General, and it takes effect immediately |
 | Subagent stall watchdog | `multitask.watchdog` | how quiet a Subagent must be to count as stalled, the check interval, and what happens then |
-| Subagent context compaction | `multitask.compaction` | the budget for the compaction that runs inside the Subagent realm (headroom / summary size, in tokens). Empty keeps the upstream default of 65536; on a context window of 128k or less it must be lowered, or headroom plus summary exceeds the window, the budget goes negative, and nearly every step compacts |
+| Subagent context compaction | `multitask.compaction` | how much room a Subagent's auto-summary gets. **The defaults (8192 reserved / 65536 summary cap) ship with the plugin and work out of the box — you normally do not need to touch this.** DSH's own 65536 reservation makes small-context models fail outright; the plugin corrects it by default without changing when compaction triggers on large-context models. Empty fields keep the defaults (the grey text shows what is currently in effect); changes apply to new sessions |
 
 **The "General" page — two rows** (alongside the built-in language / appearance / developer-tools rows)
 

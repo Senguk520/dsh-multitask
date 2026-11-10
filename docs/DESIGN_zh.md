@@ -163,7 +163,7 @@ clone 本仓库、直接跑工作区里的源码时用这条（改动不经过 n
 | 子代理使用的模型 | `multitask.subagentModels[]`（`subagentType` / `provider` / `model` / `reasoningEffort?`） | 四类 worker **各自的默认模型**，以及该模型的**思考强度**。「所有子代理使用同一个模型」选**是**时，四类一起写成同一条路线；选**否**时每类单独指定，「继承协调者」是默认项。`reasoningEffort` 的档位**只能**取自模型目录（`models[].reasoning.efforts[]`，见 `dsh-api-remotes` 的 `session.modelCatalog`）—— 写死 low / medium / high 会提交上游 `ReasoningEffortId()` 不认的值；模型没公布档位时不画该控件 |
 | 子代理并行数量上限 | `subagent.maxActiveSubagents` | **与「设置 → 通用设置」里的那个值是同一个** —— 两处 UI 编辑同一个字段，所以改一处另一处立刻跟着变。它决定**同一主 Agent 下同时能存活多少个子代理**，对所有模式生效，Multitask 不例外。改完**即刻生效** |
 | 子代理停滞看门狗 | `multitask.watchdog`（`stallTimeoutMs` / `tickMs` / `mode`） | 面板用**秒**、配置存**毫秒**，换算只在控制器里各做一次。它决定「子代理安静多久算卡死」以及卡死之后做什么（只记录 / 停止并唤醒） |
-| 子代理上下文压缩 | `multitask.compaction`（`headroomTokens` / `maxTokens` / …，单位 token） | **子代理 realm 内那次压缩的预算**。`compaction-basic` 的上游默认是 `headroomTokens: 65536`、`maxTokens` 随之为同值；压力预算 `contextWindow − headroom − maxTokens` 在 ≤128k 窗口的模型上会算成**负数**，于是每一步都触发紧急压缩。本 preset 把压缩放在 `isolate: { compaction: true }` 的组里，宿主 patch 进不去，所以这一项是那条链路上**唯一**的入口。留空 = 不干预，用上游默认 |
+| 子代理上下文压缩 | `multitask.compaction`（`headroomTokens` / `maxTokens` / …，单位 token） | **手动覆盖的入口，不是修复本身**。修复在组装层：`composition.mjs` 的 `COMPACTION_DEFAULTS`（`headroomTokens: 8192`、`maxTokens: 65536`）无条件写进 `compaction-basic` 那一行。上游缺省 headroom 65536 会让压力预算 `contextWindow − 请求输出预留 − headroomTokens` 在 ≤128k 窗口的模型上变成零以下、直接抛 `TargetPressureConfigError`（`maxTokens` **不参与**这个公式，早期"`contextWindow − headroom − maxTokens`"的说法是错的）。调小 headroom 对大窗口**单调无影响**：触发点 `min(0.8 × 窗口, 窗口 − 输出预留 − headroom)` 在大窗口本来就被 0.8 × 窗口封顶，1M 模型一个字都不变。本 preset 把压缩放在 `isolate: { compaction: true }` 的组里，宿主 patch 进不去，所以预算必须由本包自带。面板输入框的灰字显示当前生效值；留空 = 回到缺省预算 |
 
 **「通用设置」页 —— 两行**（与官方的语言 / 外观 / 开发者工具并排）
 
