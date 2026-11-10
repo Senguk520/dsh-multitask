@@ -219,12 +219,14 @@ The provider is fixed to `spawn` and is not a configuration option: upstream req
 
 Once installed, DSH's settings gain the following.
 
-**The "Multitask" page — two cards**
+**The "Multitask" page — four cards**
 
 | Card | Field | What it does |
 |---|---|---|
-| Model used by Subagents | `multitask.subagentModels[]` | the default model for each of the four worker kinds. Either "use one model for every Subagent" or per-kind; the default is "inherit coordinator". Applies only to sessions created **afterwards** |
+| Model used by Subagents | `multitask.subagentModels[]` | the default model for each of the four worker kinds, plus that model's **reasoning effort** (the choices come from the model catalogue; a model that advertises none shows no control). Either "use one model for every Subagent" or per-kind; the default is "inherit coordinator". Applies only to sessions created **afterwards** |
 | Subagent parallelism limit | `subagent.maxActiveSubagents` | **the same field** as the row in Settings → General, and it takes effect immediately |
+| Subagent stall watchdog | `multitask.watchdog` | how quiet a Subagent must be to count as stalled, the check interval, and what happens then |
+| Subagent context compaction | `multitask.compaction` | the budget for the compaction that runs inside the Subagent realm (headroom / summary size, in tokens). Empty keeps the upstream default of 65536; on a context window of 128k or less it must be lowered, or headroom plus summary exceeds the window, the budget goes negative, and nearly every step compacts |
 
 **The "General" page — two rows** (alongside the built-in language / appearance / developer-tools rows)
 
@@ -486,6 +488,8 @@ The remaining switches live in the `config` of the corresponding rows in `preset
 | `interrupt-before-send` | corrections go back to queueing at the next step boundary instead of stopping the target's current turn |
 | `approval-gate` | dangerous operations no longer prompt (back to default DSH behaviour) |
 | `workspace-acl` | `WRITE_OWNER` is no longer granted automatically, and existing subdirectories are no longer stamped (or use `config.autoGrantWriteOwner: false` / `config.autoRepairStampedChildren: false` to switch off one half at a time) |
+
+The environment variable `DSH_MULTITASK_LIST_AGENTS_ROW` forces the standalone `list-agents` row in the delegation group on or off. `0` / `false` / `off` / `drop` drop it, `1` / `true` / `on` / `keep` keep it; unset means the decision is made by a host probe at startup (kept when the host's `@deepseek-ai/dsh-tool-subagent-control` still exports `./list-agents`, dropped otherwise — that subpath was removed in 0.2.2 and `list_agents` is registered by the main entry). It is read at module load, so it needs an app restart. It is only needed when the probe cannot reach a conclusion and you know which host you are on.
 
 The environment variable `DSH_MULTITASK_MULTI_MODE=0` removes the `subagent_ptc` and `subagent_minimal` delegation paths (and their two keep-list entries) in one step, without touching the original `subagent` / `subagent_fork`. It does **not** unmount the PTC presentation row: `subagent-mode` — the row that performs the collapse — is mounted unconditionally. Because no `multitask_ptc` worker then exists, the collapse has nothing to act on, so the practical effect is as if the presentation were off, but the row itself is still there. To turn the presentation off for real, disable the `subagent-mode` row. Only `0`, `false` and `off` disable the variable's switch — any other value, including a typo, leaves it enabled. It is read at module load, so it needs an app restart.
 

@@ -1,3 +1,8 @@
+import { createRequire } from 'node:module'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 /**
  * Multitask 模式的 agent preset 组成。
  *
@@ -862,6 +867,226 @@ const WATCHDOG_MODES = ['interrupt', 'log', 'off']
  */
 export const PRESET_ID = 'multitask'
 
+/* ── ★ 委派「清单工具」行：`…/list-agents` 子路径的宿主能力探测 ───────────── */
+
+/**
+ * 被探测的包，以及那一行在 preset 里登记的插件名。
+ *
+ * ── 为什么必须探测，而不是写死或直接删掉 ─────────────────────────────────────
+ *
+ * `@deepseek-ai/dsh-tool-subagent-control` 从 **0.2.2-alpha.3** 起把 `list_agents`
+ * 并进了包主入口（`apply()` 第一行就是 `registerListAgents(ctx)`），同时从
+ * `package.json` 的 `exports` 里**删掉**了 `./list-agents` 子路径。
+ *
+ * 写死那一行的后果不是「少一个工具」，而是**整个模式消失**：loader 解析不到该行 →
+ * 该行状态 `never started` → 整条 preset 被标记 `broken` → 模式选择器只渲染
+ * `broken === undefined` 的项（`@deepseek-ai/dsh-client-ui-agent-preset` 的
+ * `presetOptions`），于是「Multitask 减震器模式」从新会话列表里彻底不见。
+ *
+ * 反向也不能无条件删：在 0.2.1 及更早的宿主上，主入口**不**注册 `list_agents`，
+ * 那一行是它唯一的来源 —— 删掉会让旧宿主的协调者失去清单能力（`coordinator-guard`
+ * 仍然保留着该工具名，只是它不存在了）。
+ *
+ * 两种宿主的行表不可能同时正确，所以按宿主能力二选一。
+ *
+ * ── 判据为什么是「读包的 exports」而不是「import 一下试试」──────────────────
+ *
+ * 试 `import()` 会把一次失败的解析留在 ESM 缓存里，而且失败原因（包不存在 /
+ * 子路径被移除 / 文件缺失）在报错上难以区分。读 `exports` 表是纯数据判断，还能
+ * 区分两件完全不同的事：
+ *
+ *   · 这个 base **找不到宿主包** → 无结论，换下一个 base；
+ *   · 宿主包在、但 `exports` 里**没有** `./list-agents` → 确定结论，立即返回。
+ *
+ * ── 为什么需要「多个 base」/ 为什么会「无结论」──────────────────────────────
+ *
+ * preset 模块由宿主的 loader 加载，它自己的模块解析根**不是**宿主包的安装位置：
+ * 桌面端宿主包在 `app.asar/dsh/node_modules`（Electron 的 fs 对 asar 透明），
+ * 而本包被装在 profile 的 `node_modules` 下 —— 从插件目录 `createRequire`
+ * 根本解析不到 `@deepseek-ai/dsh-tool-subagent-control`。所以依次试：
+ *
+ *   1. `process.argv` 里**真实存在**的路径（桌面端为 `…/resources/app.asar/dsh`；
+ *      源码运行时为 `dsh` 的入口脚本）；
+ *   2. Electron 的 `process.resourcesPath` 下的两个常规位置（argv 被改写时兜底）；
+ *   3. 进程的 cwd 与本文件所在目录（pnpm 把宿主包提升到这两处时有效）。
+ *
+ * ── 全都无结论时：**丢掉这一行** ─────────────────────────────────────────────
+ *
+ * 两害相权：丢行在旧宿主上只是少一个 `list_agents` 工具，留行在新宿主上会让整个
+ * 模式从选择器里消失。所以默认取「丢」。
+ *
+ * 需要强行指定时设环境变量 `DSH_MULTITASK_LIST_AGENTS_ROW`：
+ * `1` / `true` / `on` / `keep` 强行保留，`0` / `false` / `off` / `drop` 强行丢弃。
+ */
+const LIST_AGENTS_PACKAGE = '@deepseek-ai/dsh-tool-subagent-control'
+const LIST_AGENTS_ROW_NAME = `${LIST_AGENTS_PACKAGE}/list-agents`
+const LIST_AGENTS_OVERRIDE_ENV = 'DSH_MULTITASK_LIST_AGENTS_ROW'
+
+/**
+ * 本宿主是否仍导出 `…/list-agents` 子路径。
+ *
+ * 永不抛错：这个函数在模块求值路径上，抛错等于 preset 根本加载不出来。
+ *
+ * @returns 是否应当保留那一行（无结论时返回 `false`，理由见上方说明）。
+ */
+function hostHasListAgentsSubpath() {
+  const override = readListAgentsOverride()
+  if (override !== undefined) return override
+  for (const base of listAgentsProbeBases()) {
+    const verdict = listAgentsSubpathFrom(base)
+    if (verdict !== undefined) return verdict
+  }
+  return false
+}
+
+/**
+ * 读环境变量里的强行指定。
+ *
+ * @returns `true` / `false`；未指定或写错时 `undefined`（交给自动探测）。
+ */
+function readListAgentsOverride() {
+  let raw
+  try {
+    raw = String(process.env?.[LIST_AGENTS_OVERRIDE_ENV] ?? '').trim().toLowerCase()
+  } catch {
+    return undefined
+  }
+  if (['0', 'false', 'off', 'drop'].includes(raw)) return false
+  if (['1', 'true', 'on', 'keep'].includes(raw)) return true
+  return undefined
+}
+
+/**
+ * 依次尝试的模块解析根（去重、按可信度排序）。
+ *
+ * @returns 若干目录路径。
+ */
+function listAgentsProbeBases() {
+  const bases = []
+  const push = (candidate) => {
+    if (typeof candidate !== 'string' || candidate === '') return
+    if (bases.includes(candidate)) return
+    bases.push(candidate)
+  }
+
+  let argv = []
+  try {
+    argv = Array.isArray(process.argv) ? process.argv.slice(1) : []
+  } catch {
+    argv = []
+  }
+  for (const arg of argv) {
+    if (typeof arg !== 'string' || arg === '' || arg.startsWith('-')) continue
+    // 只认「带路径分隔符」的参数：`electron .` 这种位置参数没有信息量。
+    if (!arg.includes('/') && !arg.includes('\\')) continue
+    let directory = arg
+    try {
+      if (existsSync(arg) && !statSync(arg).isDirectory()) directory = dirname(arg)
+    } catch {
+      // 路径不可 stat（asar 感知进程之外会这样）：先按「它是个文件」处理。
+      directory = dirname(arg)
+    }
+    push(directory)
+    // 兜底再试路径本身：`existsSync()` 在非 asar 感知的进程里会把
+    // `…/app.asar/dsh` 判成「不存在」，但那个字符串仍然可能是宿主的运行时目录。
+    push(arg)
+  }
+
+  try {
+    const resources = typeof process.resourcesPath === 'string' ? process.resourcesPath : ''
+    if (resources !== '') {
+      push(join(resources, 'app.asar', 'dsh'))
+      push(join(resources, 'app', 'dsh'))
+    }
+  } catch {
+    // 不是 Electron：没有 resourcesPath。
+  }
+
+  try {
+    push(process.cwd())
+  } catch {
+    // 没有 cwd 的环境（极少见）就跳过。
+  }
+  try {
+    push(dirname(fileURLToPath(import.meta.url)))
+  } catch {
+    // import.meta.url 解不出路径（被 bundle 过）时跳过。
+  }
+  return bases
+}
+
+/**
+ * 在**一个** base 上判定宿主包是否导出 `./list-agents`。
+ *
+ * @param base - 目录路径，作为模块解析的起点。
+ * @returns `true` / `false`；这个 base 解析不到宿主包时 `undefined`。
+ */
+function listAgentsSubpathFrom(base) {
+  let requireFrom
+  try {
+    requireFrom = createRequire(join(base, 'dsh-multitask-probe.js'))
+  } catch {
+    return undefined
+  }
+  const manifest = readHostControlManifest(requireFrom)
+  if (manifest === undefined) return undefined
+  const entry = manifest.exports === undefined || manifest.exports === null
+    ? undefined
+    : manifest.exports['./list-agents']
+  return entry !== undefined && entry !== null
+}
+
+/**
+ * 读出宿主 `dsh-tool-subagent-control` 的 `package.json`。
+ *
+ * 两条路径都要试，因为不同宿主版本导出的子路径不同：
+ *   1. `…/package.json` —— 0.2.1 与 0.2.2 都导出了它，最快且最准；
+ *   2. 主入口 + 向上找最近的 `package.json` —— 给「不导出 package.json」的宿主兜底。
+ *
+ * @param requireFrom - 以目标目录为根的 `require`。
+ * @returns 清单对象；解析不到这个包时 `undefined`。
+ */
+function readHostControlManifest(requireFrom) {
+  try {
+    const file = requireFrom.resolve(`${LIST_AGENTS_PACKAGE}/package.json`)
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    if (parsed !== null && typeof parsed === 'object') return parsed
+  } catch {
+    // 该宿主不导出 ./package.json（或这个 base 找不到包）：走主入口那一条。
+  }
+  try {
+    const entry = requireFrom.resolve(LIST_AGENTS_PACKAGE)
+    let dir = dirname(entry)
+    for (let depth = 0; depth < 8; depth += 1) {
+      const candidate = join(dir, 'package.json')
+      if (existsSync(candidate)) {
+        const parsed = JSON.parse(readFileSync(candidate, 'utf8'))
+        if (parsed?.name === LIST_AGENTS_PACKAGE) return parsed
+      }
+      const up = dirname(dir)
+      if (up === dir) break
+      dir = up
+    }
+  } catch {
+    // 这个 base 解析不到宿主包 —— 交给调用方换下一个 base。
+  }
+  return undefined
+}
+
+/** 这个宿主是否还导出 `…/list-agents` 子路径（导出供本地回归断言）。 */
+export const LIST_AGENTS_SUBPATH = hostHasListAgentsSubpath()
+
+/**
+ * 委派组里的「清单工具」行。
+ *
+ * ⚠️ 必须在 `definition` **之前**求值：`definition.plugins` 在模块求值时就调用
+ * `buildPlugins()`，那里会展开这个常量；放到后面会撞 TDZ
+ * （`Cannot access 'LIST_AGENTS_ROWS' before initialization`），整个模块导入即抛。
+ */
+const LIST_AGENTS_ROWS = LIST_AGENTS_SUBPATH
+  ? [{ id: 'tool-subagent-list-agents', name: LIST_AGENTS_ROW_NAME }]
+  : []
+
 /** preset 的显示元数据（供新会话界面的模式选择器使用）。 */
 export const definition = {
   id: PRESET_ID,
@@ -961,6 +1186,63 @@ function normalizeWatchdog(watchdog) {
 }
 
 /**
+ * 可以透传给 `@deepseek-ai/dsh-compaction-basic` 的字段，及其合法性判据。
+ *
+ * 这五项是上游 `POLICY_CONFIG_KEYS`（`compaction-basic/src/config.ts`）里与
+ * 「预留多少、摘要多长、何时触发」有关的那一组。**刻意不把 `auto` /
+ * `summarizationProvider` / `summarizationModel` 放进来**：前者关掉压缩等于关掉
+ * 长会话的生命线，后两者属于另一个问题（压缩用哪个模型），不该夹在「修预算」里。
+ */
+const COMPACTION_FIELDS = Object.freeze({
+  headroomTokens: (value) => Number.isSafeInteger(value) && value > 0,
+  maxTokens: (value) => Number.isSafeInteger(value) && value > 0,
+  retainTokens: (value) => Number.isSafeInteger(value) && value > 0,
+  thresholdRatio: (value) => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1,
+  retainRatio: (value) => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1,
+})
+
+/**
+ * 把宿主传进来的「压缩设置」收敛成可以直接展开进 `compaction-basic` 行 `config` 的片段。
+ *
+ * ── 为什么这一项必须能配（issue #5）──────────────────────────────────────────
+ *
+ * `compaction-basic` 的缺省值是 `headroomTokens = 65536`、`maxTokens = headroomTokens`
+ * （`config.ts` 里 `config.maxTokens ?? headroomTokens`）。而压力预算算的是
+ *
+ *     contextWindow − headroomTokens − maxTokens
+ *
+ * 在 128k 的本地模型上就是 `128000 − 65536 − 65536 = −3072` ⇒ 负预算 ⇒
+ * `TargetPressureConfigError` ⇒ **紧急压缩**，而且每一轮都重演。
+ *
+ * 宿主 `cordis.patch.yml` 里对 `compaction-basic` 的修正**到不了这里**：本 preset
+ * 把压缩放在 `isolate: { compaction: true }` 的组里，组内是一个独立的 realm，
+ * 宿主那条按 id 的 patch 只作用于入口列表，指不进 preset 声明内部（详见
+ * `subagent-watchdog` 行上方同一条注释）。
+ *
+ * 所以「预留多少」必须由本包自己带进来：用户值经 `lib/index.js` 的
+ * `readCompaction()` 规范化后从这里进入 `compaction-basic` 那一行。
+ *
+ * ── 为什么不给默认值 ─────────────────────────────────────────────────────────
+ *
+ * 不传 / 传空时**不产生 `config` 键**（返回 `noOptions()`），于是行为与加入本参数
+ * 之前逐字等价：上游自己的默认值说了算。给本包一个「更安全的默认」听起来更好，
+ * 但那是**替用户改压缩策略**：不同模型的窗口差一个数量级，猜错就是把长会话截短。
+ * 面板把这件事讲清楚，值交给用户填。
+ *
+ * @param compaction - `{ headroomTokens?, maxTokens?, retainTokens?, thresholdRatio?, retainRatio? }`。
+ * @returns 供 `...` 展开的对象；没有任何合法字段时无键。
+ */
+function normalizeCompaction(compaction) {
+  if (compaction === null || typeof compaction !== 'object' || Array.isArray(compaction)) return noOptions()
+  const config = noOptions()
+  for (const [field, isValid] of Object.entries(COMPACTION_FIELDS)) {
+    const value = compaction[field]
+    if (isValid(value)) config[field] = value
+  }
+  return Object.keys(config).length === 0 ? noOptions() : { config }
+}
+
+/**
  * 把配置里的毫秒数收敛成正数；非法值退回默认值。
  *
  * @param value - 配置值。
@@ -1047,14 +1329,22 @@ function noOptions() {
  * `300000 / 30000 / interrupt`，也就是今天写死在 composition 里的那组值。
  * 设置面板保存后，宿主半（`lib/index.js` 的 `readWatchdog()`）把新值从这里传进来。
  *
+ * ── 关于可选的 `compaction`（子代理 realm 的压缩预算）────────────────────────
+ *
+ * 同样**不传参时与加入本参数之前逐字等价**：`compaction-basic` 那一行拿到的是
+ * 空片段，也就是上游自己的默认值（65536 / 65536）。传了才展开成 `config`，
+ * 理由与「为什么必须能配」见 `normalizeCompaction()`。
+ *
  * @param options - 可选的注入项。
  * @param options.modelMap - `类型键 -> { provider, model, reasoningEffort? }`。
  * @param options.watchdog - `{ stallTimeoutMs, tickMs, mode }`（毫秒）。
+ * @param options.compaction - `{ headroomTokens?, maxTokens?, retainTokens?, thresholdRatio?, retainRatio? }`。
  * @returns 供 preset 注册表挂载的插件行数组。
  */
 export function buildPlugins(options) {
   const modelMap = normalizeModelMap(options?.modelMap)
   const watchdog = normalizeWatchdog(options?.watchdog)
+  const compaction = normalizeCompaction(options?.compaction)
   return [
     // ── 身份：协调者人格 + Multitask 工作纪律 ─────────────────────────────────
     //
@@ -1157,13 +1447,25 @@ export function buildPlugins(options) {
     // ── 压缩 ──────────────────────────────────────────────────────────────────
     //
     // 长会话必需：Multitask 会跑很多轮委派与回报，不做压缩会很快撞上上下文上限。
+    //
+    // ⚠️ `isolate: { compaction: true }` 是一道**双向**的墙：
+    //   · 出去：本组用的压缩实例与宿主那一份互不干扰；
+    //   · 进来：宿主 `cordis.patch.yml` 里对 `compaction-basic` 的修正**进不来**。
+    // 所以「预留多少 token」必须由本包自己带进 `compaction-basic`（见
+    // `normalizeCompaction`）：上游默认的 65536+65536 在 ≤128k 窗口的模型上是负预算，
+    // 会退化成每轮都触发紧急压缩（issue #5）。
     {
       id: 'compaction',
       name: 'cordis:group',
       group: true,
       isolate: { compaction: true, toolResultPruner: true },
       config: [
-        { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' },
+        {
+          id: 'compaction-basic',
+          name: '@deepseek-ai/dsh-compaction-basic',
+          // 未配置时**不产生 `config` 键** ⇒ 与加入本参数之前逐字等价。
+          ...compaction,
+        },
         { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
         {
           id: 'tool-result-pruner',
@@ -1181,10 +1483,17 @@ export function buildPlugins(options) {
       isolate: { workflowEngine: true },
       config: [
         { id: 'tool-subagent-control', name: '@deepseek-ai/dsh-tool-subagent-control' },
-        {
-          id: 'tool-subagent-list-agents',
-          name: '@deepseek-ai/dsh-tool-subagent-control/list-agents',
-        },
+
+        // 清单工具 `list_agents`：**按宿主能力二选一**，别把它写回常量。
+        //
+        //   · 0.2.2-alpha.3 起：主入口的 `apply()` 第一行就是 `registerListAgents(ctx)`，
+        //     `./list-agents` 子路径已从 `exports` 删除 ⇒ 这里**不能**有独立行，
+        //     否则 loader 解析失败 → 该行 `never started` → **整条 preset broken**
+        //     → 模式从选择器里消失（issue #1 / #2 / #3）。
+        //   · 0.2.1 及更早：主入口不注册它，**必须**有这一行。
+        //
+        // 判据与两种宿主的差异见 `LIST_AGENTS_ROWS` 上方那段长注释。
+        ...LIST_AGENTS_ROWS,
 
         // 主力委派工具：全新上下文的子代理，可续接，默认后台。
         //

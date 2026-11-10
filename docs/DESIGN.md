@@ -121,12 +121,14 @@ You can also switch the whole plugin off with `enabled: false` (no preset is dec
 
 Once this package is installed, DSH's **Settings** gains one top-level page, **Multitask** (the browser-side bundle is `lib/client.js`, declared by `package.json`'s `dsh.client`), plus two rows under **General**. They gather the tunables above that are **genuinely worth changing by hand** into one place, so you no longer have to edit the patch file:
 
-**The "Multitask" page — two cards**
+**The "Multitask" page — four cards**
 
 | Card | Field | Scope |
 |---|---|---|
-| Model used by Subagents | `multitask.subagentModels[]` (`subagentType` / `provider` / `model`) | the default model for each of the four worker kinds. With "use one model for every Subagent" set to **yes**, all four are written as one route; with **no**, each kind is set separately, and "inherit coordinator" is the default option |
+| Model used by Subagents | `multitask.subagentModels[]` (`subagentType` / `provider` / `model` / `reasoningEffort?`) | the default model for each of the four worker kinds, plus that model's **reasoning effort**. With "use one model for every Subagent" set to **yes**, all four are written as one route; with **no**, each kind is set separately, and "inherit coordinator" is the default option. The effort choices **must** come from the model catalogue (`models[].reasoning.efforts[]` in `session.modelCatalog` from `dsh-api-remotes`) — a hard-coded low/medium/high would submit ids that upstream `ReasoningEffortId()` rejects; a model that advertises none shows no control |
 | Subagent parallelism limit | `subagent.maxActiveSubagents` | **the same value** as the row in Settings → General — both UIs edit the same field, so changing one immediately changes the other. It decides **how many subagents can be live at once under one main Agent**, applies to every mode, and Multitask is no exception. Takes effect **immediately** |
+| Subagent stall watchdog | `multitask.watchdog` (`stallTimeoutMs` / `tickMs` / `mode`) | the panel uses **seconds**, the config stores **milliseconds**, and the conversion happens exactly once in each direction inside the controller. It decides how quiet a Subagent must be to count as stalled, and what happens then (record only / stop and wake) |
+| Subagent context compaction | `multitask.compaction` (`headroomTokens` / `maxTokens` / …, in tokens) | the budget for **the compaction that runs inside the Subagent realm**. The upstream default of `compaction-basic` is `headroomTokens: 65536` with `maxTokens` following it, so the pressure budget `contextWindow − headroom − maxTokens` goes **negative** on a 128k window and every step triggers emergency compaction. This preset keeps compaction inside `isolate: { compaction: true }`, which a host patch cannot reach, so this field is the only entry point on that path. Empty means "do not interfere": the upstream default applies |
 
 **The "General" page — two rows** (alongside the built-in language / appearance / developer-tools rows)
 
@@ -139,9 +141,9 @@ Once this package is installed, DSH's **Settings** gains one top-level page, **M
 >
 > ⚠️ **"Subagent parallelism limit" appears in two places at once, deliberately**: it takes one row under **General** (alongside the built-in run limits), and one card on the **Multitask** page as well (because it is the number this mode is tuned most often). Both places edit **the same field**, share one form snapshot and one write path — so there is no "which one wins" question, and no sync code is needed.
 >
-> **Save** submits the **only** field in the `multitask` namespace (`subagentModels[]`), so that save bar **serves the model card alone**: the parallelism limit is **written on change** (it commits when you release the control; there is no save button). That is the opposite of an approach that lies — make an instant-apply row wait for a save button and the user concludes their change has not landed, when it took effect long ago.
+> All four cards are **written on change** (they commit when the control is released or the dropdown is picked); there is no save bar on this page. The model card, the watchdog and the compaction budget write three fields in the `multitask` namespace, each submitting **its own whole block** (the `subagentModels[]` array / the `watchdog` object / the `compaction` object); the parallelism limit writes the host's `subagent` namespace. The two namespaces settle their revisions separately, so the two writes cannot interfere. Make an instant-apply row wait for a save button and the user concludes their change has not landed, when it took effect long ago.
 >
-> The model card's **shape is never persisted**; it is derived from the field itself: the shape of "use one model for every Subagent" is derived from `subagentModels[]` — all four kinds pointing at one route means "yes", anything else "no". Switching the shape creates no dirty state in itself (Save stays greyed out when there is no value to write) and never silently changes other settings on the switch. **"Cannot be set to 0" is guaranteed by the UI layer and the host side together**: the number box has a floor of 1, and should an illegal value get past the UI (a hand-edited YAML, say), the host side **converges it to 1** as well, never treating it as "unlimited".
+> The model card's **shape is never persisted**; it is derived from the field itself: the shape of "use one model for every Subagent" is derived from `subagentModels[]` — all four kinds pointing at one route means "yes", anything else "no". Switching the shape creates no dirty state in itself and never silently changes other settings on the switch. **"Cannot be set to 0" is guaranteed by the UI layer and the host side together**: the number box has a floor of 1, and should an illegal value get past the UI (a hand-edited YAML, say), the host side **converges it to 1** as well, never treating it as "unlimited".
 
 > Why register as `settings.section` (a top-level page in the Settings navigation) rather than `plugins.item` (the sub-slot on the sidebar **Plugins** page): by official design the latter is for "configuring official plugins on the plugins page", whereas the requirement here is "in Settings, and findable by a new user". The reasoning and the trade-off are written in the file header of `lib/client.js`.
 >
@@ -1156,7 +1158,7 @@ dsh-multitask/
 │   └── test_image/                     # UI screenshots referenced by the README (doc material, not tests)
 ├── lib/
 │   ├── index.js                        # host half: declares its own preset to agentPresets on activation
-│   └── client.js                       # ★ browser half: a top-level "Multitask" page in Settings (two cards) + two rows in General settings
+│   └── client.js                       # ★ browser half: a top-level "Multitask" page in Settings (four cards) + two rows in General settings
 └── presets/multitask/
     ├── composition.mjs                 # preset composition + coordinator persona + per-mode worker personas
     ├── coordinator-guard.mjs           # ★ the shock absorber (includes the "mode isolation" ownership test)

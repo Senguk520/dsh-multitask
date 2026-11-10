@@ -156,12 +156,14 @@ clone 本仓库、直接跑工作区里的源码时用这条（改动不经过 n
 `lib/client.js`，由 `package.json` 的 `dsh.client` 声明），以及「**通用设置**」里的两行。
 它们把上面那些可调项里**真正值得手动改的**集中到一处，不用再去改 patch 文件：
 
-**「Multitask」页 —— 两张卡片**
+**「Multitask」页 —— 四张卡片**
 
 | 卡片 | 对应字段 | 作用范围 |
 |---|---|---|
-| 子代理使用的模型 | `multitask.subagentModels[]`（`subagentType` / `provider` / `model`） | 四类 worker **各自的默认模型**。「所有子代理使用同一个模型」选**是**时，四类一起写成同一条路线；选**否**时每类单独指定，「继承协调者」是默认项 |
+| 子代理使用的模型 | `multitask.subagentModels[]`（`subagentType` / `provider` / `model` / `reasoningEffort?`） | 四类 worker **各自的默认模型**，以及该模型的**思考强度**。「所有子代理使用同一个模型」选**是**时，四类一起写成同一条路线；选**否**时每类单独指定，「继承协调者」是默认项。`reasoningEffort` 的档位**只能**取自模型目录（`models[].reasoning.efforts[]`，见 `dsh-api-remotes` 的 `session.modelCatalog`）—— 写死 low / medium / high 会提交上游 `ReasoningEffortId()` 不认的值；模型没公布档位时不画该控件 |
 | 子代理并行数量上限 | `subagent.maxActiveSubagents` | **与「设置 → 通用设置」里的那个值是同一个** —— 两处 UI 编辑同一个字段，所以改一处另一处立刻跟着变。它决定**同一主 Agent 下同时能存活多少个子代理**，对所有模式生效，Multitask 不例外。改完**即刻生效** |
+| 子代理停滞看门狗 | `multitask.watchdog`（`stallTimeoutMs` / `tickMs` / `mode`） | 面板用**秒**、配置存**毫秒**，换算只在控制器里各做一次。它决定「子代理安静多久算卡死」以及卡死之后做什么（只记录 / 停止并唤醒） |
+| 子代理上下文压缩 | `multitask.compaction`（`headroomTokens` / `maxTokens` / …，单位 token） | **子代理 realm 内那次压缩的预算**。`compaction-basic` 的上游默认是 `headroomTokens: 65536`、`maxTokens` 随之为同值；压力预算 `contextWindow − headroom − maxTokens` 在 ≤128k 窗口的模型上会算成**负数**，于是每一步都触发紧急压缩。本 preset 把压缩放在 `isolate: { compaction: true }` 的组里，宿主 patch 进不去，所以这一项是那条链路上**唯一**的入口。留空 = 不干预，用上游默认 |
 
 **「通用设置」页 —— 两行**（与官方的语言 / 外观 / 开发者工具并排）
 
@@ -182,14 +184,15 @@ clone 本仓库、直接跑工作区里的源码时用这条（改动不经过 n
 > 共用同一份表单快照与同一个写入路径 —— 所以不存在「哪一处说了算」的问题，
 > 也不需要任何同步代码。
 >
-> 「保存」提交的是 `multitask` 命名空间里**唯一**的字段（`subagentModels[]`），
-> 所以那条保存条**只服务模型卡**：并发上限是**改完即写**的（松开控件即提交，没有保存按钮）。
-> 这与会说谎的做法相反 —— 若让一个即时生效的行去等一个保存按钮，用户会以为自己改的值
-> 还没落地，而它其实早就生效了。
+> 四张卡都是**改完即写**（松开控件 / 选完下拉即提交），本页没有保存条。
+> 模型卡、看门狗与压缩预算写的是 `multitask` 命名空间里的三个字段，各自写**自己那一整块**
+> （`subagentModels[]` 数组 / `watchdog` 对象 / `compaction` 对象）；并发上限写宿主
+> `subagent` 命名空间。两个命名空间各自结算自己的 revision，所以两次写入互不影响。
+> 若让一个即时生效的行去等一个保存按钮，用户会以为自己改的值还没落地，而它其实早就生效了。
 >
 > 模型卡的**形态不落盘**，由字段自身推导：「所有子代理使用同一个模型」的形态由
 > `subagentModels[]` 推导 —— 四类指向同一条路线即「是」，否则即「否」。切换形态本身
-> 不产生脏值（没有值可写时保存按钮保持灰着），也不会在切换时静默改掉别的配置。
+> 不产生脏值，也不会在切换时静默改掉别的配置。
 > **「不能设成 0」靠 UI 层与宿主侧共同保证**：数字框的下限是 1，而万一有非法值绕过了 UI
 > （手改 YAML 等），宿主侧也会把它**收敛成 1**，绝不当作「不限制」。
 
@@ -1702,7 +1705,7 @@ dsh-multitask/
 │   └── test_image/                     # README 引用的界面截图（文档素材，不是测试）
 ├── lib/
 │   ├── index.js                        # host 半：激活时向 agentPresets 声明自带 preset
-│   └── client.js                       # ★ 浏览器半：设置里的一级页「Multitask」两张卡 + 通用设置两行
+│   └── client.js                       # ★ 浏览器半：设置里的一级页「Multitask」四张卡 + 通用设置两行
 └── presets/multitask/
     ├── composition.mjs                 # preset 组成 + 协调者人格 + 各模式 worker 人格
     ├── coordinator-guard.mjs           # ★ 减震器（含「模式隔离」归属判据）

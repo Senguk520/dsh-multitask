@@ -219,12 +219,14 @@ provider 固定用 `spawn`，不是配置项：上游要求「能选别的 prese
 
 本包装好后，DSH 的设置里会多出这些：
 
-**「Multitask」页 —— 两张卡**
+**「Multitask」页 —— 四张卡**
 
 | 卡片 | 字段 | 作用 |
 |---|---|---|
-| 子代理使用的模型 | `multitask.subagentModels[]` | 四类 worker 各自的默认模型。可选「所有子代理使用同一个模型」，也可按类型分别指定；默认是「继承协调者」。只对此后**新建**的会话生效 |
+| 子代理使用的模型 | `multitask.subagentModels[]` | 四类 worker 各自的默认模型，以及该模型的**思考强度**（档位取自模型目录，模型没公布就不显示该控件）。可选「所有子代理使用同一个模型」，也可按类型分别指定；默认是「继承协调者」。只对此后**新建**的会话生效 |
 | 子代理并行数量上限 | `subagent.maxActiveSubagents` | 与「设置 → 通用设置」里那一行**是同一个字段**，改完即刻生效 |
+| 子代理停滞看门狗 | `multitask.watchdog` | 子代理安静多久算停滞、巡检频率、超时后做什么 |
+| 子代理上下文压缩 | `multitask.compaction` | 子代理 realm 内那次压缩的预算（预留 / 摘要上限，单位 token）。留空即用上游默认的 65536；上下文窗口 ≤128k 的模型必须调小，否则预留 + 摘要超过窗口、预算为负，几乎每一步都在压缩 |
 
 **「通用设置」页 —— 两行**（与官方的语言 / 外观 / 开发者工具并排）
 
@@ -504,6 +506,8 @@ worker 把前提不成立指出来，而不是绕过去硬做。
 | `interrupt-before-send` | 纠错退回「排到下一个步骤边界」，而不是停掉目标当前这一轮 |
 | `approval-gate` | 危险操作不再弹窗（回到 DSH 默认行为） |
 | `workspace-acl` | 不再自动补 `WRITE_OWNER`，也不再给既存子目录补齐盖章（也可分别用 `config.autoGrantWriteOwner: false` / `config.autoRepairStampedChildren: false` 单独关掉其中一段） |
+
+环境变量 `DSH_MULTITASK_LIST_AGENTS_ROW` 强行指定「委派组里那条独立的 `list-agents` 行」要不要保留。`0` / `false` / `off` / `drop` 丢弃，`1` / `true` / `on` / `keep` 保留；不设则由启动时的宿主探测决定（宿主 `@deepseek-ai/dsh-tool-subagent-control` 的 `exports` 里还有 `./list-agents` 就保留，否则丢弃 —— 0.2.2 起该子路径已被移除、`list_agents` 由主入口注册）。它在模块加载时读取，需要重启应用。只有探测拿不到结论而你又确知宿主版本时才需要它。
 
 环境变量 `DSH_MULTITASK_MULTI_MODE=0` 一次摘掉 `subagent_ptc` / `subagent_minimal` 两条委派路径（以及它们在保留集里的两项），不影响原有的 `subagent` / `subagent_fork`。它**不会**卸下 PTC 呈现那一行：真正执行塌缩的 `subagent-mode` 是无条件挂载的。只是没有 `multitask_ptc` worker 之后，塌缩没有作用对象，所以实际效果等同于呈现停用，但那一行仍然在。想把呈现真正关掉，就停用 `subagent-mode` 那一行。这个变量的关闭值只有 `0`、`false`、`off` 三个 —— 其他任何值（包括拼错）都视为启用。它在模块加载时读取，需要重启应用。
 
