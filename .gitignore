@@ -5,7 +5,7 @@ install-multitask.ps1
 test/
 .cursor/
 docs/remember.md
-
+.codebuddy/
 research/
 docs/AGENT-TEAM-COMPAT.md
 .tmp-*
