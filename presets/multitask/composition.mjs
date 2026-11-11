@@ -1110,20 +1110,172 @@ const COMPACTION_FIELDS = Object.freeze({
 })
 
 /**
- * 本包给子代理压缩的**缺省预算**（同样必须在 `definition` 之前，理由同上）。
+ * 这是本 preset 给子代理 realm 的**默认压缩预算**（同样必须在 `definition`
+ * 之前，理由同上）。
  *
- * 两个数各自的理由不同，不要合并成「都改小」：
+ * 两个数**成对**给：`headroomTokens` 是「压缩开始前给摘要预留多少空间」，
+ * `maxTokens` 是「摘要最多能写多长」。本 preset 让两者**相等**（`8192 / 8192`），
+ * 为的是让一次摘要请求永远装得进预留空间：若只留 8k 却允许摘要写 64k，压出来的
+ * 摘要可能比预留空间还大，刚压完就再次越过阈值，表现就是「压缩完马上又压」，
+ * 甚至重试耗尽后报错。相等也是这两个字段本来的语义 —— `maxTokens` 的默认行为
+ * 就是跟随 `headroomTokens`。
  *
- * - `headroomTokens: 8192` —— 真正修 issue #5 的那一个：它决定压缩**何时**
- *   触发，推导见下方 `normalizeCompaction()`（对大窗口单调无影响）。
- * - `maxTokens: 65536` —— 与上游缺省**保持一致**。它是摘要输出的上限，不参与
- *   压力预算；显式写死是为了不让它跟着被调小的 headroom 缩到 8192，否则
- *   大窗口模型的摘要上限会被顺手改小（那才是真的误伤）。
+ * 为什么取 8192（而不是更大）：
+ *
+ * - 128k 窗口、请求输出预留 32k 的模型上，触发点 = min(0.8 × W, W − O − H)
+ *   ≈ 87k（约 68%）：压力预算保持为正，也不会过早触发；
+ * - 256k / 1M 这类大窗口上，触发点被 `0.8 × W` 封顶（或紧贴它），8k 的预留
+ *   不会把压缩提前。
+ *
+ * 背景（只作对比，不是本 preset 要处理的对象）：上游 `compaction-basic` 自身的
+ * 默认是 `headroomTokens: 65536`、`maxTokens` 跟随它，那是按大窗口挑的一组数；
+ * 本 preset 不用这组值 —— 大窗口下 8k 的预留不会让压缩提前，小窗口下则更不容易
+ * 让压力预算变成负数（`O + H ≥ W` 时 `compaction-basic` 会抛
+ * `TargetPressureConfigError`）。
+ *
+ * 两个数的推导与成立条件见下方 `normalizeCompaction()`。
  */
 export const COMPACTION_DEFAULTS = Object.freeze({
   headroomTokens: 8192,
-  maxTokens: 65536,
+  maxTokens: 8192,
 })
+
+/**
+ * 「按模型推导压缩预算」用的边界值 —— 与 `COMPACTION_FIELDS` 一样，**必须声明在
+ * `definition` 之前**（TDZ 教训见上方那段注释）。
+ *
+ * 这些不是随手可调的旋钮，而是「再小就失去意义 / 再大就危险」的两端；每一条的
+ * 取值理由都写在 `normalizeModelPolicies()` 的注释里，改之前先读那里。
+ */
+const MODEL_POLICY_LIMITS = Object.freeze({
+  /** 最多接受多少条策略 —— 目录异常（把整张模型表都塞进来）时的爆炸半径上限。 */
+  limit: 256,
+  /** 摘要预算按窗口的 `1 / divisor` 推导：1M → 65536、256k → 16384。 */
+  divisor: 16,
+  /** 摘要预算下限：再小摘要就只剩骨架，压了也没用。 */
+  minBudget: 4096,
+  /** 摘要预算上限：与上游缺省 headroom（65536）同量级，避免大窗口写出天价摘要。 */
+  maxBudget: 65536,
+  /** 「输出预留吃掉窗口」的判据之一：扣掉输出预留后至少要剩这么多 token。 */
+  minRoom: 16384,
+  /** 判据之二：剩下的空间还要 ≥ 窗口的 10%。 */
+  minRoomRatio: 0.1,
+  /** 预算之外还要留的余量：摘要请求本身也要占位置。 */
+  safetyMargin: 1024,
+  /** 算出来的可用预算低于这个数就整条丢弃 —— 宁可用全局缺省，也不配一个没意义的数。 */
+  minSafe: 1024,
+})
+
+/**
+ * 把「每个模型的上下文窗口」换算成 `compaction-basic` 行的 `modelPolicies`。
+ *
+ * ── 为什么需要它 ─────────────────────────────────────────────────────────────
+ *
+ * 全局 `COMPACTION_DEFAULTS`（8192 / 8192）是一组**折中**值：它得同时照顾 64k 和
+ * 1M 的窗口，于是在大窗口上偏保守 —— 1M 的模型明明写得出 64k 的摘要，却只被允许
+ * 写 8k。上游 `compaction-basic` 提供 `modelPolicies` 让每个模型有自己的预算，
+ * 本函数就是「模型窗口 → 该模型的策略」的那一步换算。
+ *
+ * ── 换算规则（单调、可解释）─────────────────────────────────────────────────
+ *
+ *     room   = contextWindow − (defaultMaxTokens ?? 0)   （O = 请求输出预留）
+ *     target = round(contextWindow / 16)                 （1M → 65536、256k → 16384）
+ *     budget = clamp(target, 4096, 65536)
+ *     safe   = min(budget, room − 1024)
+ *
+ * 单看比例是「窗口的 1/16」，但两头都夹住：小窗口不低于 4k（否则摘要没有意义），
+ * 大窗口不高于 64k（与上游缺省 headroom 同量级）。`safe` 那一步是给「输出预留
+ * 很大」的模型兜底：预算绝不能把 `room` 吃穿，否则 `pressureBudget` 转负、上游抛
+ * `TargetPressureConfigError`（公式与推导见 `normalizeCompaction()`）。
+ *
+ * 两道**跳过**条件，方向都是「宁可回落全局缺省，也不要配出一个会炸的值」：
+ *
+ *   1. `room < max(16384, contextWindow × 0.1)` —— 输出预留吃掉窗口的模型。这种模型
+ *      连一条完整对话都快装不下，配什么预算都救不回来（`O + H ≥ W` 是死结）。
+ *      用比例当第二道判据，是因为窗口越大，10% 的余量也越大，绝对值 16384 兜不住
+ *      大窗口上的「预留大半窗口」。
+ *   2. `safe < 1024` —— 扣完余量后所剩无几，配了也没有意义。
+ *
+ * ── 为什么去重 / 排序 / 截断必须在这里做 ─────────────────────────────────────
+ *
+ * 上游按 `provider + model` **精确匹配**，而且数组里出现重复键会在**加载期直接抛
+ * 错**。一个重复键就把整条 preset 打成 broken（模式从新会话列表消失），所以本地
+ * 必须先收敛：剔非法 → 按 `provider` → `model` 去重（保留第一条）→ 排序 → 截断到
+ * `MODEL_POLICY_LIMITS.limit` 条。
+ *
+ * 排序不只是为了好看：它让截断结果与输入顺序无关（同一份模型目录永远得到同一份
+ * 配置），也让产物稳定、好 diff。
+ *
+ * ── 输出形状 ────────────────────────────────────────────────────────────────
+ *
+ * 每条策略**只写** `provider` / `model` / `headroomTokens` / `maxTokens` 四个键。
+ * **不带 `contextWindow`**、也不带 `defaultMaxTokens`：那是本函数自己的输入，上游
+ * policy 只认策略字段，多带一个未知键在加载期就会失败。
+ *
+ * ⚠️ `provider` / `model` **原样保留、不 trim**：上游是精确匹配，改一个字符就等于
+ * 换了身份，策略永远匹配不上。只把「全是空白」的当作空串丢弃。
+ *
+ * ⚠️ 本函数**绝不抛错**：它在 `definition.plugins` 的模块求值路径上被调用，抛一次
+ * 就是整条 preset 挂不上（表现为模式从新会话列表消失）。
+ *
+ * @param modelPolicies - `Array<{ provider, model, contextWindow, defaultMaxTokens? }>`，可为空。
+ * @returns 有有效策略时 `{ modelPolicies }`；否则返回一个**没有键**的对象（展开后不
+ *          产生 `modelPolicies` 键，与本参数加入之前逐字等价）。
+ */
+function normalizeModelPolicies(modelPolicies) {
+  if (!Array.isArray(modelPolicies)) return noOptions()
+
+  const {
+    limit, divisor, minBudget, maxBudget, minRoom, minRoomRatio, safetyMargin, minSafe,
+  } = MODEL_POLICY_LIMITS
+  /** `JSON.stringify([provider, model])` -> 策略，用于去重且保留第一条。 */
+  const policies = new Map()
+
+  for (const entry of modelPolicies) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const { provider, model, contextWindow } = entry
+    if (typeof provider !== 'string' || provider.trim() === '') continue
+    if (typeof model !== 'string' || model.trim() === '') continue
+    if (!Number.isSafeInteger(contextWindow) || contextWindow <= 0) continue
+
+    // 输出预留是**可选**的：缺席（undefined / null）按 0 处理；一旦给了，就必须是
+    // 非负整数，否则整条丢弃。拿不准的数当成 0 会把预算算**大**，而算大正是会让
+    // 上游 `O + H ≥ W` 抛错的那种错误 —— 宁可这条模型回落全局缺省。
+    const reserved = entry.defaultMaxTokens ?? 0
+    if (!Number.isSafeInteger(reserved) || reserved < 0) continue
+
+    const room = contextWindow - reserved
+    if (!(room >= Math.max(minRoom, contextWindow * minRoomRatio))) continue
+
+    const budget = Math.max(minBudget, Math.min(maxBudget, Math.round(contextWindow / divisor)))
+    const safe = Math.min(budget, room - safetyMargin)
+    if (safe < minSafe) continue
+
+    // 重复键保留第一条：上游遇到重复键会在加载期抛错，这里必须先收敛掉。
+    const key = JSON.stringify([provider, model])
+    if (policies.has(key)) continue
+    policies.set(key, { provider, model, headroomTokens: safe, maxTokens: safe })
+  }
+
+  if (policies.size === 0) return noOptions()
+  return { modelPolicies: [...policies.values()].sort(compareModelPolicies).slice(0, limit) }
+}
+
+/**
+ * `modelPolicies` 的稳定排序：先 `provider`、再 `model`，按**码元**比较。
+ *
+ * 刻意不用 `localeCompare()`：它受运行环境的 ICU / 默认语言影响，同一份模型目录在
+ * 不同机器上可能排出不同顺序 —— 那样「截断到 256 条」的结果就不可复现了。
+ *
+ * @param left - 一条策略。
+ * @param right - 另一条策略。
+ * @returns 负数 / 0 / 正数（`Array.prototype.sort` 的比较器约定）。
+ */
+function compareModelPolicies(left, right) {
+  if (left.provider !== right.provider) return left.provider < right.provider ? -1 : 1
+  if (left.model !== right.model) return left.model < right.model ? -1 : 1
+  return 0
+}
 
 /** preset 的显示元数据（供新会话界面的模式选择器使用）。 */
 export const definition = {
@@ -1244,25 +1396,33 @@ function normalizeWatchdog(watchdog) {
  * 2. 预算为负时上游是**抛配置错误**，不是「每一步都在紧急压缩」；预算为正但被
  *    钳制时，表现才是压缩来得比预期早。
  *
- * ── 为什么把 headroom 调小是**单调安全**的 ──────────────────────────────────
+ * ── 为什么把 headroom 调小是**单调安全**的（但不是「对大窗口完全无影响」）─────
  *
  * headroom 在整个模块里只出现在 pressureBudget 这一处。于是
  *
- *     threshold(H) = min(0.8 × W, W − R − H)      （R = 请求的输出预留）
+ *     threshold(H) = min(0.8 × W, W − O − H)      （O = 请求的输出预留）
  *
- * H 减小 ⇒ `W − R − H` 增大 ⇒ threshold **增大或不变**，绝不会提前压缩。
- * 而当窗口大到 `W − R − 65536 ≥ 0.8 × W` 时（1M 窗口、R = 65536 时为
- * 868928 ≥ 800000，成立），threshold 本来就被 0.8 × W 封顶着：
- * **大窗口模型改不改 headroom，压缩触发点一模一样。**
+ * H 减小 ⇒ `W − O − H` 增大 ⇒ threshold **增大或不变**，绝不会提前压缩。
  *
- * 所以这里不需要知道模型窗口、也不需要按模型分别配置：一个偏小的 headroom
- * 对小窗口是修复，对大窗口是无操作。这正是不走 `modelPolicies` 的原因。
+ * 但「增大或不变」里的**不变**是有条件的：只有当 `W − O ≥ 0.8 × W` 时，
+ * threshold 才本来就被 0.8 × W 封顶，调小 headroom 对触发点毫无影响。反过来说，
+ * 当 `W − O < 0.8 × W` 时那个封顶并不生效，threshold 会随 H 变化：此时调小
+ * headroom 反而会把触发点**往后推**（压缩更晚，方向仍不会造成提前压缩，但
+ * 「大窗口模型改不改 headroom 都一样」这句话就不成立了）。
+ *
+ * O 是**请求的输出预留**，来自适配器 / 模型声明，**不是一个固定的 32k / 64k**，
+ * 默认可能高达 256k；窗口和 O 在同一量级时，上面的条件根本不成立。
+ *
+ * 所以这里不需要知道模型窗口：偏小的 headroom 对「W − O 仍 ≥ 0.8 × W」的窗口是
+ * 修复、对触发点无操作；对 O 很大的窗口则只是把触发点往后挪。这也是本函数始终只
+ * 写**一组全局预算**的原因 —— 按模型的那一层由 `normalizeModelPolicies()` 另行
+ * 叠加，只补匹配到窗口的模型，本函数的缺省仍是它们的兜底。
  *
  * ── 缺省与覆盖的规则 ────────────────────────────────────────────────────────
  *
- * - 用户什么都没写：`headroomTokens = 8192`、`maxTokens = 65536`。
+ * - 用户什么都没写：`headroomTokens = 8192`、`maxTokens = 8192`（两者成对）。
  * - 用户只写了 headroom：`maxTokens` **跟随用户的 headroom**（与上游第 64 行
- *   的缺省语义一致），而不是跟我们的 65536。
+ *   的缺省语义一致），而不是跟我们的缺省 8192。
  * - 用户写了 maxTokens：一律用用户的。
  * - 其余三项（retainTokens / thresholdRatio / retainRatio）只在用户写了才带，
  *   不写就继续由上游缺省决定。
@@ -1381,21 +1541,36 @@ function noOptions() {
  *
  * ── 关于可选的 `compaction`（子代理 realm 的压缩预算）────────────────────────
  *
- * **不传参也会带上一组缺省预算**（`COMPACTION_DEFAULTS`：8192 / 65536）——这是
+ * **不传参也会带上一组缺省预算**（`COMPACTION_DEFAULTS`：8192 / 8192）——这是
  * 本包替子代理选的值，不是上游缺省（65536 / 跟随 headroom）。为什么这组缺省
- * 既能修好小窗口、又对大窗口模型无影响，推导见 `normalizeCompaction()`。
+ * 既避得开 `O + H ≥ W` 的抛错、又只在 `O + H ≤ 0.2 × W` 时才保证触发点不动
+ * （成立条件），推导见 `normalizeCompaction()`。
  * 用户传了 `compaction` 就按那里的覆盖规则合并。
+ *
+ * ── 关于可选的 `modelPolicies`（按模型推导的压缩预算）──────────────────────────
+ *
+ * 全局 `COMPACTION_DEFAULTS` 是一组**折中**值（得同时照顾 64k 和 1M 的窗口），所以
+ * 大窗口上偏保守。传了 `modelPolicies`，`normalizeModelPolicies()` 会把每个模型的
+ * 窗口换算成该模型自己的策略（1M → 65536、256k → 16384、128k → 8192、64k → 4096），
+ * 叠在全局预算之上。两件事要记住：
+ *
+ *   1. 全局预算**不变**，仍是「没匹配到策略的模型」的兜底，也是用户手填值的落点；
+ *      按模型的策略只补「按模型」的那一部分，不参与用户手填值的覆盖规则。
+ *   2. **没有有效输入时不产生 `modelPolicies` 键** —— 这一行 config 与加入本参数
+ *      之前逐字等价（本地回归大量断言无参调用）。
  *
  * @param options - 可选的注入项。
  * @param options.modelMap - `类型键 -> { provider, model, reasoningEffort? }`。
  * @param options.watchdog - `{ stallTimeoutMs, tickMs, mode }`（毫秒）。
  * @param options.compaction - `{ headroomTokens?, maxTokens?, retainTokens?, thresholdRatio?, retainRatio? }`。
+ * @param options.modelPolicies - `Array<{ provider, model, contextWindow, defaultMaxTokens? }>`。
  * @returns 供 preset 注册表挂载的插件行数组。
  */
 export function buildPlugins(options) {
   const modelMap = normalizeModelMap(options?.modelMap)
   const watchdog = normalizeWatchdog(options?.watchdog)
   const compaction = normalizeCompaction(options?.compaction)
+  const modelPolicies = normalizeModelPolicies(options?.modelPolicies)
   return [
     // ── 身份：协调者人格 + Multitask 工作纪律 ─────────────────────────────────
     //
@@ -1501,10 +1676,17 @@ export function buildPlugins(options) {
     //
     // ⚠️ `isolate: { compaction: true }` 是一道**双向**的墙：
     //   · 出去：本组用的压缩实例与宿主那一份互不干扰；
-    //   · 进来：宿主 `cordis.patch.yml` 里对 `compaction-basic` 的修正**进不来**。
-    // 所以预算必须由本包自己带进 `compaction-basic`（见 `normalizeCompaction`）：
-    // 上游缺省 headroom 65536 在小窗口模型上会把压力预算算到零以下，直接抛
-    // `TargetPressureConfigError`（issue #5）。本包缺省改成 8192 / 65536。
+    //   · 进来：组内的 `compaction-basic` 只认本行 `config` 里的值。
+    // 所以压缩预算由本 preset 自己带进 `compaction-basic`（见 `normalizeCompaction`）：
+    // 压力预算在 `O + H ≥ W` 时降到零以下（O = 请求输出预留，H = headroom，
+    // W = 窗口），此时 `compaction-basic` 会抛 `TargetPressureConfigError`（issue #5）
+    // —— 条件是相对的，与窗口绝对值无关。本 preset 的默认预算是 8192 / 8192
+    // （headroom 与摘要上限成对，见 `COMPACTION_DEFAULTS`）；上游 `compaction-basic`
+    // 自身的默认是 65536 / 65536，本 preset 不用这组值。
+    //
+    // 全局预算照顾不了「1M 窗口本可以写 64k 摘要」这种情况，所以再叠一层按模型的
+    // 策略（`normalizeModelPolicies()`）：窗口匹配到策略的模型用自己的预算，没匹配到
+    // 的继续用上面的全局缺省。没有有效输入时本行**不出现** `modelPolicies` 键。
     {
       id: 'compaction',
       name: 'cordis:group',
@@ -1514,8 +1696,11 @@ export function buildPlugins(options) {
         {
           id: 'compaction-basic',
           name: '@deepseek-ai/dsh-compaction-basic',
-          // 始终带 `config`：缺省预算由本包给出（见 `COMPACTION_DEFAULTS`）。
+          // 始终带 `config`：缺省预算由本包给出（见 `COMPACTION_DEFAULTS`）；
+          // `modelPolicies` 在此**叠加**（`normalizeModelPolicies()` 无有效输入时是空对象，
+          // 展开后不产生键，config 与加入该参数之前逐字相同）。
           ...compaction,
+          config: { ...compaction.config, ...modelPolicies },
         },
         { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
         {
