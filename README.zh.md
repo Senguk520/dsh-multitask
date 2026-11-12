@@ -507,7 +507,7 @@ worker 把前提不成立指出来，而不是绕过去硬做。
 | `approval-gate` | 危险操作不再弹窗（回到 DSH 默认行为） |
 | `workspace-acl` | 不再自动补 `WRITE_OWNER`，也不再给既存子目录补齐盖章（也可分别用 `config.autoGrantWriteOwner: false` / `config.autoRepairStampedChildren: false` 单独关掉其中一段） |
 
-环境变量 `DSH_MULTITASK_LIST_AGENTS_ROW` 强行指定「委派组里那条独立的 `list-agents` 行」要不要保留。`0` / `false` / `off` / `drop` 丢弃，`1` / `true` / `on` / `keep` 保留；不设则由启动时的宿主探测决定（宿主 `@deepseek-ai/dsh-tool-subagent-control` 的 `exports` 里还有 `./list-agents` 就保留，否则丢弃 —— 0.2.2 起该子路径已被移除、`list_agents` 由主入口注册）。它在模块加载时读取，需要重启应用。只有探测拿不到结论而你又确知宿主版本时才需要它。
+环境变量 `DSH_MULTITASK_LIST_AGENTS_ROW` 强行指定「委派组里那条独立的 `list-agents` 行」要不要保留。`0` / `false` / `off` / `drop` 丢弃，`1` / `true` / `on` / `keep` 保留；不设则由启动时的宿主探测决定（宿主 `@deepseek-ai/dsh-tool-subagent-control` 的 `exports` 里还有 `./list-agents` 就保留，否则丢弃 —— 0.2.2 起该子路径已被移除、`list_agents` 由主入口注册）。探测只在能定位到**正在运行的宿主安装**时采信（运行入口所在的宿主包根，或 Electron `resourcesPath` 下的那份），定位不到就丢弃那一行并打一条警告 —— `cwd` 里碰巧存在的一份副本不算证据。它在模块加载时读取，需要重启应用。只有探测拿不到结论而你又确知宿主版本时才需要它。
 
 环境变量 `DSH_MULTITASK_MULTI_MODE=0` 一次摘掉 `subagent_ptc` / `subagent_minimal` 两条委派路径（以及它们在保留集里的两项），不影响原有的 `subagent` / `subagent_fork`。它**不会**卸下 PTC 呈现那一行：真正执行塌缩的 `subagent-mode` 是无条件挂载的。只是没有 `multitask_ptc` worker 之后，塌缩没有作用对象，所以实际效果等同于呈现停用，但那一行仍然在。想把呈现真正关掉，就停用 `subagent-mode` 那一行。这个变量的关闭值只有 `0`、`false`、`off` 三个 —— 其他任何值（包括拼错）都视为启用。它在模块加载时读取，需要重启应用。
 

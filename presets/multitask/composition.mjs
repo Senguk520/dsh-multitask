@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -893,188 +893,849 @@ export const PRESET_ID = 'multitask'
  *
  * 试 `import()` 会把一次失败的解析留在 ESM 缓存里，而且失败原因（包不存在 /
  * 子路径被移除 / 文件缺失）在报错上难以区分。读 `exports` 表是纯数据判断，还能
- * 区分两件完全不同的事：
+ * 把三件完全不同的事分开（**确定结论** 与 **无结论** 不是一回事，见下）：
  *
- *   · 这个 base **找不到宿主包** → 无结论，换下一个 base；
- *   · 宿主包在、但 `exports` 里**没有** `./list-agents` → 确定结论，立即返回。
+ *   · 这个锚点里**根本没有这个包** → 确定结论：**丢**（0.2.1 与 0.2.2 都装了它，
+ *     装不上就说明这个锚点不是本机的宿主安装）；
+ *   · 宿主包在、但 `exports` 里**没有** `./list-agents` → 确定结论：**丢**；
+ *   · 宿主包在、`exports` 里**有** `./list-agents` → 确定结论：**留**；
+ *   · 清单读不出来 / JSON 坏了 / 解析报了个看不懂的错 → **无结论**，换下一个锚点。
  *
- * ── 为什么需要「多个 base」/ 为什么会「无结论」──────────────────────────────
+ * ══════════════════════════════════════════════════════════════════════════════
+ * ★ 这一节被**整体重写**过一次。原因值得留在文件里，因为它是本模块踩过的
+ *   最贵的一个坑，而「旧实现看起来完全合理」正是它最危险的地方。
+ * ══════════════════════════════════════════════════════════════════════════════
  *
- * preset 模块由宿主的 loader 加载，它自己的模块解析根**不是**宿主包的安装位置：
- * 桌面端宿主包在 `app.asar/dsh/node_modules`（Electron 的 fs 对 asar 透明），
- * 而本包被装在 profile 的 `node_modules` 下 —— 从插件目录 `createRequire`
- * 根本解析不到 `@deepseek-ai/dsh-tool-subagent-control`。所以依次试：
+ * ── 旧实现做了什么，以及它是怎么骗人的 ───────────────────────────────────────
  *
- *   1. `process.argv` 里**真实存在**的路径（桌面端为 `…/resources/app.asar/dsh`；
- *      源码运行时为 `dsh` 的入口脚本）；
- *   2. Electron 的 `process.resourcesPath` 下的两个常规位置（argv 被改写时兜底）；
- *   3. 进程的 cwd 与本文件所在目录（pnpm 把宿主包提升到这两处时有效）。
+ * 旧版依次在**五个目录**上尝试模块解析：argv 里带分隔符的路径、`app.asar/dsh`、
+ * `app/dsh`、`process.cwd()`、本文件所在目录 —— **第一个给出结论的就赢**。
+ * 后两个是**猜测**，而猜测会骗人，且骗起来很便宜。复现场景（实测）：
  *
- * ── 全都无结论时：**丢掉这一行** ─────────────────────────────────────────────
+ *   在 `%TEMP%` 造一个假家目录，`node_modules/@deepseek-ai/dsh-tool-subagent-control/`
+ *   里放一份**旧版**宿主包（`exports` 里还有 `./list-agents`），把 `cwd` 指过去，
+ *   再以绝对路径 import 本文件 —— 探测返回 `true`。而本机真正在跑的宿主是
+ *   0.2.2-rc.1，`exports` 里**没有**这个子路径。**真值是 `false`，探测给出 `true`。**
+ *
+ * 后果不是「多一行」：那一行解析失败 ⇒ 整条 preset `broken` ⇒ 模式从选择器消失，
+ * 也就是下面「为什么必须探测」那段描述的同一个灾难，只是从另一个方向撞上去。
+ *
+ * ── 所以现在：**只有锚点能给结论** ───────────────────────────────────────────
+ *
+ * 「可信锚点」= 能证明「这个目录就是本机**正在运行**的那份宿主安装」的模块解析根。
+ * 只有两类（见 `listAgentsTrustedAnchors()`），**按下面的顺序**收集：
+ *
+ *   A. **Electron 资源目录** —— `process.resourcesPath` 下的 `app.asar/dsh` /
+ *      `app/dsh`，其 `package.json` 是**宿主包名**。桌面端的 argv 常被改写成
+ *      别的形状（`electron .`、带一堆开关、入口只剩一个目录名……），真正稳定的
+ *      是资源目录，所以它排第一。
+ *   B. **运行入口所在的宿主包根** —— `process.argv` 里**那一个**入口候选（见
+ *      `listAgentsEntryCandidate()`：第一个非 `-` 开头、`realpath` 成功、确实在
+ *      磁盘上的参数，且不是解释器自身），从它开始向上 8 层内找到**宿主包名**的
+ *      `package.json`（名字见 `DSH_HOST_PACKAGES`）。入口可以是文件（`bin/dsh.js`），
+ *      也可以是**目录**（`electron .` 的那个 `.`），两种都认。
+ *
+ * 只取**一个**入口，不再扫 argv 里所有像路径的东西：`argv` 里常混着配置目录、
+ * 上一次会话的残留路径、甚至某个用户参数的绝对路径；把它们全部当锚点，等于把
+ * 「谁先给出结论谁赢」交给运气 —— 这正是本模块最忌讳的那类不确定性。
+ * 去重保留**首次出现**，判定仍是「第一个 `decided` 的锚点获胜」。
+ *
+ * ⚠️ **「宿主包名」是两个名字，不是一个**（2026-11 在 0.2.2-rc.1 桌面安装上实测）：
+ * `<resources>/app.asar/dsh/package.json` 的 `name` 是
+ * `@deepseek-ai/dsh-desktop-runtime`；`@deepseek-ai/dsh` 是它 `node_modules` 里的
+ * 那个宿主包。只认 `@deepseek-ai/dsh` 会让锚点 A（资源目录）在**桌面端永远不命中**
+ * ⇒ 每次都 `unknown` ⇒ 每次都丢行 + 打告警（旧宿主上则是误丢）。所以两个名字都认 ——
+ * 判据仍然是「包名逐字等于 DSH 专有名字之一」，不是「目录名长得像 dsh」。
+ *
+ * 判据是「进程自己的运行事实」，而不是「某个目录里恰好有什么」。
+ *
+ * ── 猜测目录仍然会看，但**只用于诊断** ───────────────────────────────────────
+ *
+ * `process.cwd()` 与本文件所在目录不在锚点里。它们解析得到宿主包时，只会往告警里
+ * 追加一句「这里其实有一份副本（版本 x，有没有 `./list-agents`），已忽略：它不能
+ * 证明这就是正在运行的宿主」。这样用户看到「cwd 里明明有包，那一行却被丢了」时，
+ * 告警直接解释了原因，而不是让人再去猜。
+ *
+ * ── 三种结果，而不是两个布尔值 ───────────────────────────────────────────────
+ *
+ * 旧实现在全部无结论时**静默** `return false` —— 那等于把「确认没有」和「不知道」
+ * 压成同一个值，事后再也分不清是宿主真的没这个子路径，还是探测根本没找到宿主。
+ * 现在 `probeListAgentsRow()` 返回 `{ mode, keep, anchor?, reason?, reasons, diagnostics }`，
+ * `mode` 是 `'override'` / `'anchor'` / `'unknown'` 三态之一，`unknown` 会**打一条告警**：
+ *
+ *     dsh-multitask: could not prove which DSH install is running, so the optional
+ *     "@deepseek-ai/dsh-tool-subagent-control/list-agents" row was dropped. Set
+ *     DSH_MULTITASK_LIST_AGENTS_ROW=1 if your host still ships it.
+ *
+ * ── `unknown` 为什么仍然**默认丢行** ─────────────────────────────────────────
  *
  * 两害相权：丢行在旧宿主上只是少一个 `list_agents` 工具，留行在新宿主上会让整个
- * 模式从选择器里消失。所以默认取「丢」。
+ * 模式从选择器里消失。而「不知道」恰恰是最该走保守那条路的场景 —— 现在它至少不再
+ * 沉默，而是明说「我证明不了，所以我丢了；你若确知宿主版本，请用环境变量」。
  *
- * 需要强行指定时设环境变量 `DSH_MULTITASK_LIST_AGENTS_ROW`：
- * `1` / `true` / `on` / `keep` 强行保留，`0` / `false` / `off` / `drop` 强行丢弃。
+ * ── 环境变量（强行指定，语义与旧版一致）──────────────────────────────────────
+ *
+ * 需要强行指定时设 `DSH_MULTITASK_LIST_AGENTS_ROW`：
+ * `1` / `true` / `on` / `keep` 强行保留，`0` / `false` / `off` / `drop` 强行丢弃；
+ * 其它值（含拼错）视为未设置，回到自动探测。它在模块求值时读取，改完要重启应用。
+ * 它**不**参与「猜测目录」那条路 —— 能证明的事不需要它，证明不了的事由用户明说。
  */
 const LIST_AGENTS_PACKAGE = '@deepseek-ai/dsh-tool-subagent-control'
 const LIST_AGENTS_ROW_NAME = `${LIST_AGENTS_PACKAGE}/list-agents`
 const LIST_AGENTS_OVERRIDE_ENV = 'DSH_MULTITASK_LIST_AGENTS_ROW'
+/**
+ * 宿主包的 `name` —— 「这个目录是本机的 DSH 安装」的判据（**不是**目录名）。
+ *
+ * 两个名字都要认，理由见上方长注释里那段实测记录：桌面端的运行时包叫
+ * `@deepseek-ai/dsh-desktop-runtime`（`<resources>/app.asar/dsh/package.json`），
+ * `@deepseek-ai/dsh` 是它 `node_modules` 里的宿主包；CLI / 源码运行时里入口则
+ * 直接落在 `@deepseek-ai/dsh` 上。两者都是 DSH 专有包名。
+ */
+const DSH_HOST_PACKAGES = ['@deepseek-ai/dsh', '@deepseek-ai/dsh-desktop-runtime']
+/** 沿父目录向上找 `package.json` 的层数上限（锚点定位与清单回退共用）。 */
+const MANIFEST_WALK_LIMIT = 8
+/** 告警里最多列几条「猜测目录里的副本」（再多只是噪音）。 */
+const LIST_AGENTS_GUESS_LIMIT = 3
+/**
+ * `unknown` 时打印的告警原文。
+ *
+ * 逐字固定：用户看到的必须直接指出「要设哪个变量」。测试与 README 引用同一句。
+ */
+const LIST_AGENTS_UNKNOWN_WARNING =
+  'dsh-multitask: could not prove which DSH install is running, so the optional ' +
+  `"${LIST_AGENTS_ROW_NAME}" row was dropped. ` +
+  `Set ${LIST_AGENTS_OVERRIDE_ENV}=1 if your host still ships it.`
 
 /**
- * 本宿主是否仍导出 `…/list-agents` 子路径。
+ * 探测「本机宿主是否仍然导出 `…/list-agents`」—— **三态**结果。
  *
  * 永不抛错：这个函数在模块求值路径上，抛错等于 preset 根本加载不出来。
  *
- * @returns 是否应当保留那一行（无结论时返回 `false`，理由见上方说明）。
+ * 运行事实全部可注入（默认取本进程的），测试因此可以用**真实目录树**驱动它，
+ * 而不必 mock 文件系统 —— mock 过的 FS 只能证明「我以为的路径」，不能证明
+ * Node 的解析规则真的那样走。
+ *
+ * @param options - 可注入的运行事实：
+ *   · `argv` —— 启动参数（找「运行入口」用）；
+ *   · `resourcesPath` —— Electron 的 `process.resourcesPath`；
+ *   · `cwd` / `moduleDir` —— **猜测**目录，只进诊断；
+ *   · `env` —— 读强行指定那个变量；
+ *   · `warn` —— 告警出口（测试可收集）。
+ * @returns `{ mode, keep, anchor?, reason?, reasons, diagnostics }`：
+ *   · `mode: 'override'` —— 环境变量命中，`keep` 就是它的值；
+ *   · `mode: 'anchor'` —— 某个**可信锚点**给出了结论，`anchor` 是那个目录；
+ *   · `mode: 'unknown'` —— 没有锚点能证明宿主是谁：`keep` 恒为 `false`，
+ *     并且**已经**通过 `warn()` 打过一条告警（`diagnostics` 是要追加的句子）。
+ *   · `reason` —— 人读文本（`unknown` 时是「为什么没结论」的汇总）；
+ *   · `reasons` —— **机器可读**的结论码数组，**只收未决锚点**，每个未决锚点一条；
+ *     正常取值只有 `'error'` / `'malformed'`（已决时是空数组）。
+ *     `'absent'` / `'exports'` 属于**已决**（`mode: 'anchor'`）的内部结论码，
+ *     不会出现在这里 —— 有锚点给出结论时顶层 `reasons` 恒为 `[]`。
+ *     测试与排障据它断言，不必去解析人读文案（文案会随措辞调整，结论码不会）。
  */
-function hostHasListAgentsSubpath() {
-  const override = readListAgentsOverride()
-  if (override !== undefined) return override
-  for (const base of listAgentsProbeBases()) {
-    const verdict = listAgentsSubpathFrom(base)
-    if (verdict !== undefined) return verdict
+export function probeListAgentsRow({
+  argv = process.argv,
+  resourcesPath = process.resourcesPath,
+  cwd = safeCurrentDirectory(),
+  moduleDir = safeModuleDirectory(),
+  env = process.env,
+  warn = (message) => console.warn(message),
+} = {}) {
+  let result
+  try {
+    const override = readListAgentsOverride(env)
+    result =
+      override !== undefined
+        ? {
+            mode: 'override',
+            keep: override.keep,
+            reason: `env ${LIST_AGENTS_OVERRIDE_ENV}=${override.raw}`,
+            reasons: [],
+            diagnostics: [],
+          }
+        : listAgentsDecision({ argv, resourcesPath, cwd, moduleDir })
+  } catch (error) {
+    // 兜底：探测本身出问题绝不能连带让 preset 加载失败 —— 那就成了「模式消失」。
+    result = {
+      mode: 'unknown',
+      keep: false,
+      reason: `probe crashed: ${messageOf(error)}`,
+      reasons: ['error'],
+      diagnostics: [],
+    }
   }
-  return false
+  if (result.mode === 'unknown') {
+    try {
+      warn([LIST_AGENTS_UNKNOWN_WARNING, ...result.diagnostics].join(' '))
+    } catch {
+      // 告警通道自己坏掉（被替换成抛错的函数等）也不能影响 preset 加载。
+    }
+  }
+  return result
+}
+
+/**
+ * 依次在**可信锚点**上判定；全部无结论时退回 `unknown`（附猜测目录的诊断）。
+ *
+ * @param facts - `{ argv, resourcesPath, cwd, moduleDir }`。
+ * @returns 三态结果（不含告警副作用，告警由 `probeListAgentsRow()` 统一发）。
+ */
+function listAgentsDecision({ argv, resourcesPath, cwd, moduleDir }) {
+  const details = []
+  const reasons = []
+  for (const anchor of listAgentsTrustedAnchors({ argv, resourcesPath })) {
+    const verdict = listAgentsVerdictFromAnchor(anchor)
+    if (verdict.decided === true) {
+      return {
+        mode: 'anchor',
+        keep: verdict.keep,
+        anchor,
+        reason: verdict.detail,
+        reasons: [],
+        diagnostics: [],
+      }
+    }
+    details.push(verdict.detail)
+    reasons.push(verdict.reason)
+  }
+  const reason =
+    details.length === 0
+      ? 'no trusted anchor: argv / resourcesPath do not identify the running DSH install'
+      : `no trusted anchor reached a conclusion (${details.join('; ')})`
+  return {
+    mode: 'unknown',
+    keep: false,
+    reason,
+    reasons,
+    diagnostics: listAgentsGuessDiagnostics({ cwd, moduleDir }),
+  }
 }
 
 /**
  * 读环境变量里的强行指定。
  *
- * @returns `true` / `false`；未指定或写错时 `undefined`（交给自动探测）。
+ * @param env - 环境变量表（测试可注入）。
+ * @returns `{ keep, raw }`；未指定、或值不认识时 `undefined`（交给自动探测）。
  */
-function readListAgentsOverride() {
+function readListAgentsOverride(env) {
   let raw
   try {
-    raw = String(process.env?.[LIST_AGENTS_OVERRIDE_ENV] ?? '').trim().toLowerCase()
+    raw = String(env?.[LIST_AGENTS_OVERRIDE_ENV] ?? '').trim().toLowerCase()
   } catch {
     return undefined
   }
-  if (['0', 'false', 'off', 'drop'].includes(raw)) return false
-  if (['1', 'true', 'on', 'keep'].includes(raw)) return true
+  if (['0', 'false', 'off', 'drop'].includes(raw)) return { keep: false, raw }
+  if (['1', 'true', 'on', 'keep'].includes(raw)) return { keep: true, raw }
   return undefined
 }
 
 /**
- * 依次尝试的模块解析根（去重、按可信度排序）。
+ * 收集**可信锚点**：能证明「这个目录是本机正在运行的宿主安装」的模块解析根。
  *
- * @returns 若干目录路径。
+ * 两类来源，按下面的顺序收集（去重保留首次出现；判定是「第一个 `decided` 的锚点
+ * 获胜」，所以顺序就是优先级）：
+ *
+ *   A. **Electron 资源目录** —— `process.resourcesPath` 下的 `app.asar/dsh` /
+ *      `app/dsh`，其 `package.json` 同样是宿主包名（`DSH_HOST_PACKAGES`）。
+ *      桌面端的 `argv` 常被改写成别的形状，资源目录是当前进程**实测**的那一份
+ *      资源树，因此它排在最前。
+ *   B. **运行入口所在的宿主包根** —— 先按 `listAgentsEntryCandidate()` 从 `argv`
+ *      里挑出**唯一**一个入口候选（文件或目录），再从它（目录入口）或它所在目录
+ *      （文件入口）向上最多 `MANIFEST_WALK_LIMIT` 层找宿主包名的 `package.json`。
+ *
+ * ⚠️ **猜测目录不在这里**：`process.cwd()` 与本文件所在目录只进
+ * `listAgentsGuessDiagnostics()`。原因见上方长注释里那个 `%TEMP%` 复现场景 ——
+ * 让它们参与判定，探测就会被「cwd 里恰好有一份旧版宿主包」骗过去。
+ *
+ * @param facts - `{ argv, resourcesPath }`。
+ * @returns 锚点目录数组；可能为空（那就说明没有可证明的宿主 → `unknown`）。
  */
-function listAgentsProbeBases() {
-  const bases = []
+function listAgentsTrustedAnchors({ argv, resourcesPath }) {
+  const anchors = []
   const push = (candidate) => {
     if (typeof candidate !== 'string' || candidate === '') return
-    if (bases.includes(candidate)) return
-    bases.push(candidate)
+    if (anchors.includes(candidate)) return
+    anchors.push(candidate)
   }
 
-  let argv = []
+  let resources = ''
   try {
-    argv = Array.isArray(process.argv) ? process.argv.slice(1) : []
+    resources = typeof resourcesPath === 'string' ? resourcesPath : ''
   } catch {
-    argv = []
+    resources = ''
   }
-  for (const arg of argv) {
-    if (typeof arg !== 'string' || arg === '' || arg.startsWith('-')) continue
-    // 只认「带路径分隔符」的参数：`electron .` 这种位置参数没有信息量。
-    if (!arg.includes('/') && !arg.includes('\\')) continue
-    let directory = arg
-    try {
-      if (existsSync(arg) && !statSync(arg).isDirectory()) directory = dirname(arg)
-    } catch {
-      // 路径不可 stat（asar 感知进程之外会这样）：先按「它是个文件」处理。
-      directory = dirname(arg)
-    }
-    push(directory)
-    // 兜底再试路径本身：`existsSync()` 在非 asar 感知的进程里会把
-    // `…/app.asar/dsh` 判成「不存在」，但那个字符串仍然可能是宿主的运行时目录。
-    push(arg)
-  }
-
-  try {
-    const resources = typeof process.resourcesPath === 'string' ? process.resourcesPath : ''
-    if (resources !== '') {
-      push(join(resources, 'app.asar', 'dsh'))
-      push(join(resources, 'app', 'dsh'))
-    }
-  } catch {
-    // 不是 Electron：没有 resourcesPath。
-  }
-
-  try {
-    push(process.cwd())
-  } catch {
-    // 没有 cwd 的环境（极少见）就跳过。
-  }
-  try {
-    push(dirname(fileURLToPath(import.meta.url)))
-  } catch {
-    // import.meta.url 解不出路径（被 bundle 过）时跳过。
-  }
-  return bases
-}
-
-/**
- * 在**一个** base 上判定宿主包是否导出 `./list-agents`。
- *
- * @param base - 目录路径，作为模块解析的起点。
- * @returns `true` / `false`；这个 base 解析不到宿主包时 `undefined`。
- */
-function listAgentsSubpathFrom(base) {
-  let requireFrom
-  try {
-    requireFrom = createRequire(join(base, 'dsh-multitask-probe.js'))
-  } catch {
-    return undefined
-  }
-  const manifest = readHostControlManifest(requireFrom)
-  if (manifest === undefined) return undefined
-  const entry = manifest.exports === undefined || manifest.exports === null
-    ? undefined
-    : manifest.exports['./list-agents']
-  return entry !== undefined && entry !== null
-}
-
-/**
- * 读出宿主 `dsh-tool-subagent-control` 的 `package.json`。
- *
- * 两条路径都要试，因为不同宿主版本导出的子路径不同：
- *   1. `…/package.json` —— 0.2.1 与 0.2.2 都导出了它，最快且最准；
- *   2. 主入口 + 向上找最近的 `package.json` —— 给「不导出 package.json」的宿主兜底。
- *
- * @param requireFrom - 以目标目录为根的 `require`。
- * @returns 清单对象；解析不到这个包时 `undefined`。
- */
-function readHostControlManifest(requireFrom) {
-  try {
-    const file = requireFrom.resolve(`${LIST_AGENTS_PACKAGE}/package.json`)
-    const parsed = JSON.parse(readFileSync(file, 'utf8'))
-    if (parsed !== null && typeof parsed === 'object') return parsed
-  } catch {
-    // 该宿主不导出 ./package.json（或这个 base 找不到包）：走主入口那一条。
-  }
-  try {
-    const entry = requireFrom.resolve(LIST_AGENTS_PACKAGE)
-    let dir = dirname(entry)
-    for (let depth = 0; depth < 8; depth += 1) {
-      const candidate = join(dir, 'package.json')
-      if (existsSync(candidate)) {
-        const parsed = JSON.parse(readFileSync(candidate, 'utf8'))
-        if (parsed?.name === LIST_AGENTS_PACKAGE) return parsed
+  if (resources !== '') {
+    for (const candidate of [join(resources, 'app.asar', 'dsh'), join(resources, 'app', 'dsh')]) {
+      const manifest = readPackageManifest(join(candidate, 'package.json'))
+      if (manifest !== undefined && manifest.status === 'ok' && isDshHostPackageName(manifest.value.name)) {
+        push(candidate)
       }
-      const up = dirname(dir)
+    }
+  }
+
+  let args = []
+  try {
+    args = Array.isArray(argv) ? argv : []
+  } catch {
+    args = []
+  }
+  const entry = listAgentsEntryCandidate(args)
+  if (entry !== undefined) {
+    const root = hostRootFromEntry(entry)
+    if (root !== undefined) push(root)
+  }
+  return anchors
+}
+
+/**
+ * 从 `argv` 里挑出**唯一**那个入口候选（文件或目录都接受）。
+ *
+ * 判据（依次）：
+ *   1. 是字符串、非空、不以 `-` 开头（开关不是入口）；
+ *   2. **前一个** `argv` 元素不是以 `-` 开头的字符串 —— 否则这个值多半是某个开关的
+ *      取值（`--config <dir>`、`-e <code>`），当入口会把整棵配置目录错认成宿主根；
+ *   3. `realpath` 成功、且该路径**在磁盘上存在**；
+ *   4. **不是解释器自身** —— `argv[0]` 通常是 `node.exe` / Electron 可执行文件，
+ *      它只是「谁来跑」，不是「跑的是哪份宿主」。不排掉它，`argv[0]` 会永远抢先
+ *      成为入口（node 的安装目录当然不是宿主包根，于是锚点每次都落空）。
+ *
+ * 第一个满足全部条件的参数就是入口，**其余参数一律不再参与锚点**：`argv` 里常混着
+ * 配置目录、上一次会话的残留路径，把它们都当锚点等于让「谁先给结论」交给运气。
+ *
+ * ⚠️ **第 2 条是启发式，不是 argv 解析器**：它只挡「开关 + 空格 + 取值」这一种形状。
+ * 挡不住的写法（例如直接把一个独立路径塞进 `argv`、前面没有任何开关）仍然会成为
+ * 候选，`hostRootFromEntry()` 从它向上 `MANIFEST_WALK_LIMIT` 层找不到宿主包名 ⇒ 该
+ * 锚点不成立 ⇒ 最终落 `unknown`（`keep: false` + 一条告警），**不会**误判成 `keep: true`。
+ * 宁可多一次 unknown，也不要把一个配置目录当成「正在运行的宿主」。
+ *
+ * @param args - `argv` 数组（已确认是数组）。
+ * @returns 已 `realpath` 的入口路径；没有合格候选时 `undefined`。
+ */
+function listAgentsEntryCandidate(args) {
+  const interpreter = resolveRealPath(safeExecutablePath())
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if (typeof arg !== 'string' || arg === '' || arg.startsWith('-')) continue
+    const previous = args[index - 1]
+    if (typeof previous === 'string' && previous.startsWith('-')) continue
+    const real = resolveRealPath(arg)
+    if (real === undefined) continue
+    if (existsSync(real) !== true) continue
+    if (interpreter !== undefined && real === interpreter) continue
+    return real
+  }
+  return undefined
+}
+
+/**
+ * 这个 `package.json` 的 `name` 是否等于「DSH 宿主包」之一。
+ *
+ * @param name - 清单里的 `name` 字段。
+ * @returns 是否算宿主包（判据只有名字，目录名不算数）。
+ */
+function isDshHostPackageName(name) {
+  return typeof name === 'string' && DSH_HOST_PACKAGES.includes(name)
+}
+
+/**
+ * 沿父目录向上找「这个入口属于哪个 DSH 宿主包」。
+ *
+ * 起始点取决于入口是**文件**还是**目录** —— 两种都真实存在：
+ *
+ *   · 文件（`bin/dsh.js`）→ 从 `dirname(入口)` 开始；
+ *   · 目录（`electron .`、`dsh serve <dir>`）→ 从**入口自身**开始；
+ *   · `statSync` 失败（路径已不存在、权限、跨卷）→ 两条都试，先自身再父级。
+ *
+ * 判据只有一条：那个 `package.json` 的 `name` 必须逐字等于**两个宿主包名之一**
+ * （`DSH_HOST_PACKAGES`：`@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-desktop-runtime`），
+ * 目录名长得像 `dsh` 不算。认两个名字的理由见文件上方那段实测记录。
+ *
+ * @param entryPath - 已 `realpath` 过的入口路径（文件或目录都可以）。
+ * @returns 宿主包根目录；`MANIFEST_WALK_LIMIT` 层内没有匹配的 `package.json` 时 `undefined`。
+ */
+function hostRootFromEntry(entryPath) {
+  const starts = []
+  const addStart = (candidate) => {
+    if (typeof candidate !== 'string' || candidate === '') return
+    if (starts.includes(candidate)) return
+    starts.push(candidate)
+  }
+
+  let isDirectory
+  try {
+    isDirectory = statSync(entryPath).isDirectory()
+  } catch {
+    // 查不了类型就当它有可能是目录也可能是文件：两条起始点都试。
+    isDirectory = undefined
+  }
+  if (isDirectory === true) {
+    addStart(entryPath)
+  } else if (isDirectory === false) {
+    try {
+      addStart(dirname(entryPath))
+    } catch {
+      return undefined
+    }
+  } else {
+    addStart(entryPath)
+    try {
+      addStart(dirname(entryPath))
+    } catch {
+      // 取不到父级就只用「自身」这一条。
+    }
+  }
+
+  for (const start of starts) {
+    let dir = start
+    for (let depth = 0; depth < MANIFEST_WALK_LIMIT; depth += 1) {
+      const manifest = readPackageManifest(join(dir, 'package.json'))
+      if (manifest !== undefined && manifest.status === 'ok' && isDshHostPackageName(manifest.value.name)) {
+        return dir
+      }
+      let up
+      try {
+        up = dirname(dir)
+      } catch {
+        break
+      }
       if (up === dir) break
       dir = up
     }
-  } catch {
-    // 这个 base 解析不到宿主包 —— 交给调用方换下一个 base。
   }
   return undefined
 }
 
-/** 这个宿主是否还导出 `…/list-agents` 子路径（导出供本地回归断言）。 */
-export const LIST_AGENTS_SUBPATH = hostHasListAgentsSubpath()
+/**
+ * `realpath` —— 先试原生实现，再退到 JS 实现，都不行就 `undefined`。
+ *
+ * 为什么必须先 `realpath`：启动参数里的路径可能是 8.3 短名、`..` 段，或者一个
+ * 指向安装目录的符号链接。不还原就没法可靠地「沿父目录向上找」，而且同一份安装
+ * 会被当成两个不同的锚点。
+ *
+ * @param target - 待解析的路径。
+ * @returns 真实的绝对路径，或 `undefined`。
+ */
+function resolveRealPath(target) {
+  try {
+    if (typeof realpathSync.native === 'function') return realpathSync.native(target)
+  } catch {
+    // 原生实现偶尔会拒绝（跨卷、权限、奇怪的路径）：退到下面那条。
+  }
+  try {
+    return realpathSync(target)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 在**一个锚点**上判定：这份宿主安装是否仍然导出 `./list-agents`。
+ *
+ * 判据与顺序（只有 `decided: true` 才是结论，其余一律「不采信、换下一个锚点」）：
+ *
+ *   1. 优先读包的 `package.json`（`exports` 是唯一判据，见 `decideListAgentsFromManifest`）；
+ *      **解析前先剥 BOM**（`readPackageManifest` 里做），否则带 BOM 的清单会被
+ *      JSON.parse 判成非法 —— 那是 Windows 上很常见的一种写法，旧实现正是被它
+ *      静默糊弄过去的。
+ *   2. 回退：`package.json` 这条路**解析失败**时，解析包**主入口**，再沿它的目录
+ *      向上找该包自己的 `package.json`。这是给「宿主没有导出 `./package.json`」
+ *      的版本留的后路 —— 那条分支里 `exports` 一样可读。
+ *   3. 回退也失败时才分类，**而且分类要能站得住**：
+ *      · `ERR_PACKAGE_PATH_NOT_EXPORTED` **不是**「包不在」的证据 —— 它恰恰说明包
+ *        在、只是没开放那个子路径。它只走第 2 步；回退也失败就记 `error`（未决），
+ *        绝不下「确认没有」的结论。
+ *      · `MODULE_NOT_FOUND` 只有在**错误信息里出现包名**时才算 `absent`；光有错误码
+ *        不够 —— 一个被删掉的依赖、一个拼错的相对路径也都是 `MODULE_NOT_FOUND`，
+ *        拿它当「宿主没装这个包」的证据会把整行悄悄丢掉。
+ *      · 其余（清单读不出来、主入口解析不到、看不懂的错）→ `error`（未决）。
+ *
+ * `reason` 是**机器可读**的结论码，按「是否已决」分成两组：
+ *
+ *   · `'exports'` / `'absent'` —— **已决**结论，只在 `decided: true` 时出现；
+ *   · `'error'` / `'malformed'` —— **未决**，只有这两个会被 `probeListAgentsRow()`
+ *     收进顶层 `reasons`（已决的那两个不进，结论已经落成 `mode: 'anchor'`）。
+ *
+ * `detail` 是人读文案。
+ *
+ * @param anchor - 宿主包根目录（来自 `listAgentsTrustedAnchors()`）。
+ * @returns `{ decided: true, keep, reason: 'exports' | 'absent', detail }` 或
+ *          `{ decided: false, reason: 'error' | 'malformed', detail }`。
+ */
+function listAgentsVerdictFromAnchor(anchor) {
+  let requireFrom
+  try {
+    requireFrom = createRequire(join(anchor, 'dsh-multitask-probe.js'))
+  } catch (error) {
+    return { decided: false, reason: 'error', detail: `${anchor}: cannot create a resolver (${messageOf(error)})` }
+  }
+
+  const probe = resolveHostControlManifest(requireFrom)
+  if (probe.status === 'ok') return decideListAgentsFromManifest(probe.value, anchor)
+  if (probe.status === 'malformed') {
+    return {
+      decided: false,
+      reason: 'malformed',
+      detail: `${anchor}: malformed ${LIST_AGENTS_PACKAGE}/package.json`,
+    }
+  }
+  if (probe.exportGap === true) {
+    return {
+      decided: false,
+      reason: 'error',
+      detail:
+        `${anchor}: ${LIST_AGENTS_PACKAGE} does not export ./package.json ` +
+        `(ERR_PACKAGE_PATH_NOT_EXPORTED) and the main entry could not be resolved — undecided`,
+    }
+  }
+  if (isAbsentPackageError(probe.error)) {
+    return {
+      decided: true,
+      keep: false,
+      reason: 'absent',
+      detail: `${anchor}: ${LIST_AGENTS_PACKAGE} is not installed (${errorCodeOf(probe.error)})`,
+    }
+  }
+  return {
+    decided: false,
+    reason: 'error',
+    detail: `${anchor}: ${describeProbeFailure(probe)} — undecided`,
+  }
+}
+
+/**
+ * 未决时把失败原因写成一句可读文案（`probe.error` 可能压根没有）。
+ *
+ * @param probe - `resolveHostControlManifest()` 的 `missing` 结果。
+ * @returns 人读文案。
+ */
+function describeProbeFailure(probe) {
+  if (probe.error !== undefined) return messageOf(probe.error)
+  if (probe.manifestError !== undefined) return messageOf(probe.manifestError)
+  return `${LIST_AGENTS_PACKAGE}/package.json could not be read and its main entry was not found`
+}
+
+/**
+ * 从宿主工具包的清单里读结论：`exports` 里有 `./list-agents` 就留，否则丢。
+ *
+ * @param manifest - 已解析的 `package.json` 对象。
+ * @param where - 锚点目录（只进 `detail` 文案，便于事后定位）。
+ * @returns `{ decided: true, keep, reason: 'exports', detail }`。
+ */
+function decideListAgentsFromManifest(manifest, where) {
+  const keep = isPresentExport(exportsEntryOf(manifest))
+  return {
+    decided: true,
+    keep,
+    reason: 'exports',
+    detail: keep
+      ? `${where}: ${LIST_AGENTS_PACKAGE} exports ./list-agents`
+      : `${where}: ${LIST_AGENTS_PACKAGE} has no ./list-agents export`,
+  }
+}
+
+/**
+ * `exports` 里某个子路径的条目算不算「存在」。
+ *
+ * 不能只判 `!== undefined`：`null`、空字符串、空数组、空对象都是「写了但等于没有」
+ * 的写法，留着它们会让 loader 解析失败 —— 又一次把模式搞没。
+ *
+ * @param entry - `exports['./list-agents']` 的原始值。
+ * @returns 是否应当保留那一行。
+ */
+function isPresentExport(entry) {
+  if (entry === undefined || entry === null || entry === '') return false
+  if (Array.isArray(entry)) return entry.length > 0
+  if (typeof entry === 'object') return Object.keys(entry).length > 0
+  return true
+}
+
+/**
+ * 取清单里 `exports['./list-agents']` 的原始值。
+ *
+ * @param manifest - 已解析的 `package.json` 对象。
+ * @returns 该子路径的条目；`exports` 缺席或不是对象（如字符串主入口）时 `undefined`。
+ */
+function exportsEntryOf(manifest) {
+  const exportsField = manifest === null || typeof manifest !== 'object' ? undefined : manifest.exports
+  if (exportsField === null || typeof exportsField !== 'object') return undefined
+  return exportsField['./list-agents']
+}
+
+/**
+ * 试着解析出宿主 `dsh-tool-subagent-control` 的 `package.json` 清单。
+ *
+ * 两条路径都要试，因为不同宿主版本导出的子路径不同：
+ *   1. `…/package.json` —— 0.2.1 与 0.2.2 都导出了它，最快且最准；
+ *   2. 主入口 + 向上找该包自己的 `package.json` —— 给「不导出 `./package.json`」
+ *      的宿主兜底（否则会把一份**装了、但没开放该子路径**的宿主误判成「没有这个包」）。
+ *
+ * 两条都失败时，这里**不做结论**，只把两边的错误原样交出去，让
+ * `listAgentsVerdictFromAnchor()` 按「错误码 + 错误信息里的包名」分类 ——
+ * 分类规则集中在那一处，才不会出现「这个调用点算 absent、那个调用点算 error」。
+ *
+ * @param requireFrom - 以某个锚点为根的 `require`。
+ * @returns `{ status: 'ok', value }`（找到清单）/
+ *          `{ status: 'malformed' }`（清单在，但 JSON 坏了）/
+ *          `{ status: 'missing', error, manifestError, exportGap }`（解析不到）：
+ *          `error` 取**主入口回退**那次的错误（没有则为 `manifestError`），
+ *          `manifestError` 是 `…/package.json` 那次，
+ *          `exportGap` 表示「清单那次是 `ERR_PACKAGE_PATH_NOT_EXPORTED`」——
+ *          它说明包**在**、只是没开放该子路径，绝不能据此判 absent。
+ */
+function resolveHostControlManifest(requireFrom) {
+  let manifestFailure
+  try {
+    const file = requireFrom.resolve(`${LIST_AGENTS_PACKAGE}/package.json`)
+    const manifest = readPackageManifest(file)
+    if (manifest !== undefined) {
+      if (manifest.status === 'malformed') return { status: 'malformed' }
+      return { status: 'ok', value: manifest.value }
+    }
+    // 解析到了路径却读不出来：不是「没有这个包」，但仍然可以试试主入口回退。
+  } catch (error) {
+    manifestFailure = error
+  }
+
+  const fallback = manifestFromMainEntry(requireFrom)
+  if (fallback.status === 'ok') return { status: 'ok', value: fallback.value }
+  if (fallback.status === 'malformed') return { status: 'malformed' }
+  return {
+    status: 'missing',
+    error: fallback.error ?? manifestFailure,
+    manifestError: manifestFailure,
+    exportGap: errorCodeOf(manifestFailure) === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+  }
+}
+
+/**
+ * 回退路径：解析包的**主入口**，再从它所在目录向上找这个包自己的 `package.json`。
+ *
+ * @param requireFrom - 以某个锚点为根的 `require`。
+ * @returns `{ status: 'ok', value }` / `{ status: 'malformed' }` /
+ *          `{ status: 'notfound', error? }`（`error` 是 `require.resolve()` 那次
+ *          抛出的原始错误，供上层区分「包不在」与「别的错」）。
+ */
+function manifestFromMainEntry(requireFrom) {
+  let entry
+  try {
+    entry = requireFrom.resolve(LIST_AGENTS_PACKAGE)
+  } catch (error) {
+    return { status: 'notfound', error }
+  }
+  let dir = dirname(entry)
+  let sawMalformed = false
+  for (let depth = 0; depth < MANIFEST_WALK_LIMIT; depth += 1) {
+    const manifest = readPackageManifest(join(dir, 'package.json'))
+    if (manifest !== undefined) {
+      if (manifest.status === 'malformed') sawMalformed = true
+      else if (manifest.value.name === LIST_AGENTS_PACKAGE) return { status: 'ok', value: manifest.value }
+    }
+    const up = dirname(dir)
+    if (up === dir) break
+    dir = up
+  }
+  return { status: sawMalformed ? 'malformed' : 'notfound' }
+}
+
+/**
+ * 读一个 `package.json` 并解析。
+ *
+ * **先剥 BOM**：`JSON.parse` 遇到 `\uFEFF` 会直接抛错，而带 BOM 的清单在 Windows
+ * 上很常见（某些编辑器「另存为 UTF-8 with BOM」）。旧实现没有这一步，于是那种清单
+ * 被静默当成「解析不到这个包」—— 表现为那一行被悄悄丢掉，日志里什么都没有。
+ *
+ * @param file - 绝对路径。
+ * @returns `{ status: 'ok', value }` / `{ status: 'malformed' }` /
+ *          `undefined`（文件不存在、或读不了）。
+ */
+function readPackageManifest(file) {
+  let text
+  try {
+    text = readFileSync(file, 'utf8')
+  } catch {
+    return undefined
+  }
+  try {
+    const value = JSON.parse(text.replace(/^\uFEFF/, ''))
+    if (value === null || typeof value !== 'object') return { status: 'malformed' }
+    return { status: 'ok', value }
+  } catch {
+    return { status: 'malformed' }
+  }
+}
+
+/**
+ * **猜测目录**的诊断报告：它们能解析到宿主包时，只说「这里有一份副本」，不参与判定。
+ *
+ * 为什么要有这一节：那两份目录（`cwd` 与本文件所在目录）正是旧实现骗人的入口。
+ * 直接删掉它们的信息也不对 —— 用户会觉得「我 cwd 里明明有这个包，为什么那一行被
+ * 丢了」。所以现在把它降级成**诊断**：写进告警，明说「已忽略，因为它不能证明
+ * 这就是正在运行的宿主」。
+ *
+ * @param facts - `{ cwd, moduleDir }`。
+ * @returns 告警里要追加的句子（最多 `LIST_AGENTS_GUESS_LIMIT` 条）。
+ */
+function listAgentsGuessDiagnostics({ cwd, moduleDir }) {
+  const diagnostics = []
+  const seen = []
+  const inspect = (dir) => {
+    if (typeof dir !== 'string' || dir === '') return
+    if (seen.includes(dir)) return
+    seen.push(dir)
+    if (diagnostics.length >= LIST_AGENTS_GUESS_LIMIT) return
+    const report = describeListAgentsCopy(dir)
+    if (report !== undefined) diagnostics.push(report)
+  }
+  inspect(cwd)
+  inspect(moduleDir)
+  return diagnostics
+}
+
+/**
+ * 看一眼某个**猜测**目录里的宿主工具包，写成一句可读的诊断。
+ *
+ * @param dir - 猜测的模块解析根。
+ * @returns 诊断句；该目录解析不到这个包时 `undefined`。
+ */
+function describeListAgentsCopy(dir) {
+  let requireFrom
+  try {
+    requireFrom = createRequire(join(dir, 'dsh-multitask-probe.js'))
+  } catch {
+    return undefined
+  }
+  const probe = resolveHostControlManifest(requireFrom)
+  if (probe.status === 'malformed') {
+    return `found a copy at ${dir} (manifest unparseable) — ignored: not provably the running host.`
+  }
+  if (probe.status !== 'ok') return undefined
+  const version = String(probe.value.version ?? 'unknown')
+  const hasSubpath = isPresentExport(exportsEntryOf(probe.value))
+  return (
+    `found a copy at ${dir} (version ${version}, ./list-agents: ${hasSubpath ? 'yes' : 'no'}) ` +
+    '— ignored: not provably the running host.'
+  )
+}
+
+/**
+ * 取错误码（`error.code`），取不到时 `undefined`。
+ *
+ * @param error - 任意抛出物。
+ * @returns 错误码字符串。
+ */
+function errorCodeOf(error) {
+  try {
+    return typeof error?.code === 'string' ? error.code : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 这个解析错误是否等于「这个锚点里确实没有这个包」。
+ *
+ * **两个条件都要满足**，缺一不可：
+ *
+ *   1. 错误码是 `MODULE_NOT_FOUND`；
+ *   2. 错误信息里出现包名 `@deepseek-ai/dsh-tool-subagent-control`。
+ *
+ * 只看错误码是旧实现的错法：任何一个被删掉的依赖、拼错的相对路径、坏掉的
+ * `main` 都会抛 `MODULE_NOT_FOUND`，拿它当「宿主没装这个包」的证据，就会把一条
+ * 本可以保留的行**确定地**丢掉 —— 而 `unknown` 至少还会打告警。
+ *
+ * `ERR_PACKAGE_PATH_NOT_EXPORTED` **不在**这里：它意味着包**在**、只是没开放
+ * `./package.json` 这个子路径，属于「回去试主入口」的情形，不是「包不在」。
+ *
+ * `message` 必须是**字符串**且逐字包含包名：非字符串（缺失、数字、对象）只说明这不是
+ * Node 解析器给出的那条错误，不能当证据 —— 一律返回 `false`（宁可 `unknown`）。
+ * 本函数**永不抛错**（`code` / `message` 取值本身可能炸）。
+ *
+ * 导出它是给本地回归用的：这条分类是「丢行」与「打告警」的分界，回归要能直接钉住它，
+ * 而不是只能隔着 `probeListAgentsRow()` 的间接结果猜。
+ *
+ * @param error - `require.resolve()` 抛出的错误。
+ * @returns 是否可据此下「确定没有」的结论。
+ */
+export function isAbsentPackageError(error) {
+  if (errorCodeOf(error) !== 'MODULE_NOT_FOUND') return false
+  let message
+  try {
+    message = error?.message
+  } catch {
+    return false
+  }
+  if (typeof message !== 'string') return false
+  return message.includes(LIST_AGENTS_PACKAGE)
+}
+
+/**
+ * 错误 → 一行可读文本（探测路径上永不抛错）。
+ *
+ * @param error - 任意抛出物。
+ * @returns 文本。
+ */
+function messageOf(error) {
+  if (error === null || error === undefined) return 'unknown error'
+  if (typeof error === 'string') return error
+  try {
+    return String(error.message ?? error)
+  } catch {
+    return 'unknown error'
+  }
+}
+
+/**
+ * 当前工作目录；取不到时 `''`（探测路径上永不抛错）。
+ *
+ * @returns 目录路径。
+ */
+function safeCurrentDirectory() {
+  try {
+    return process.cwd()
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 本文件所在目录；解不出时 `''`（被 bundle 过会这样）。
+ *
+ * @returns 目录路径。
+ */
+function safeModuleDirectory() {
+  try {
+    return dirname(fileURLToPath(import.meta.url))
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 当前进程的解释器/可执行文件（`process.execPath`）；取不到时 `''`。
+ *
+ * 用途只有一个：把 `argv[0]` 里那个「谁来跑」的参数从入口候选里排掉 ——
+ * 它指向的是 node 安装目录，不是任何 DSH 宿主包根。
+ *
+ * @returns 可执行文件路径；环境不允许读时 `''`。
+ */
+function safeExecutablePath() {
+  try {
+    return typeof process.execPath === 'string' ? process.execPath : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 本机宿主探测的**完整结果**（三态，见 `probeListAgentsRow()`）。
+ *
+ * 导出它是给本地回归用的：`LIST_AGENTS_SUBPATH` 只有布尔值，分不清「确认没有」
+ * 与「证明不了」，而这两者在排障时是完全不同的两件事。
+ */
+export const LIST_AGENTS_PROBE = probeListAgentsRow()
+
+/** 这个宿主是否还导出 `…/list-agents` 子路径（导出名保持不变，供本地回归断言）。 */
+export const LIST_AGENTS_SUBPATH = LIST_AGENTS_PROBE.keep
 
 /**
  * 委派组里的「清单工具」行。
