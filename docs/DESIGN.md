@@ -680,11 +680,12 @@ The interrupt goes through `keepInbox` and aborts only **the current turn**:
 
 | Kept | Removed |
 |---|---|
-| every queued message in the inbox (`keepInbox`, upstream verbatim) | **the one action** in flight (a long command that has not finished, say) |
-| the descendants it spawned (`descendants intact`) | that action's result never enters the context (it did not complete) |
+| every queued message in the inbox (`keepInbox`, upstream verbatim) | **the rest of that turn**: the tool batch in flight (a long command that has not finished, say), the steps it had not reached yet, any reply it was still composing |
+| the descendants it spawned (`descendants intact`) | that batch's result never enters the context (it did not complete) |
 | **all context already built up** — every fact already appended to the session log is still there (upstream: `every accepted fact is appended to the session log before the next step derives from it`); files read, commands run and conclusions drawn are not cleared | |
+| | **every approval request that was waiting for the user** is settled as `cancelled` — neither `rejected` nor `allowed`. The click the user had already made is discarded, and the worker re-issues the same call as a fresh request whose card is byte-identical to the old one. That is the cost worth naming: steering a worker that is sitting on an approval card throws the user's answer away |
 
-So the "right overall, details need adjusting" case not only loses nothing, it comes out ahead: redirecting it immediately with all its established state beats finishing the wrong details and redoing them. And **the new message may itself carry the critical information** (a constraint the user just added, a path just discovered, an approach just rejected) — which is exactly why it should not be made to finish first.
+So the "right overall, details need adjusting" case still comes out ahead, even though a correction restarts that turn: redirecting it immediately with all its established state beats finishing the wrong details and redoing them. And **the new message may itself carry the critical information** (a constraint the user just added, a path just discovered, an approach just rejected) — which is exactly why it should not be made to finish first.
 
 Conclusion: this module's stance is not "trade something for timeliness" but **a correction should take effect immediately; waiting buys nothing**.
 
@@ -926,7 +927,7 @@ It also **cannot read its own session id** (that lives in metadata it cannot see
 
 **One: being interrupted mid-turn is normal, not a mistake.** The coordinator will cut the current turn off outright while a worker is working and follow with a new instruction (see the "correction timing" section — the delay is on the order of milliseconds). A worker that does not know this in advance reads "an instruction that arrives out of nowhere" as its own screw-up, and redoes the work from the top — when it in fact still holds all the context it built up, so the redo is pure waste.
 
-So all four personas say it plainly: **what you have read, run and concluded is not wiped**; all that is lost is the **one** action in progress at the moment of the interrupt; a new instruction **outranks the original brief** where they conflict; **do not redo the work from the start**; and **report across the interrupt boundary** (how far you got before it, what you did after it) — otherwise the coordinator cannot tell whether the correction took.
+So all four personas say it plainly: **what you have read, run and concluded is not wiped**; what is lost is the **rest of that turn** (the tool batch in flight, the steps it had not reached yet, any reply it was still composing) — and **an approval request that was waiting for the user is settled as `cancelled`**, so the click the user already made is thrown away; a new instruction **outranks the original brief** where they conflict; **do not redo the work from the start**; and **report across the interrupt boundary** (how far you got before it, what you did after it) — otherwise the coordinator cannot tell whether the correction took.
 
 ⚠️ Each copy must be written to its own mechanism; they must not be copied from one another:
 
