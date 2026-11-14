@@ -11,5 +11,5 @@
 
   <rect x="117" y="159" width="620" height="8" rx="4" fill="url(#rule)"/>
 
-  <text x="427" y="204" text-anchor="middle" font-family="'Segoe UI Variable Text', 'Segoe UI', -apple-system, 'SF Pro Text', 'Helvetica Neue', Arial, 'Noto Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="21" letter-spacing="2.4" fill="#8B949E">v<tspan id="version">1.5.1</tspan> · MIT · 零运行时依赖</text>
+  <text x="427" y="204" text-anchor="middle" font-family="'Segoe UI Variable Text', 'Segoe UI', -apple-system, 'SF Pro Text', 'Helvetica Neue', Arial, 'Noto Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="21" letter-spacing="2.4" fill="#8B949E">v<tspan id="version">1.5.2</tspan> · MIT · 零运行时依赖</text>
 </svg>
