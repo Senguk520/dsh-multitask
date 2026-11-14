@@ -113,7 +113,12 @@ for (const file of packed) {
 }
 
 // `files` 里每一项都必须真的贡献出文件（npm 对写错的路径是静默忽略的）。
+//
+// ⚠️ `!` 开头的**排除项**不走这条：它按定义一个文件都不加，只表达「别把这个打进来」。
+// 拿「必须贡献文件」去卡它，只会得到一条假的「路径写错了」——那正是把意图写进配置的代价。
+// （`"!docs/test"` 就是这种项：`docs/` 整体不在白名单里，它本来就一条文件都不贡献。）
 for (const entry of pkg.files || []) {
+  if (String(entry).startsWith('!')) continue
   const name = String(entry).replace(/\/$/, '')
   const contributes = packed.some((file) => file === name || file.startsWith(`${name}/`))
   if (!contributes) {

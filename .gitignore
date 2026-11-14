@@ -3,6 +3,12 @@ install-multitask.ps1
 
 #相关测试文件
 test/
+
+# 公开镜像：docs/test/ 是 test/ 中适合随仓库公开的那部分测试。
+# 不加上这两行，上面的 `test/` 会连 docs/test 一起忽略
+# （无前导斜杠的模式匹配任意层级的同名目录）。
+!docs/test/
+!docs/test/**
 .cursor/
 docs/remember.md
 .codebuddy/

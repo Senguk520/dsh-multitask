@@ -22,7 +22,8 @@
     "docs/DESIGN_zh.md",
     "README.md",
     "README.zh.md",
-    "LICENSE"
+    "LICENSE",
+    "!docs/test"
   ],
   "keywords": [
     "deepseek-harness",

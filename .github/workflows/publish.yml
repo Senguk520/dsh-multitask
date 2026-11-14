@@ -42,6 +42,7 @@
 #   被 `.gitignore` 忽略的东西只活在本机上，一个都不许进包 ——
 #   `install-multitask.ps1`、`test/`、`.cursor/`、`docs/remember.md` 都属于这一类。
 #   `.gitignore` 自己虽在仓库里，但不在 `files` 里，同样不入包。
+#   `docs/test/` 是公开镜像，不在 `files` 里，因此不入包。
 #
 #   两条要害（都实测过）：
 #     · `files` 里写**具体文件**（`"docs/DESIGN.md"`），不要写整个目录（`"docs"`）。
