@@ -164,6 +164,8 @@
  *     MULTITASK-APPROVAL-RELAYED          第二级把子代理请求转呈给了父会话
  *     MULTITASK-APPROVAL-RELAY-FAILED     转呈失败（reason=…），已退回原路径
  *     MULTITASK-APPROVAL-RELAY-RETRY-*    转呈失败后唤醒父会话并重试的结果（见下节）
+ *     MULTITASK-APPROVAL-WAIT-ENTER       转呈期间登记「这个子代理正在等审批」
+ *     MULTITASK-APPROVAL-WAIT-EXIT        等到了（或被取消/抛错），撤销那份登记
  *
  * ── 「回合刚好关着」：为什么会有个例，以及怎么补（本次修复）──────────────────
  *
@@ -390,6 +392,110 @@ const RELAY_RETRY_POLL_MS = 100
  * （没有送达就没有唤醒，等下去只是白等）。
  */
 const NOTIFY_ACK_TIMEOUT_MS = 2000
+
+/**
+ * 「某个子代理正在等审批」的跨模块登记表的键名（**逐字**跨文件契约）。
+ *
+ * ── 它解决的是哪条链 ────────────────────────────────────────────────────────
+ *
+ * 本模块把子代理的危险调用转呈给父会话时，那次等待在**别人眼里**与「卡住了」
+ * 完全同形：
+ *
+ *     `interrupt-before-send`（协调者发消息前）无条件 `interrupt(targetId)`；
+ *     `subagent-watchdog`（5 分钟没有工具调用）也 `interrupt`；
+ *     而运行时 `dsh-user-approval` 的 `decide()` 第一行是
+ *     `if (signal?.aborted) return "cancelled"`。
+ *
+ * 于是「卡弹出 → 用户点允许」那一刻如果回合已被 abort，那次点击就被**静默丢弃**
+ * （不是报错、不是拒绝），子代理重发同一条命令，用户看到一张**逐字相同**的第二张卡。
+ *
+ * 断链的办法就是让「正在等审批」这件事对其他插件可见：本模块在转呈期间往这张表里
+ * 记一笔，两个 interrupt 方看到 `entry !== undefined && entry.n > 0` 就跳过打断
+ * （分别退回排队语义 / 不判停滞）。
+ *
+ * ── 契约（三处必须逐字一致）─────────────────────────────────────────────────
+ *
+ *     键名：'dsh-multitask:approval-wait:v1'（挂在 globalThis 上）
+ *     值：  Map<string, { n: number, at: number }>
+ *           agentId（或 sessionId）→ { n: 在飞转呈计数, at: 最后一次变更的 Date.now() }
+ *
+ * ⚠️ **不设 TTL**是有意的：过期会让「本该跳过打断」的时刻又被打断，失败方向正好反了。
+ * 计数只在 `n <= 0` 时删键，所以登记表不会长出一堆 `n === 0` 的空壳。
+ *
+ * ⚠️ 本仓的预设模块约定「零 import、常量各自留一份」（见
+ * `presets/multitask/composition.mjs` 与 `test/repo-consistency.mjs` 的跨模块常量守卫），
+ * 所以这里**不**抽公共模块，只有这个字符串常量与读取方各抄一份。
+ */
+const APPROVAL_WAIT_KEY = 'dsh-multitask:approval-wait:v1'
+
+/**
+ * 取（必要时建立）跨模块登记表。任何异常都返回 `undefined`。
+ *
+ * @returns 登记表；`globalThis` 不可用或不可写时为 `undefined`。
+ */
+function approvalWaitTable() {
+  try {
+    const existing = globalThis[APPROVAL_WAIT_KEY]
+    if (existing instanceof Map) return existing
+    const created = new Map()
+    globalThis[APPROVAL_WAIT_KEY] = created
+    return created
+  } catch {
+    // 登记表只是一个「给别人看的提示」：它不存在时最坏退化成本次修复前的行为，
+    // 但绝不允许它把审批本身弄挂。
+    return undefined
+  }
+}
+
+/**
+ * 登记「这些 id 正在等审批」：每个 id 的计数 +1。
+ *
+ * @param ids - 非空字符串 id 列表（空值已由调用方滤掉）。
+ */
+function waitEnter(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return
+  try {
+    const table = approvalWaitTable()
+    if (table === undefined) return
+    const now = Date.now()
+    for (const id of ids) {
+      if (typeof id !== 'string' || id === '') continue
+      const previous = table.get(id)
+      const n = typeof previous?.n === 'number' && Number.isFinite(previous.n) ? previous.n : 0
+      table.set(id, { n: n + 1, at: now })
+    }
+  } catch {
+    // 静默吞掉：审批路径的成败与这张表无关。
+  }
+}
+
+/**
+ * 撤销一次登记：每个 id 的计数 -1，`n <= 0` 时删键。
+ *
+ * ⚠️ 必须与 `waitEnter` **成对**出现在 `finally` 里：abort / 抛错 / 正常返回三条路径
+ * 都要清账。漏一次就会留下一个 `n > 0` 的幽灵项 —— 那种状态下那两个 interrupt 方会
+ * **永远**跳过这个子代理，而表面上看不出任何异常（正是本注册表最坏的失败方向）。
+ *
+ * @param ids - 与对应 `waitEnter` 完全相同的 id 列表。
+ */
+function waitExit(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return
+  try {
+    const table = globalThis[APPROVAL_WAIT_KEY]
+    if (!(table instanceof Map)) return
+    const now = Date.now()
+    for (const id of ids) {
+      if (typeof id !== 'string' || id === '') continue
+      const previous = table.get(id)
+      if (previous === undefined) continue
+      const n = typeof previous?.n === 'number' && Number.isFinite(previous.n) ? previous.n - 1 : 0
+      if (n <= 0) table.delete(id)
+      else table.set(id, { n, at: now })
+    }
+  } catch {
+    // 同上。
+  }
+}
 
 /** 每次进程只警告一次的记录器（与同仓守卫同款，避免刷屏）。 */
 function warnOnceFactory(ctx) {
@@ -1547,6 +1653,59 @@ export function apply(ctx, config) {
     }
 
     /**
+     * 取一个 agent 的**登记用 id**：`agent.id`，以及存在时的 `agent.session.id`。
+     *
+     * 两种形态都要登记，因为下游拿哪个字符串来查不由本模块决定：`interrupt(targetId)`
+     * 那一侧传进来的可能是 agent id，也可能是 session id。少登记一个就等于「那一侧
+     * 认不出来 ⇒ 照旧打断」，而**认不出来时是静默的** —— 所以宁可两个都记。
+     *
+     * 空值一律滤掉（`unknown` / `''` 之类的占位 id 记进去只会污染表），重复值也去重
+     * （测试与部分部署里 `agent.id === agent.session.id`，重复登记会让计数虚高）。
+     *
+     * @param target - 子代理（`request.agent`）。
+     * @returns 去重后的非空字符串 id 列表；读不出来时为空数组。
+     */
+    const idsOf = (target) => {
+      const out = []
+      try {
+        for (const value of [target?.id, target?.session?.id]) {
+          if (value === undefined || value === null) continue
+          const id = typeof value === 'string' ? value : String(value)
+          if (id === '') continue
+          if (!out.includes(id)) out.push(id)
+        }
+      } catch {
+        // 读 id 本身出意外时按「没有可登记的 id」处理：登记表是尽力而为的提示，
+        // 它缺项只会退化成修复前的行为，绝不影响审批。
+      }
+      return out
+    }
+
+    /**
+     * 记一行登记 / 撤销的日志（固定标识，便于 grep）。
+     *
+     * ⚠️ 这两行是**成对**的，不是装饰：孤零零的一条 `WAIT-ENTER` 而没有对应的
+     * `WAIT-EXIT`，正是「计数泄漏」的形状 —— 那种状态下那两个 interrupt 方会永远
+     * 跳过这个子代理，而界面上完全看不出异常。成对记录才让这件事可诊断。
+     * 频率与既有的 `MULTITASK-APPROVAL-RELAYED` 同阶（每张卡各一行），不刷屏。
+     *
+     * @param kind - `ENTER` / `EXIT`。
+     * @param ids - 本次登记 / 撤销的 id 列表。
+     * @param detail - 给人看的补充说明（撤销时用来标明结局）。
+     */
+    const noteWait = (kind, ids, detail) => {
+      try {
+        ctx.logger?.info?.(
+          `dsh-multitask: MULTITASK-APPROVAL-WAIT-${kind}` +
+            ` id=${ids.length === 0 ? 'none' : ids.map((id) => JSON.stringify(id)).join(',')}` +
+            `${detail === undefined ? '' : ` — ${detail}`}`,
+        )
+      } catch {
+        // 日志通道不可用不能反过来炸掉审批。
+      }
+    }
+
+    /**
      * 记一次重试相关的结果（固定标识，便于 grep）。
      *
      * @param kind - `WAITING` / `SKIPPED` / `RETRIED` / `FAILED`。
@@ -1609,7 +1768,7 @@ export function apply(ctx, config) {
      * @returns 重试成功时的用户决定；没有重试、或重试仍失败时为 undefined。
      */
     const retryRelayAfterWake = async (context) => {
-      const { error, parent: root, toolName: name, childId: id, original: why, request: source, notice } = context
+      const { error, parent: root, agent, toolName: name, childId: id, original: why, request: source, notice } = context
 
       if (relayRetryWindowMs <= 0) {
         noteRetry('SKIPPED', 'disabled-by-config')
@@ -1680,7 +1839,20 @@ export function apply(ctx, config) {
           noteRetry('SKIPPED', 'parent-not-interactive')
           return undefined
         }
-        const outcome = await approval.request(buildRelayPayload({ root, name, id, why, source }))
+        // 重试同样是一次**真实的等待**：卡一旦落到主对话里，那两个 interrupt 方读的
+        // 就是同一张登记表，所以这里也要先登记、再 await、最后在 `finally` 里撤销。
+        // （漏掉这一处的话，重试走出来的卡恰恰是最容易被打断的那一类 —— 它出现的
+        // 场景本来就是「父会话刚被唤醒」。）
+        const waitIds = idsOf(agent)
+        let outcome
+        waitEnter(waitIds)
+        noteWait('ENTER', waitIds, 'retry')
+        try {
+          outcome = await approval.request(buildRelayPayload({ root, name, id, why, source }))
+        } finally {
+          waitExit(waitIds)
+          noteWait('EXIT', waitIds, `retry outcome=${String(outcome)}`)
+        }
         noteRetry('RETRIED', undefined, `the retried relay reached the parent session; outcome=${String(outcome)}`)
         return outcome
       } catch (retryError) {
@@ -1728,9 +1900,23 @@ export function apply(ctx, config) {
           // 向父会话发起一次**新的**审批请求。它会走完整条链路（含上游的转发者），
           // 于是由 `ui-approval` 在主对话里渲染成面板 —— 这正是本模块要的效果。
           relayAttempted = true
-          const outcome = await approval.request(
-            buildRelayPayload({ root: parent, name: toolName, id: childId, why: original, source: request }),
-          )
+          // ── 转呈期间登记「这个子代理正在等审批」（别的插件的 interrupt 会读它）──
+          //
+          // 必须**先登记再 await**：卡一弹出，两个 interrupt 方就可能动手，而那一刻
+          // 之前的窗口正是出错的地方（详见 `APPROVAL_WAIT_KEY` 的注释）。
+          // 撤销放在 `finally`：abort / 抛错 / 正常返回三条路径都要清账。
+          const waitIds = idsOf(agent)
+          let outcome
+          waitEnter(waitIds)
+          noteWait('ENTER', waitIds)
+          try {
+            outcome = await approval.request(
+              buildRelayPayload({ root: parent, name: toolName, id: childId, why: original, source: request }),
+            )
+          } finally {
+            waitExit(waitIds)
+            noteWait('EXIT', waitIds, `outcome=${String(outcome)}`)
+          }
 
           try {
             ctx.logger?.info?.(

@@ -54,7 +54,7 @@
  *   |---|---|---|
  *   | 已结束、等下一轮 | 空操作 | 与不加本模块完全一样 |
  *   | 正跑**错**的东西 | 停掉当前轮次 | 纠错立刻被读到 —— 本模块的全部意义 |
- *   | 正跑**对**的东西 | 停掉当前轮次 | 丢掉**正在进行的那一个动作**，其余全部保留 |
+ *   | 正跑**对**的东西 | 停掉当前轮次 | 丢掉**这一轮剩下的部分**（在飞的工具批及结果、未到达的步骤、正在组织的汇报）**和该轮所有待答复的审批**（结算为 `cancelled`），其余保留 |
  *
  * ⚠️ 第三行不是「任务被中断」，这一点必须说准 —— 早期版本把它写成「牺牲这一步的进度」，
  * 那是错的。中断保留的东西比它拿掉的多得多：
@@ -63,10 +63,10 @@
  *   · **已经建立的全部上下文**：会话日志里每一条已 append 的事实都还在（上游：
  *     `every accepted fact is appended to the session log before the next step derives
  *     from it`），worker 已经读过的文件、跑过的命令、得出的结论**都不会被清掉**；
- *   · **它真正放弃的只有「正在进行中的那一个动作」** —— 例如一条还没跑完的长命令，
+ *   · **它真正放弃的是「这一轮剩下的部分」和「该轮挂着的待答复审批」** —— 例如一条还没跑完的长命令，
  *     那一次调用的结果不会进上下文（因为它没完成）。
  *
- * 于是「大方向对、细节要调」的情形不但没有损失，反而更划算：让它带着全部已建立的
+ * 于是「大方向对、细节要调」的情形仍然更划算 —— 尽管纠错会让这一轮重来：让它带着全部已建立的
  * 状态立刻改道，好过按错的细节做完再返工。而且新的一条消息里**可能就带着关键信息**
  * （用户刚补充的约束、刚发现的路径、刚否决的方案）—— 那正是不该等它跑完的理由。
  *
@@ -136,6 +136,21 @@ const TARGET_KEYS = ['target', 'agent_id', 'sessionId', 'job_id']
 const SUBAGENT_ORIGIN = 'subagent'
 
 /**
+ * 「谁正在等一张审批卡」这张表的**全局键名**（与 `approval-gate.mjs` 里写入的那一份
+ * 逐字一致；本仓库零 import 约定，所以每个模块自带一份字面量）。
+ *
+ * 值类型固定是 `Map<string, { n: number, at: number }>`，判定是
+ * `entry !== undefined && entry.n > 0`。本模块只**读**它，从不写。
+ *
+ * 为什么这里需要它：用户点「允许」之后，`dsh-user-approval` 的 `decide()` 第一件事就是
+ * `if (signal?.aborted) return 'cancelled'` —— 也就是说，若在子代理**正等着一张审批卡**
+ * 的时候中断它，用户的那次点击会被**静默丢弃**，worker 随后重发同一条命令，弹出逐字
+ * 相同的第二张卡。跳过这次中断，消息仍然按 steer 语义排队到下一步骤，而审批卡还是
+ * 用户点的那一张。
+ */
+const APPROVAL_WAIT_KEY = 'dsh-multitask:approval-wait:v1'
+
+/**
  * 判断一个 agent 是不是被委派出来的子代理。
  *
  * 与 `coordinator-guard.mjs` / `minimal-guard.mjs` / `subagent-mode.mjs` /
@@ -192,6 +207,33 @@ function targetIdOf(args) {
 }
 
 /**
+ * 判断某个会话此刻是不是**正在等一张审批卡**。
+ *
+ * 判据逐字来自跨文件契约（见 `APPROVAL_WAIT_KEY`）：表存在、类型是 `Map`、条目存在且
+ * `n > 0`。任一条件不成立都算「不在等」——**宁可多中断一次，也不要把一次正常的中断
+ * 判成等待**：多中断的代价是纠错晚一步（宿主原语义），漏判的代价是吞掉用户的一次点击。
+ *
+ * ⚠️ 必须对三种异常完全免疫，否则本模块的「失败取向」就被破坏了（见文件头）：
+ * 注册表不存在（`undefined`）、`globalThis` 被冻结或被塞了抛错的 getter、值类型不对
+ * （不是 `Map`、条目不是对象、`n` 不是数字）。所以取值、类型判定、`get` 全在 `try` 里，
+ * 任何异常都退成 `false`。**绝不写**这张表（写入方在 `approval-gate.mjs`）。
+ *
+ * @param id - 会话 id（可能是 `undefined` / 空串 / 非字符串：一律 `false`）。
+ * @returns 该会话是否正在等审批。
+ */
+function awaitingApproval(id) {
+  try {
+    if (typeof id !== 'string' || id === '') return false
+    const table = globalThis[APPROVAL_WAIT_KEY]
+    if (!(table instanceof Map)) return false
+    const entry = table.get(id)
+    return entry !== undefined && entry.n > 0
+  } catch {
+    return false
+  }
+}
+
+/**
  * 装载本模块。
  *
  * @param ctx - preset scope 的插件上下文。
@@ -231,6 +273,18 @@ export function apply(ctx, config) {
       if (targetId === undefined) {
         // 取不到目标就不中断：宁可纠错晚一点，也不能靠猜去停一个会话。
         note('SKIPPED', 'reason=no-target-id')
+        return await next()
+      }
+
+      // ── 目标正等着一张审批卡：**不中断** ────────────────────────────────────
+      //
+      // 这条跳过不是「少做一次优化」，而是修一个真实的用户可见缺陷：中断会让
+      // `dsh-user-approval.decide()` 里的 `if (signal?.aborted) return 'cancelled'`
+      // 命中，用户刚点下的「允许」被静默丢弃，worker 重发同一条命令 ⇒ 弹出逐字相同的
+      // 第二张卡。等待中的目标不会因为这次中断而更快读到纠错（它本来就卡在等人），
+      // 所以这里退回**宿主原语义**：消息照常进收件箱，排队到下一个步骤边界。
+      if (awaitingApproval(targetId)) {
+        note('SKIPPED', 'reason=awaiting-approval')
         return await next()
       }
 

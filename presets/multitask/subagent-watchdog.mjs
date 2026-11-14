@@ -27,7 +27,7 @@
  *
  * ── 为什么是「停掉」而不是「重新派单」───────────────────────────────────────
  *
- * 停掉是**可观测**的最小动作：它不丢上下文（中断只丢进行中的那一个动作），它不重复
+ * 停掉是**可观测**的最小动作：它不丢上下文（中断丢掉这一轮剩下的部分，以及该轮挂着的待答复审批（结算为 `cancelled`）），它不重复
  * 副作用（重派会让同一个写入动作做两遍），而它的通知就是唤醒父会话的那条路。重派是
  * 协调者的决定 —— 它看得见报告、看得见文件现状；本模块看不见这些，替它重派只会
  * 制造重复劳动与并发两套结果。
@@ -81,6 +81,21 @@ export const SKIPPED_MARKER = '[MULTITASK-WATCHDOG-SKIPPED]'
 export const NO_PARENT_MARKER = '[MULTITASK-WATCHDOG-NO-PARENT]'
 
 /**
+ * 「谁正在等一张审批卡」这张表的**全局键名**（与 `approval-gate.mjs` 里写入的那一份
+ * 逐字一致；本仓库零 import 约定，所以每个模块自带一份字面量）。
+ *
+ * 值类型固定是 `Map<string, { n: number, at: number }>`，判定是
+ * `entry !== undefined && entry.n > 0`。本模块只**读**它，从不写。
+ *
+ * 为什么看门狗需要它：等审批时 `at` 不会因为任何工具调用而刷新（那张卡本身就是一次
+ * 工具调用的**中间态**，`tools/post-execute` 还没发生），于是票数一过阈值就会被判成
+ * 停滞。此时中断的后果不是「停下卡死」，而是把用户点下的「允许」静默丢弃
+ * （`dsh-user-approval.decide()` 开头就是 `if (signal?.aborted) return 'cancelled'`），
+ * worker 随后重发同一条命令、弹出逐字相同的第二张卡。
+ */
+const APPROVAL_WAIT_KEY = 'dsh-multitask:approval-wait:v1'
+
+/**
  * 默认停滞阈值：5 分钟。
  *
  * 够长，长到不会误杀一个正在长思考 / 长命令里的 worker（一次 `read` 动辄几十秒，
@@ -128,6 +143,64 @@ function isDelegatedChild(agent) {
   if (typeof header.parentSession === 'string' && header.parentSession !== '') return true
   if (typeof header.delegationDepth === 'number' && header.delegationDepth > 0) return true
   return false
+}
+
+/**
+ * 判断某个会话此刻是不是**正在等一张审批卡**。
+ *
+ * 判据逐字来自跨文件契约（见 `APPROVAL_WAIT_KEY`）：表存在、类型是 `Map`、条目存在且
+ * `n > 0`。任一条件不成立都算「不在等」—— 方向是**宁可不放过**：判成「不在等」的代价
+ * 只是让看门狗按老规则处理（该记的记、该停的停），而漏判它正在等审批才是那次静默丢点击。
+ *
+ * ⚠️ 必须对三种异常完全免疫，否则本模块「绝不抛错」的取向就被破坏了（见文件头）：
+ * 注册表不存在（`undefined`）、`globalThis` 被冻结或被塞了抛错的 getter、值类型不对
+ * （不是 `Map`、条目不是对象、`n` 不是数字）。所以取值、类型判定、`get` 全在 `try` 里，
+ * 任何异常都退成 `false`。**绝不写**这张表（写入方在 `approval-gate.mjs`）。
+ *
+ * @param id - 会话 id（可能是 `undefined` / 空串 / 非字符串：一律 `false`）。
+ * @returns 该会话是否正在等审批。
+ */
+function awaitingApproval(id) {
+  try {
+    if (typeof id !== 'string' || id === '') return false
+    const table = globalThis[APPROVAL_WAIT_KEY]
+    if (!(table instanceof Map)) return false
+    const entry = table.get(id)
+    return entry !== undefined && entry.n > 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 在册条目对应的**正在等审批的 id**（没有就 `undefined`）。
+ *
+ * 为什么要试多个形态：条目里的 `id` 是纳入那一刻抓的 `agent.session.id ?? agent.id`
+ * （见 `watch()`），而审批表的写入方取到的是哪一个是它自己的事。两种形态都试才能覆盖：
+ *
+ *   1. `entry.id` —— 纳入时拿到的会话 id（有 `session.id` 时就是它，也是 `interrupt()`
+ *      要的那个 id）；
+ *   2. `agent.session.id` —— 活 agent 上现在的会话 id（纳入时 `session.id` 还不在、
+ *      后来才有的情形）；
+ *   3. `agent.id` —— agent 自己的 id（`entry.id` 落到 `session.id` 而写入方记的是
+ *      `agent.id` 时，只有这一条能命中）。
+ *
+ * **不试 `parentId`**：那是父会话的 id，拿它去查会把「父会话自己在等审批」误当成
+ * 「这个 worker 在等审批」，等于让整批 worker 的停滞判定全部失效。
+ *
+ * @param entry - 在册条目 `{ at, id, parentId }`。
+ * @param agent - 该条目对应的活 agent。
+ * @returns 命中的 id，或 `undefined`。
+ */
+function approvalWaitingIdOf(entry, agent) {
+  try {
+    for (const candidate of [entry?.id, agent?.session?.id, agent?.id]) {
+      if (typeof candidate === 'string' && candidate !== '' && awaitingApproval(candidate)) return candidate
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** 规范化一个 preset id：只接受非空字符串。 */
@@ -217,6 +290,16 @@ export function apply(ctx, config) {
    */
   const watched = new Map()
 
+  /**
+   * 已经为「在等审批」打过跳过日志的 child id。
+   *
+   * 与 `noteOnceFactory` 的 `seen` 同一约定（每个理由只报一次），但键是 **child id**：
+   * 这条跳过的日志是**周期性**的（每 `tickMs` 都会重新遇到同一个仍在等审批的 worker），
+   * 若不去重，一张挂着的审批卡会把日志刷满。worker 走了就从这里删掉，避免长进程里
+   * 这个 Set 只增不减。
+   */
+  const approvalSkipNoted = new Set()
+
   /** 打一条 warn（停滞是**故障级**信号，不能被 info 淹掉）。 */
   const warn = (message) => {
     try {
@@ -297,14 +380,37 @@ export function apply(ctx, config) {
   /**
    * 巡检一次。
    *
-   * 处理顺序刻意是「先删除、再打断」：这样即使 `interrupt` 同步地又抛出 / 触发事件，
-   * 同一个 worker 也不会在另一次巡检里被重复处理。
+   * 处理顺序刻意是「**先问审批** → 先删除 → 再打断」：
+   *
+   *   · 问审批排在最前，是因为判据（`idle > stallTimeoutMs`）在等审批的 worker 上**必然**
+   *     成立，而那一轮的唯一正确处置是「什么都不做」（见下面那段注释）；
+   *   · 删除排在打断之前：这样即使 `interrupt` 同步地又抛出 / 触发事件，同一个 worker
+   *     也不会在另一次巡检里被重复处理。
    */
   const tick = () => {
     const now = Date.now()
     for (const [agent, entry] of watched) {
       const idle = now - entry.at
       if (idle <= stallTimeoutMs) continue
+
+      // ── 先问一句「它是不是正等着一张审批卡」 ────────────────────────────────
+      //
+      // 等审批时 `at` **不会**被刷新：那张卡本身就是一次工具调用的中间态，
+      // `tools/post-execute` 还没发生（工具还没跑完）。所以一个乖乖在等人的 worker
+      // 与一个真的卡死的 worker 在时间戳上**长得一模一样**，只能靠这张表区分。
+      //
+      // 这里刻意**不**刷新 `entry.at`：那是拿「放过所有停滞」去换「放过这一个」，而真正
+      // 卡死的 worker 也会被一并放过。正确做法是**这一轮什么都不做** —— 不删除、不判
+      // 停滞、不中断 —— 等审批落地后那次 `tools/post-execute` 自己会把 `at` 顶上去；
+      // 若它一直挂着，下一轮巡检仍然走到这里，只是不再重复打日志。
+      const approvalId = approvalWaitingIdOf(entry, agent)
+      if (approvalId !== undefined) {
+        if (!approvalSkipNoted.has(approvalId)) {
+          approvalSkipNoted.add(approvalId)
+          note('info', `${SKIPPED_MARKER} reason=awaiting-approval child=${approvalId} idle=${idle}ms`)
+        }
+        continue
+      }
 
       // 立刻从在册里删掉：停滞只处理一次。
       watched.delete(agent)
@@ -415,6 +521,14 @@ export function apply(ctx, config) {
       const agent = payload?.agent
       if (agent === undefined || agent === null) return
       watched.delete(agent)
+      // 「这条跳过的日志已经打过」的记账也一并清掉：id 随会话消失，留着只会让 Set 只增不减。
+      try {
+        for (const candidate of [agent?.session?.id, agent?.id]) {
+          if (typeof candidate === 'string' && candidate !== '') approvalSkipNoted.delete(candidate)
+        }
+      } catch {
+        // 清不掉只是内存里多一个字符串。
+      }
     } catch {
       // 删不掉只是内存里多一条记录，下一次 tick 会因为拿不到 id 而忽略它。
     }
