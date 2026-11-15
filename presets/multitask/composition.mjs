@@ -229,6 +229,16 @@ When the team tools are in your catalog (\`spawn_teammate\`, \`wait_agent\`, \`t
 - **Reach for \`wait_agent\` only when there is nothing else to advance.** It does report the next teammate state change, message or task-board update — but with no active teammate it returns \`noProgress\` immediately instead of blocking, so it is not a polling primitive, and a loop around it spends turns and produces nothing. If another brief, a verification or the report is available, do that first and let the members run.
 - **State the file scope a member may change.** Name the files or directories in the brief. Treat that scope as advisory, not as a lock: overlapping write scopes are recorded and warned about, but nothing enforces them, so the only thing keeping two members off the same file is what you wrote down.
 
+## Every brief carries a task key
+
+The first line of every brief you dispatch is \`task: <slug>\` — \`subagent\`, \`subagent_fork\`, \`subagent_ptc\`, \`subagent_minimal\`, \`subagent_preset\` and \`spawn_teammate\` all require it, and a dispatch without one is REFUSED. The slug is 3-64 characters, lowercase: \`[a-z0-9][a-z0-9._-]{2,63}\` — letters, digits, dot, underscore, hyphen. No spaces, no capitals, and it is not a pattern: never write a regular expression or a sentence as the slug.
+
+The same piece of work always carries the same slug; different work always carries different slugs (\`fix-gate-a\` vs \`fix-gate-b\`). Restarting, reassigning or taking over a task REUSES its original slug — that reuse is the only thing that makes the second dispatch recognisable as the same job, and a fresh slug invented for the same job is exactly the failure this key exists to prevent.
+
+While that slug is live, a second dispatch with it is refused and the refusal names the session already running it. There are three ways out and no others: wait for that worker to finish; stop it first with \`interrupt_agent\` and then dispatch (never \`send_message\` — that aborts the current turn and opens a NEW one, so the worker keeps running); or, if this genuinely is different work, give it a different slug. Keys are scoped to this conversation, so the same slug may be used again in an unrelated conversation.
+
+The mirror-image mistake is reusing one slug for two different jobs: the second dispatch is then refused on behalf of work that has nothing to do with it. Two jobs means two slugs, each dispatched on its own.
+
 ## Dispatching to another installed mode
 
 The four paths above are this mode's OWN workers. All four run **under this mode's own preset**: the host composes a child from its parent's preset, so a \`subagent\` you start is a Multitask worker with a full tool surface — it is NOT a \`standard\`-mode worker, and no instruction in a brief can change that. It is a structural property of how delegation composes, not a setting you can pass.
@@ -2917,6 +2927,41 @@ export function buildPlugins(options) {
     {
       id: 'interrupt-before-send',
       name: local('./interrupt-before-send.mjs'),
+      config: { enabled: true },
+    },
+
+    // ── ★ 任务键：同一件事不许同时派两个 worker ────────────────────────────────
+    //
+    // 只做一件事：要求每份任务书带一行 `task: <slug>`，并在**同一个键**已经有 worker
+    // 在跑时拒绝第二次派发。
+    //
+    // ── 为什么需要它（人格纪律解决不了的那个洞）─────────────────────────────────
+    //
+    // 「停掉 A、改派 B 做同一件事」在实践中常常变成 **A 没停、B 又开始**：两个 agent
+    // 并发改同一批文件。机制侧看不出这两次派发是同一件事 —— `subagent` /
+    // `subagent_fork` / `subagent_ptc` / `subagent_minimal` 的参数只有 `cwd` /
+    // `description` / `prompt`，**没有任务标识**（真实 schema 见
+    // `.tmp-asar/tool-subagent.js` 的 `parameters`）。于是「同一件事的第二遍」与
+    // 「两件不同的事」在参数上一模一样，任何检查都无从下手。
+    //
+    // 本行补上那个标识，并且刻意用**显式任务键**而不是语义相似度：后者判不准
+    // （两份无关的任务书可以措辞几乎相同），还会误杀「两个 worker 各做一件相似的事」。
+    //
+    // ── 为什么单开一行 ────────────────────────────────────────────────────────
+    //
+    // 它既不是「工具面收窄」（coordinator-guard / minimal-guard），也不是「审批」
+    // （approval-gate），更不是「投递时机」（interrupt-before-send）—— 它管的是
+    // **这次派发是不是同一件事的重复**。失败后果也独一份：最坏是「重复派发不再被拦」，
+    // 即回到加本行之前，所以它**静默降级**（机制自己出意外时只记一行 warn）。
+    //
+    // ⚠️ 与 `interrupt-before-send` 是配套的，不是替代：那一行保证「协调者的纠错立刻
+    // 生效」，本行保证「同一个任务的第二次派发必须先把它停掉」。两者一起才凑成
+    // 「先停 A 再派 B」这条路径 —— 少了任何一半，用户看到的都是两个 worker 一起写。
+    //
+    // 登记表挂 `globalThis`（契约见该文件头），按**父会话**隔离。
+    {
+      id: 'task-key',
+      name: local('./task-key.mjs'),
       config: { enabled: true },
     },
 
