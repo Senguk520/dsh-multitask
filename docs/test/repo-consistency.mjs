@@ -226,6 +226,20 @@ function testLikeFilesOutsideTest() {
   const NAME_LOOSE = /(^|[\\/])[^\\/]*test[^\\/]*\.(mjs|js|cjs|ts|ps1)$/i
   const CONTENT_HINT = /node:assert|node:test|console\.assert|process\.exitCode|process\.exit\(1\)|spawnSync/
   const RUNNER_HINT = /function\s+test\s*\(|const\s+results\s*=\s*\[\]/
+  /**
+   * 本地临时产物的名字前缀 —— `.tmp-probe.mjs` 这类一次性探针脚本。
+   *
+   * `*.tmp-*` 已被 `.gitignore` 的 `.tmp-*` 行忽略：它们只在本地短暂存在，
+   * 既进不了版本库，也永远不会进 npm 包，所以**不可能被发布**。
+   *
+   * ⚠️ 扫它们只会制造**假红**：一个 `.tmp-check-stop.mjs` 探针就让本断言红过一次，
+   * 当时唯一的处理办法是删掉探针。假红比不红更伤 —— 它逼人习惯性忽略这条断言，
+   * 于是真正该抓的东西（`tools/verify-runner.mjs` 这种）反而没人看了。
+   *
+   * 只排除这一个前缀，**没有**放宽成「跳过所有点开头的条目」：`.github/` 必须继续
+   * 被扫，否则摆在 `test/` 之外的工作流脚本就从这里漏过去了。
+   */
+  const TMP_PREFIX = '.tmp-'
   const found = []
 
   /** 深度优先遍历（同步，够用）。 */
@@ -237,6 +251,9 @@ function testLikeFilesOutsideTest() {
       return
     }
     for (const entry of entries) {
+      // 本地临时产物（`*.tmp-*`，已被 `.gitignore` 忽略）既不进包也不会被发布，
+      // 扫它们只制造假红；**目录与文件同样跳过**（理由见 TMP_PREFIX 的注释）。
+      if (entry.name.startsWith(TMP_PREFIX)) continue
       const full = path.join(dir, entry.name)
       if (entry.isDirectory()) {
         if (SKIP_DIRS.has(entry.name)) continue
