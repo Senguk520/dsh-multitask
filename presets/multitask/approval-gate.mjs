@@ -223,9 +223,15 @@
  *     ① 上游那条守卫在 `session.append('approval/asked', …)` **之前**，所以重试
  *     **不可能**产生第二次 `asked`、也不可能让用户看到第二张卡；
  *     ② 别的失败原因（父会话已销毁、审批服务消失）重试既没用，又可能造成重复询问；
- *   · 挂起期间**不**在 `approval-wait` 登记表里占位。那张表是给「卡片已经在等用户」
- *     用的（两个 interrupt 方据此让路）；挂起期间还没有卡，占位会让 watchdog 在
- *     10 分钟里都不判停滞 —— 那正好是本次要避免的「看起来卡住却没人管」。
+ *   · 挂起期间**也**进 `approval-wait` 登记表 —— 挂起在语义上就是「正在等用户」。
+ *     那张表是另外两个插件判断「该不该让路」的**唯一**依据：`subagent-watchdog`
+ *     5 分钟没有 `tools/post-execute` 就判停滞并 `interrupt`（`DEFAULT_STALL_TIMEOUT_MS`），
+ *     `interrupt-before-send` 在协调者 `send_message` 之前先打断目标。
+ *     不登记的代价是硬的：真正的等待窗被 watchdog 砍成 **5 分钟**（而不是上面那个
+ *     10 分钟上限），而且它杀掉的恰是一个**正在等用户**的请求 —— 正是本模块要堵的坑。
+ *     所以 `waitEnter` 在进入挂起时登记，`waitExit` 放在**唯一的收尾点**上
+ *     （`retryRelayAfterWake` 那处 `finally`）：成功重试、超时、abort、父 agent
+ *     disposed、次数耗尽、逻辑异常**六条出口全部**经过它，计数归零才删键。
  *
  * ⚠️ 通知的文案因此必须**在两种结局下都为真**：它既不能说「卡片一定在主对话里」（重试
  * 可能失败），也不能说「必须去子会话作答」（重试可能成功）。而且挂起期间**子会话里也
@@ -414,6 +420,11 @@ const OPEN_TURN_REQUIRED_HINT = 'outside an open turn'
  *
  * 抬到 10 分钟后，真正无限挂住的风险只落在「用户永远不回来」这一种，而那种情况下
  * 10 分钟后的兜底通知（落到子会话 + 指路）与今天的行为一致。
+ *
+ * ⚠️ 这个窗口**必须**与 `APPROVAL_WAIT_KEY` 那张表一起看：窗口里的每一毫秒，那个子代理
+ * 都是在「等用户」，所以它在表里是 `n > 0`（见 `retryRelayAfterWake`）。不登记的话，
+ * `subagent-watchdog` 的 5 分钟停滞阈值会先把请求打断 —— 这个 600000 就形同虚设，
+ * 而它打断的恰是一次正当的等待。
  */
 const DEFAULT_RELAY_RETRY_WINDOW_MS = 600000
 
@@ -474,6 +485,18 @@ const NOTIFY_ACK_TIMEOUT_MS = 2000
  * 断链的办法就是让「正在等审批」这件事对其他插件可见：本模块在转呈期间往这张表里
  * 记一笔，两个 interrupt 方看到 `entry !== undefined && entry.n > 0` 就跳过打断
  * （分别退回排队语义 / 不判停滞）。
+ *
+ * ── 本模块有**三处**登记来源（它们共用同一张表、同一个计数）─────────────────────
+ *
+ *   ① 第一次转呈（卡片已经抛进主对话）；
+ *   ② 每次「唤醒后重试」（同样是一次真实的等待）；
+ *   ③ **挂起本身** —— 转呈还没落到下游、子代理的工具调用阻塞在那里，语义上就是
+ *      「正在等用户」。少了 ③ 的话，挂起中的请求在 watchdog 眼里与「卡住」同形，
+ *      5 分钟就被判停滞打断（详见文件头那一节）。
+ *
+ * ③ 会把 ① ② 的计数叠起来：一次「挂起中正在重试」的转呈在表里是 `n === 2`。
+ * 这不是冗余而是必须 —— 两侧的让路时长不同（挂起覆盖整个等待窗，重试只覆盖那
+ * 一次 `approval.request()`），归零才删键的语义正好让它们各自独立地进出。
  *
  * ── 契约（三处必须逐字一致）─────────────────────────────────────────────────
  *
@@ -1881,6 +1904,12 @@ export function apply(ctx, config) {
      * 跳过这个子代理，而界面上完全看不出异常。成对记录才让这件事可诊断。
      * 频率与既有的 `MULTITASK-APPROVAL-RELAYED` 同阶（每张卡各一行），不刷屏。
      *
+     * 三处登记来源都走这两行（见 `APPROVAL_WAIT_KEY` 的注释），靠 `detail` 区分：
+     * 行尾写着 `parked` 的那一对是**挂起**本身 —— 它覆盖整个等待窗（可能几分钟），
+     * 与它同时存在的那一对是这一次 `approval.request()`。所以 grep
+     * `MULTITASK-APPROVAL-WAIT-ENTER` 里带 `parked` 的那行，就能看出「这个子代理
+     * 此刻是停在挂起里、还是已经有卡在主对话里等用户」。
+     *
      * @param kind - `ENTER` / `EXIT`。
      * @param ids - 本次登记 / 撤销的 id 列表。
      * @param detail - 给人看的补充说明（撤销时用来标明结局）。
@@ -1957,8 +1986,12 @@ export function apply(ctx, config) {
      *      在 `append('approval/asked')` **之前**。
      *   4. **每次醒来都要再验一次。** `turn/start` 之后回合同样可能已经关了（协调者读完
      *      通知就回复），所以「收到信号」≠「现在能问」；验不过就继续挂起（也计入次数上限）。
-     *   5. **不往 `approval-wait` 登记表里占位。** 挂起期间还没有卡给用户看，占位会让
-     *      两个 interrupt 方在整个等待里都不判停滞 —— 详见文件头。
+     *   5. **挂起也登记进 `approval-wait`。** 挂起中的转呈在语义上就是「正在等用户」：
+     *      子代理那条工具调用就阻塞在这里，唯一能推动它的就是用户回来作答。不登记的话
+     *      `subagent-watchdog`（5 分钟没有工具调用就判停滞）会把它当成卡住杀掉，
+     *      配置的 10 分钟窗口根本轮不到生效 —— 详见文件头那一节。
+     *      登记在**确认会挂起之后**（通知送达 / 回合边界都过了）才做，撤销放在唯一的
+     *      收尾点 `finally` 里：六条出口一视同仁，严格成对。
      *
      * @param context - 失败原因、父会话、工具名、子会话 id、原子请求与通知的 promise。
      * @returns 重试成功时的用户决定；没有等待、或等不到时为 undefined。
@@ -2014,6 +2047,27 @@ export function apply(ctx, config) {
           `the relay is parked until this conversation opens a turn (up to ${relayRetryWindowMs}ms, at most ${relayRetryMaxAttempts} attempts); the child call stays blocked meanwhile`,
         )
       }
+
+      // ── 挂起即「正在等用户」：登记进跨模块的审批等待表 ──────────────────────────
+      //
+      // 挂起中的转呈**没有任何东西**能把子代理往前推，除了用户回来作答 —— 所以它在
+      // `approval-wait` 这张表里的语义与「卡片已经在等用户」**完全一样**，而在这张表
+      // 里缺席的代价是硬的：`subagent-watchdog` 5 分钟没有 `tools/post-execute` 就判
+      // 停滞并 `interrupt`（`DEFAULT_STALL_TIMEOUT_MS`），`interrupt-before-send` 也会
+      // 在协调者 `send_message` 之前先打断目标。结果就是配置的 10 分钟等待窗永远轮不到
+      // 生效 —— 5 分钟就被砍掉，而且砍掉的恰是一个「正在等用户」的请求。
+      //
+      // ⚠️ 登记点必须**在确认会挂起之后**：上面那几处 `return undefined`（窗口关闭、
+      // 不是回合边界、通知没送达、回合状态读不出来）根本没有等待发生，提前登记只会
+      // 给那两个 interrupt 方发一个假信号。
+      //
+      // ⚠️ 它和「第一次转呈」「下面每次重试」是**三个独立的占位来源**（各自 enter /
+      // exit 成对），所以「挂起中正在重试」那一刻表里的 `n` 是 2 —— 两个来源在时间上
+      // 真的重叠，不是重复计数。登记表按计数归零删键，全部沿用既有实现，
+      // 不要为了「凑成 1」去改表或去合并计数。
+      const parkIds = idsOf(agent)
+      waitEnter(parkIds)
+      noteWait('ENTER', parkIds, 'parked')
 
       try {
         for (;;) {
@@ -2137,6 +2191,16 @@ export function apply(ctx, config) {
         )
         noteRetry('PARK-EXIT', 'threw', `attempts=${attempts}`)
         return undefined
+      } finally {
+        // ── 挂起结束：撤销那次占位（**唯一的**收尾点）────────────────────────────
+        //
+        // 上面每一条出口都经过这里：成功重试（`return outcome`）、窗口耗尽、
+        // abort、父 agent disposed、次数耗尽、重试抛错、以及 catch 里那条兜底
+        // —— 没有第二条 `waitExit` 路径，所以「进一次、出一次」是结构性成立的，
+        // 而不是靠每个分支各自记得。漏一次就会留下一个 `n > 0` 的幽灵项，那种状态
+        // 下那两个 interrupt 方会**永远**跳过这个子代理，且界面上看不出异常。
+        waitExit(parkIds)
+        noteWait('EXIT', parkIds, 'parked')
       }
     }
 
@@ -2253,8 +2317,13 @@ export function apply(ctx, config) {
             // ⚠️ 它**不改变** fail-closed 的性质：只有**拿到了用户的决定**时才返回那个
             // 决定；否则一律 `undefined`，调用方照旧 `return await next()`。
             //
-            // ⚠️ 它**不**往 `approval-wait` 登记表里占位，也**不**吞掉 abort：请求被
-            // 中止时立刻收尾（见 `waitForParentTurn` 的收尾说明）。
+            // ⚠️ 它**也**往 `approval-wait` 登记表里占位：挂起中的请求与「卡片已经抛进
+            // 主对话」是同一件事 —— 都在等用户。不占位的后果是 watchdog 在 5 分钟时
+            // 把它当停滞杀掉（配置的 10 分钟窗口永远轮不到生效），详见文件头。
+            // 撤销在 `retryRelayAfterWake` 的 `finally` 里，与登记严格成对。
+            //
+            // ⚠️ 它**不**吞掉 abort：请求被中止时立刻收尾（见 `waitForParentTurn`
+            // 的收尾说明）。
             const retried = await retryRelayAfterWake({
               error,
               agent,

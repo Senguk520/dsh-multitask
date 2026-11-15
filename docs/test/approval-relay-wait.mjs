@@ -12,6 +12,15 @@
  * 保留那次请求（子代理的工具调用继续阻塞），监听父会话的下一个 `turn/start`，醒来后
  * **再验一次日志**才重新转呈，并且有时间的上限与次数的上限。
  *
+ * ── 挂起期间也算「正在等用户」─────────────────────────────────────────────────
+ *
+ * 挂起中的请求在语义上与「卡片已经在主对话里等用户」完全一样，所以它必须登记进
+ * `dsh-multitask:approval-wait:v1` 那张表 —— 那是 `subagent-watchdog`（5 分钟没有
+ * `tools/post-execute` 就判停滞并 `interrupt`）与 `interrupt-before-send`（协调者
+ * `send_message` 前先打断目标）判断「该让路」的**唯一**依据。不登记的后果是配置的
+ * 10 分钟窗口永远轮不到生效：watchdog 在 5 分钟时就把这次正当的等待当成卡住杀掉。
+ * 本文件的 W1 与新增的 W7 / W8 钉的就是这条（占位存在，且所有出口都清干净）。
+ *
  * ── 为什么单独一个文件 ───────────────────────────────────────────────────────
  *
  * `approval-gate-integration.mjs` 的替身 `ctx` 只能**记录**监听器，不能**派发**事件 ——
@@ -302,18 +311,37 @@ await testAsync('W1 ★ 默认上限是 10 分钟（不是上一版的 10 秒）
   assert(park !== undefined, '挂起要留一条可 grep 的 PARK-ENTER')
   assert(park.includes('600000'), `默认上限必须是 10 分钟（600000ms），实际日志：${park}`)
 
-  // 挂起期间**不**在跨模块登记表里占位：那张表是给「卡已经在等用户」用的，
-  // 挂起期间还没有卡，占位会让 watchdog 在整个等待里都不判停滞。
+  // ⚠️ 这条断言在「挂起期间也计入审批等待」那次修复里**翻转了方向**（原先是「不许占位」）。
+  // 原意是「不要假装那张卡已经弹出来了」—— 这层意思原样保留：下面只断言**登记表里有
+  // 占位**，一个字都没说卡片已经出现，而「此时只有一次 request」那条断言仍然钉住
+  // 「没有真的再问一次」。翻转的理由是硬的：挂起中的请求语义上就是「正在等用户」，
+  // 而 `subagent-watchdog` 只认这张表 —— 不登记的话它在 5 分钟时就判停滞并
+  // `interrupt`（配置的 10 分钟窗口永远轮不到生效），杀掉的恰是一次正当的等待。
+  // 「挂起结束后登记表被清干净」由本用例收尾处的断言与 W7 负责。
   const table = globalThis['dsh-multitask:approval-wait:v1']
+  assert(table instanceof Map, '挂起期间必须有 approval-wait 登记表（两个 interrupt 方只认它）')
+  const parked = table.get('child-1')
   assert(
-    !(table instanceof Map) || table.get('child-1') === undefined,
-    '挂起期间不该往 approval-wait 登记表里占位（那会让 watchdog 在整个等待里失明）',
+    parked !== undefined,
+    '挂起期间必须往 approval-wait 登记表里占位 —— 否则 watchdog 会把这个「正在等用户」的请求当停滞杀掉',
+  )
+  assert(
+    typeof parked.n === 'number' && parked.n >= 1,
+    `挂起期间该 agent 的 n 必须 >= 1，实际 ${String(parked.n)}`,
   )
 
   // 收尾：让它真的走完一次成功路径，免得留下 10 分钟的定时器。
   openParentTurn(parts)
   await state.done
   assert(state.outcome === 'allowed-once', `唤醒之后应当拿到真实裁决，实际 ${String(state.outcome)}`)
+
+  // 收尾之后必须清干净：挂起那一次占位与重试那一次占位都已撤销，键随计数归零被删除。
+  // ⚠️ 这条不是「顺手加的」—— 一个 `n > 0` 的幽灵项会让那两个 interrupt 方**永远**
+  // 跳过这个子代理，而界面上完全看不出异常。
+  assert(
+    !(table instanceof Map) || table.get('child-1') === undefined,
+    '挂起结束后登记表里不许留下这个子代理的幽灵项',
+  )
 })
 
 // ── 二、唤醒 → 重试 → 子代理拿到真实裁决 ─────────────────────────────────────
@@ -474,6 +502,78 @@ await testAsync('W6 父 agent 被释放：不再等满上限（那张卡已经�
     '父会话被释放要留可 grep 的原因',
   )
   assert(countHandlers(parts.handlers, 'session/event') === 0, '收尾之后监听器必须已注销')
+})
+
+// ── 五、挂起期间计入审批等待：占位存在，出口清账 ─────────────────────────────
+console.log('\n--- 5. 挂起即「正在等用户」：登记表里有占位，收尾时清干净 ---')
+
+await testAsync('W7 ★ 挂起期间登记表里该 agent 的 n >= 1；挂起因超时 / abort 结束后 n 归零、键被删除', async () => {
+  const tableOf = () => globalThis['dsh-multitask:approval-wait:v1']
+
+  // ① 超时收尾（窗口 150ms，父会话始终不开回合）。
+  {
+    const parts = setup({ enabled: true, relayRetryWindowMs: 150 })
+    const state = startRelay(parts.relay, { agent: parts.child, toolName: 'pwsh' })
+
+    await delay(60)
+    assert(state.settled === false, '150ms 窗口还没到，不该已经返回')
+    const parked = tableOf()?.get('child-1')
+    assert(parked !== undefined, '挂起期间必须登记 —— 否则 watchdog 5 分钟就会把这次正当等待当停滞杀掉')
+    assert(typeof parked.n === 'number' && parked.n >= 1, `挂起期间 n 必须 >= 1，实际 ${String(parked?.n)}`)
+
+    await state.done
+    assert(state.outcome === 'next-result', '超时之后必须退回下游')
+    assert(
+      tableOf()?.get('child-1') === undefined,
+      '超时收尾之后 n 必须归零且键被删除（幽灵项会让两个 interrupt 方永远跳过这个子代理）',
+    )
+  }
+
+  // ② abort 收尾（窗口 60s，靠中止结束）。
+  {
+    const parts = setup({ enabled: true, relayRetryWindowMs: 60000 })
+    const controller = new AbortController()
+    const state = startRelay(parts.relay, { agent: parts.child, toolName: 'pwsh', signal: controller.signal })
+
+    await delay(60)
+    assert(state.settled === false, 'abort 之前应当还挂在挂起里')
+    assert(tableOf()?.get('child-1') !== undefined, 'abort 之前的挂起期间同样必须登记')
+
+    controller.abort()
+    await state.done
+    assert(state.outcome === 'next-result', '被中止时要退回下游')
+    assert(
+      tableOf()?.get('child-1') === undefined,
+      'abort 收尾之后 n 必须归零且键被删除 —— 不确定的「中止」正好是最容易漏清账的一条出口',
+    )
+  }
+})
+
+await testAsync('W8 ★ 挂起中的重试是第二处占位来源：重试那一刻 n === 2，收尾之后归零', async () => {
+  const tableKey = 'dsh-multitask:approval-wait:v1'
+  const parts = setup({ enabled: true, relayRetryWindowMs: 60000 })
+
+  // 每次 `approval.request()` 那一刻的 `n`：首次转呈只有正常转呈那一处占位（1），
+  // 唤醒后的重试叠加了挂起那一次（2）。这正是「计数而不是布尔」要表达的东西。
+  const seen = []
+  const inner = parts.approvals.request.bind(parts.approvals)
+  parts.approvals.request = async (req) => {
+    seen.push(globalThis[tableKey]?.get('child-1')?.n)
+    return inner(req)
+  }
+
+  const state = startRelay(parts.relay, { agent: parts.child, toolName: 'pwsh' })
+  await delay(150)
+  assert(state.settled === false, '父会话还没开回合，不该已经返回')
+
+  openParentTurn(parts)
+  await state.done
+
+  assert(state.outcome === 'allowed-once', `唤醒之后应当拿到真实裁决，实际 ${String(state.outcome)}`)
+  assert(seen.length === 2, `应当恰好两次 request（原次 + 重试），实际 ${seen.length} 次`)
+  assert(seen[0] === 1, `首次转呈那一刻的 n 必须是 1（只有正常转呈那一处占位），实际 ${String(seen[0])}`)
+  assert(seen[1] === 2, `重试那一刻的 n 必须是 2（挂起 + 重试各一处），实际 ${String(seen[1])}`)
+  assert(globalThis[tableKey]?.get('child-1') === undefined, '收尾之后 n 必须归零且键被删除')
 })
 
 // ── 汇总 ─────────────────────────────────────────────────────────────────────
