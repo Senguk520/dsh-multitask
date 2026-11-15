@@ -172,6 +172,14 @@ The handover case is the exception: tell the old worker to write a handoff note 
 
 It only ever acts in the coordinator → worker direction. A message that a worker sends upward is not preceded by an interrupt, because that would cut the main conversation's own turn. If the interrupt fails, or the deployment exposes no interrupt capability, the message is still sent normally and corrections simply revert to queueing: you see an info line, not an error. Its only switch is the `interrupt-before-send` row's `config.enabled` in the composition, and changing it requires a restart.
 
+### The task key: one job, one worker
+
+Every brief carries a line `task: <slug>`, and the key is **enforced, not advisory**: it is on by default and every delegation path is checked (the four worker tools, `subagent_preset`, and `spawn_teammate` when the team tools are installed). The slug is 3-64 characters, lowercase, `[a-z0-9][a-z0-9._-]{2,63}` — no spaces, no capitals. Same job, same slug (including a restart or a takeover of it); different jobs, different slugs.
+
+While a slug is live, a second dispatch with the same key is **refused**, and the refusal names the worker already on it — the first 8 characters of its session id and how long it has been running. There are three ways out: wait for that worker to finish, stop it first with `interrupt_agent` and then dispatch, or give genuinely different work a different slug.
+
+This is the mechanical half of *Corrections stop the worker first* above. Without a key, "dispatch the replacement" and "dispatch a second unrelated brief" are the same call, and nothing can tell them apart; with one, the replacement is refused while the original is still alive. A key frees up when its worker's session is disposed (or is no longer live), and it is scoped to the conversation that issued it, so unrelated conversations never collide. There is no timeout: a job that takes 40 minutes is not expired. Its switch is the `task-key` row's `config.enabled` in the composition.
+
 ### The read-only `file_info` tool
 
 It is **this package's own tool** and the only self-authored tool on the coordinator's keep list. Its input is exactly one field: `paths`, an array of one or more path strings (up to 256), resolved by the filesystem backend with relative paths taken against the session working directory.

@@ -728,6 +728,50 @@ Three easy ways to get the diagnosis wrong:
 
 ---
 
+## The task key: one job, one worker (`task-key.mjs`)
+
+**What it is**: the only mechanical answer this mode has to the failure where "stop worker A and hand the same job to worker B" ends as **A still running and B starting** — two agents concurrently editing the same files.
+
+### Why the dispatch arguments cannot identify the task
+
+`subagent` / `subagent_fork` / `subagent_ptc` / `subagent_minimal` take `cwd`, `description` and `prompt` (`parameters` in `dsh-tool-subagent`), and `description` is a 3-5 word display label. **Nothing in the arguments says which job this is.** A second dispatch of the same job and a dispatch of a different job are byte-compatible as far as any check can tell, which is why only personality discipline held them apart — and discipline is not enforcement.
+
+### The criterion: an explicit key, not semantic similarity
+
+Every brief must carry a line `task: <slug>` (or `task=<slug>`; leading whitespace, an optional list marker, and any case of `task` are accepted). Grammar: 3-64 characters, lowercase, `[a-z0-9][a-z0-9._-]{2,63}`. The same check covers the four worker tools, `subagent_preset`, and `spawn_teammate`.
+
+The module runs in `tools/pre-execute` and refuses the dispatch when:
+
+| Situation | Verdict |
+|---|---|
+| no `task:` line | deny; the message asks for `task: <slug>` and states the grammar and the reuse rule |
+| the value is not a valid slug | deny, quoting the offending value |
+| one brief carries two different keys | deny (fail-closed: the parse is ambiguous) |
+| the key is live in this conversation | deny, naming the running worker's session id (first 8 characters) and its running time |
+| otherwise | allow, and record the claim |
+
+A dispatch is refused **only** while a key is live; nothing else about a brief is questioned. The check runs after `next()`, so another guard's rejection is never overwritten, and the decision is a single function (`judge`) so the discrimination test can neuter it and prove the assertions are looking at it.
+
+### Scope: per parent conversation
+
+Registry key = `parentSessionId + '::' + slug`, held in `globalThis['dsh-multitask:task-key:v1']` as `{ claims: Map, gone: string[] }`. Two unrelated main conversations may use the same slug without blocking each other, while two dispatches from one conversation collide — which is exactly the case that writes the same files.
+
+### Release: on dispose plus a liveness sweep, and no timeout
+
+`agent/disposed` clears the claim whose child session id matches. In addition, every check sweeps the registry: a claim whose session no longer answers `agents.get(id)` — and that had been confirmed live at least once — is released, so a missed dispose cannot hold a key forever. The child's session id is bound when the child appears (`agent/created`), and only when the binding is unambiguous: exactly one unbound claim for that parent. With several briefs in flight the id stays unbound rather than being attached to the wrong job, and the refusal then says the id is not known yet instead of inventing one.
+
+There is deliberately **no time TTL**. A job that legitimately runs 40 minutes must not be judged stale: a timeout would refuse the takeover at the moment it is needed and wave the duplicate through at the moment it is dangerous.
+
+### Fail-closed where the answer is unknown, silent where the mechanism breaks
+
+An unparseable or ambiguous brief is refused, because guessing the job's identity is precisely how one job becomes two. An *exception inside the module* degrades the other way: the dispatch is allowed and one `warn` line is logged (`TASK-KEY-SKIPPED`), which is the pre-module behaviour. "This brief is malformed" is a fact the coordinator can fix; "the registry is unavailable" is not, and turning the second into a refusal would block work for a reason nobody can act on.
+
+### How to confirm it is working
+
+`TASK-KEY-ENGAGED` at load, `TASK-KEY-CLAIMED` per admitted dispatch (with the slug), `TASK-KEY-REFUSED` per refusal. The refusal text is itself the audit: it names the live worker, its running time and the two ways out.
+
+---
+
 ## Cross-mode dispatch (`preset-dispatch.mjs`)
 
 **What it is**: it widens the shock absorber's reach from **inside this preset** to the layer **between the user and every installed mode**.
