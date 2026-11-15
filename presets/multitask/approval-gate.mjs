@@ -163,7 +163,9 @@
  *     MULTITASK-APPROVAL-ASK              第一级判定为危险，向用户发起审批
  *     MULTITASK-APPROVAL-RELAYED          第二级把子代理请求转呈给了父会话
  *     MULTITASK-APPROVAL-RELAY-FAILED     转呈失败（reason=…），已退回原路径
- *     MULTITASK-APPROVAL-RELAY-RETRY-*    转呈失败后唤醒父会话并重试的结果（见下节）
+ *     MULTITASK-APPROVAL-RELAY-RETRY-*    转呈失败后等待父会话开回合并重试的结果（见下节）
+ *     MULTITASK-APPROVAL-RELAY-RETRY-PARK-* 转呈挂起（ENTER）→ 唤醒（WAKE reason=turn-start|recheck|abort|deadline|disposed）
+ *                                           → 收尾（EXIT reason=relayed|timeout|aborted|turn-closed-again|…）
  *     MULTITASK-APPROVAL-WAIT-ENTER       转呈期间登记「这个子代理正在等审批」
  *     MULTITASK-APPROVAL-WAIT-EXIT        等到了（或被取消/抛错），撤销那份登记
  *
@@ -189,7 +191,31 @@
  *
  * 修法利用了兜底通知的**副作用**：`sendMessage` 的投递走 `steer` 且 `wakeup = true`，
  * 所以那条「有决定在等你」的通知会把**空闲的父会话真的唤醒**（写一个 `turn/start`）。
- * 于是本模块在发出通知之后**等那个回合打开、再转呈一次**：
+ * 于是本模块在发出通知之后**把这次转呈挂起，等父会话的下一个打开回合，再转呈一次**。
+ *
+ * ── 为什么是「挂起」而不是「重试几次就放弃」（本次修复）────────────────────────
+ *
+ * 上一版等 10 秒。那个数只覆盖了「通知把父会话唤醒、回合马上开」这一种，而本 preset 的
+ * 协调者人格要求**等待时结束回合**：父会话读完通知就没什么可做的了，回合随即又关掉；
+ * 真正长时间开着回合的时刻是**用户下一条消息到达之后**。于是 10 秒窗口把「用户回来之前
+ * 攒下的审批」**全部**判成等不到 —— 实测一整轮十几张卡全部落到子会话，一张都没进 composer。
+ *
+ * 所以现在的等待是**事件驱动 + 有界**：
+ *
+ *   · **事件**：`session/event` 上父会话的 `turn/start`（`{ global: true }` 注册 ——
+ *     那个事件的 carrier 按会话自己的 scope 派发，不 global 就收不到）。这是**唯一**
+ *     能证明「父回合真的开了」的钩子：`turn/start` 正是上游 `hasOpenTurn` 判据读的那条
+ *     记录，也是 `approvalStateOf(...).turnOpen` 翻转的同一个瞬间。
+ *   · **重试前再验一次**：`turn/start` 之后父回合**可能已经又关了**（协调者读完就回复）。
+ *     所以每次醒来都重新读一遍日志尾部，仍然开着才去 `approval.request()`。
+ *   · **兜底重读**：`RELAY_TURN_RECHECK_MS` 周期读一次日志，覆盖「事件没送到」的部署。
+ *   · **有界**：`config.relayRetryWindowMs`（默认 10 分钟，设 0 即关闭）与
+ *     `config.relayRetryMaxAttempts`（默认 20 次）双上限；任一用尽就**退回原路径**，
+ *     与没有这段等待时**逐字等价**（fail-closed 不变）。
+ *   · **可退出**：请求的 `signal` 中止（子代理那条调用被 abort / 被 interrupt）或父
+ *     agent 被释放，立即收尾并清掉所有监听器与定时器 —— 不泄漏、不重复 resolve。
+ *
+ * 三条仍然成立的旧约束（它们与等待多久无关）：
  *
  *   · 只在**确认通知已送达**时才等 —— 通知没送出去就说明没有任何东西会唤醒父会话，
  *     等待纯属浪费；
@@ -197,16 +223,18 @@
  *     ① 上游那条守卫在 `session.append('approval/asked', …)` **之前**，所以重试
  *     **不可能**产生第二次 `asked`、也不可能让用户看到第二张卡；
  *     ② 别的失败原因（父会话已销毁、审批服务消失）重试既没用，又可能造成重复询问；
- *   · 有**窗口上限**（默认 10 秒，`config.relayRetryWindowMs` 可调，设 0 即关闭）；
- *   · 窗口内始终等不到就**退回原路径**，与没有这段重试时**逐字等价**（fail-closed 不变）。
+ *   · 挂起期间**不**在 `approval-wait` 登记表里占位。那张表是给「卡片已经在等用户」
+ *     用的（两个 interrupt 方据此让路）；挂起期间还没有卡，占位会让 watchdog 在
+ *     10 分钟里都不判停滞 —— 那正好是本次要避免的「看起来卡住却没人管」。
  *
  * ⚠️ 通知的文案因此必须**在两种结局下都为真**：它既不能说「卡片一定在主对话里」（重试
- * 可能失败），也不能说「必须去子会话作答」（重试可能成功）。所以文案写成条件式 ——
- * 「若本对话里出现了审批卡，就在这里作答；否则打开那个子会话，提示在那里」。
+ * 可能失败），也不能说「必须去子会话作答」（重试可能成功）。而且挂起期间**子会话里也
+ * 没有卡**（请求正停在转呈里，还没落到下游），所以「去子会话里点允许」这句话在挂起
+ * 期间是**假的** —— 文案必须把它写成「若这里始终没有出现卡片，才会退回子会话」。
  * 这个要求写在 `docs/DESIGN_zh.md` 的「如实写出的边界」里；测试钉住的是它的**底线**
  * （`test/approval-gate-integration.mjs` 的 I28：通知不许被读成放行 —— 必须写明
- * 「这不是批准、在你作答前保持阻塞」）。⚠️ 那句**条件式措辞本身**目前没有任何用例在比对：
- * 改它时要自己把两种结局都核一遍（有卡片 / 没有卡片）。
+ * 「这不是批准、在你作答前保持阻塞」）。⚠️ 那句**条件式措辞本身**目前没有用例逐字比对：
+ * 改它时要自己把三种结局都核一遍（主对话里有卡 / 挂起中 / 已退回子会话）。
  *
  * ── 红线（本模块绝不做的事）──────────────────────────────────────────────────
  *
@@ -368,21 +396,55 @@ const ASK_REASON_PREFIX = 'Multitask approval gate'
 const OPEN_TURN_REQUIRED_HINT = 'outside an open turn'
 
 /**
- * 转呈重试的默认窗口（毫秒）。
+ * 转呈等待的默认上限（毫秒）：**10 分钟**。
  *
- * 磁盘实测：父会话回合结束与子代理发起请求之间只差 7.7 秒，而父会话被唤醒后
- * **3 毫秒**就开了回合。所以 10 秒对这个用途是宽裕的；它真正防的是「父会话永远不会醒来」
- * （窗口关闭、部署异常）时不要把子代理无限挂住。
+ * ── 为什么不是 10 秒（上一版的那个数）─────────────────────────────────────────
+ *
+ * 上一版把等待当成「通知唤醒父会话之后的那几毫秒」来兜，10 秒是**按那个前提**选的。
+ * 那个前提只在「协调者派完单还醒着」时成立。而本 preset 的协调者人格明确要求
+ * **等待时结束回合**，于是真实形态是：
+ *
+ *     协调者结束回合 → 子代理几秒~几分钟后才动手 → 转呈失败 → 通知唤醒父会话 →
+ *     父会话开一个回合读完通知 → 这个回合**很快又结束**（协调者没有别的事可做）
+ *
+ * 父会话真正**长时间**开着回合的时刻，是**用户下一条消息**到达之后。用户可能几分钟后
+ * 才回来。10 秒的窗口把「用户回来之前的所有审批」全判成等不到 —— 实测一整轮十几张
+ * 审批卡**全部**落到子会话里，一张都没进 composer。所以这个数必须从「毫秒级兜底」
+ * 抬到「人类回消息的时间尺度」，而**不能**是无限：子代理那条工具调用正在等它。
+ *
+ * 抬到 10 分钟后，真正无限挂住的风险只落在「用户永远不回来」这一种，而那种情况下
+ * 10 分钟后的兜底通知（落到子会话 + 指路）与今天的行为一致。
  */
-const DEFAULT_RELAY_RETRY_WINDOW_MS = 10000
+const DEFAULT_RELAY_RETRY_WINDOW_MS = 600000
 
 /**
- * 轮询间隔（毫秒）。
+ * 一次转呈最多重试几次（默认 20）。
  *
- * 必须远小于窗口（否则一次轮询就吃掉整个窗口），也远大于零（否则变成忙等待）。
- * 100ms 的代价可以忽略：这段时间里子代理本来就在等审批。
+ * ── 为什么在「时间上限」之外还要一个「次数上限」────────────────────────────────
+ *
+ * 父会话的回合可能**开了又关**：每次 `turn/start` 都是一次唤醒信号，但等到我们去重试时
+ * 那个回合可能已经结束（协调者读完通知就回复了）。这种情况下重试会再次失败、
+ * 请求会再次挂起 —— 行为正确，但**次数必须有界**：一个每次开回合就醒、每次醒都重试的
+ * 循环，在「父会话频繁短路开合」的部署里会放大日志与 CPU。20 次足够覆盖正常节奏
+ * （用户回来之后通常一两次就成），又不至于把等待变成忙循环。
  */
-const RELAY_RETRY_POLL_MS = 100
+const DEFAULT_RELAY_RETRY_MAX_ATTEMPTS = 20
+
+/**
+ * 「日志重读」兜底周期（毫秒）。
+ *
+ * ── 它不是主机制 ───────────────────────────────────────────────────────────────
+ *
+ * 主机制是 `session/event` 上的 `turn/start`（事件驱动，毫秒级）。这个周期只覆盖
+ * 一种残余情形：**那个事件没能送到本模块**（部署里换了会话存储、scope 过滤把全局
+ * 监听挡掉…）。那种情况下没有兜底就只剩「等满 10 分钟后放弃」，而这条兜底能在
+ * 5 秒内发现「回合其实已经开着」。
+ *
+ * 周期取 5 秒而不是上一版的 100ms：它读的是会话日志尾部（`turn/start` / `turn/end`
+ * 二选一即返回），5 秒一次的成本可以忽略；而每次重试都会真的向用户抛一张卡，
+ * 所以「多久**尝试**一次」由回合状态决定，不由这个周期决定。
+ */
+const RELAY_TURN_RECHECK_MS = 5000
 
 /**
  * 等「通知是否送达」的上限（毫秒）。
@@ -1455,16 +1517,18 @@ export function apply(ctx, config) {
       '',
       `A delegated Subagent (${String(childId).slice(0, 8)}) asked to run "${toolName}", and that request could not be shown in this conversation's composer: the turn that made it is not open right now.`,
       '',
-      'This same message wakes this conversation up, so an approval card may appear here within a few seconds — answer it here if it does. If no card appears, the request is still pending inside that Subagent\'s own session:',
+      'This same message wakes this conversation up. The request is parked, not dropped: it is retried here as soon as a turn opens in this conversation, so an approval card can still appear here — answer it in this conversation if it does.',
+      '',
+      'If no card appears here, the request falls back into that Subagent\'s own session:',
       '',
       `  ${childId}`,
       '',
-      'To decide in that case, open that Subagent\'s session (the Subagents list in this session header, or the id above). The approval prompt with "Allow once" / "Reject" is there.',
+      'To decide in that case, open that Subagent\'s session (the Subagents list in this session header, or the id above). The approval prompt with "Allow once" / "Reject" appears there only once the gate stops waiting for a turn here.',
       '',
       'What it wants to run:',
       `${detail ?? '(no detail supplied by the asker)'}`,
       '',
-      'Until you answer it — here or there — that call stays blocked and cannot proceed. Do not retry it or work around it: only your answer releases it.',
+      'This message is not an approval, and only your answer releases that call. Until you answer it — here or there — the call stays blocked and cannot proceed. Do not retry it or work around it.',
     ].join('\n')
 
     try {
@@ -1584,7 +1648,7 @@ export function apply(ctx, config) {
   if (config?.relay !== false) {
 
     /**
-     * 转呈重试窗口（毫秒）。`0` 表示关闭重试（退回 1.0.0 的行为）。
+     * 转呈等待的上限（毫秒）。`0` 表示关闭等待（退回 1.0.0 的行为）。
      *
      * 非法值一律**退回默认**而不是「不限制」：这个数只用来给等待封顶，把它读成
      * `Infinity` 会让子代理在父会话永不醒来时被无限挂住 —— 那是本模块最不该制造的状态。
@@ -1593,6 +1657,15 @@ export function apply(ctx, config) {
       const raw = config?.relayRetryWindowMs
       if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return DEFAULT_RELAY_RETRY_WINDOW_MS
       return raw
+    })()
+
+    /**
+     * 一次转呈最多试几次。同样**不接受**非法值（见 `DEFAULT_RELAY_RETRY_MAX_ATTEMPTS`）。
+     */
+    const relayRetryMaxAttempts = (() => {
+      const raw = config?.relayRetryMaxAttempts
+      if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 1) return DEFAULT_RELAY_RETRY_MAX_ATTEMPTS
+      return Math.floor(raw)
     })()
 
     /**
@@ -1626,8 +1699,127 @@ export function apply(ctx, config) {
       }
     }
 
-    /** 等一小会儿（重试窗口内的轮询）。 */
-    const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
+    /**
+     * 等父会话的**下一个打开回合**：事件驱动，带兜底重读、abort 与硬上限。
+     *
+     * ── 为什么必须挂在 `session/event` 上 ─────────────────────────────────────────
+     *
+     * 「父回合开了」这件事在上游只有一个可观察的瞬间：会话日志里追加 `turn/start`。
+     * 它同时是 ① `approvalStateOf(session).turnOpen` 翻成 `true` 的那一条记录、
+     * ② `hasOpenTurn` 判据读的那一条、③ 插件面唯一能订阅到的会话级事件
+     * （`ctx.on('session/event', (session, event) => …)`，上游几十个包都用它）。
+     *
+     * ⚠️ 必须用 `{ global: true }` 注册：`session/event` 的 carrier 是
+     * `scopeTarget(session, …)`（按**那个会话自己的** scope 派发），不是 global 的监听器
+     * 会被 scope 过滤掉 —— 而本模块的 ctx 是 preset 层的，不在父会话的 scope 里。
+     *
+     * ⚠️ `tools/pre-execute` / `tools/post-execute` **不能**当这个信号：它们只在父会话
+     * **真的调了工具**时才发。而唤醒父会话的那条通知通常只让协调者**读一句话就回复**，
+     * 全程一个工具都不调 —— 用它当信号会漏掉绝大多数真实情形（这正是本模块要修的那类
+     * 情形）。`turn/start` 则在回合打开那一刻就发，与父会话后面做什么无关。
+     *
+     * ── 为什么还要一个 5 秒的兜底重读 ────────────────────────────────────────────
+     *
+     * 见 `RELAY_TURN_RECHECK_MS`：覆盖「事件没能送到」的部署。它是**兜底**，不是主机制 ——
+     * 正常情况下这个 promise 在 `turn/start` 的同一个同步栈里就 resolve。
+     *
+     * ── 收尾 ────────────────────────────────────────────────────────────────────
+     *
+     * 所有退出路径都经过唯一的 `finish()`：清掉监听器、`clearTimeout`、`clearInterval`、
+     * 摘掉 abort 监听。所以「挂起 → 唤醒 → 收尾」三步既不泄漏也不会重复 resolve。
+     *
+     * @param context - `{ session, sessionId, agent, signal, deadlineAt }`。
+     * @returns `{ kind }`：`turn-start` / `recheck` / `deadline` / `abort` / `disposed`。
+     */
+    const waitForParentTurn = (context) => new Promise((resolve) => {
+      const { session, sessionId, agent, signal, deadlineAt } = context
+      let settled = false
+      /** 已注册的清理动作；`finish` 是唯一出口，逐个执行后清空。 */
+      const cleanups = []
+      const addCleanup = (fn) => { if (typeof fn === 'function') cleanups.push(fn) }
+      const finish = (kind) => {
+        if (settled) return
+        settled = true
+        for (const cleanup of cleanups.splice(0)) {
+          try {
+            cleanup()
+          } catch {
+            // 清理失败不得影响审批本身。
+          }
+        }
+        resolve({ kind })
+      }
+
+      // ① 主信号：父会话追加 `turn/start`。
+      try {
+        const disposer = ctx.on('session/event', (changed, event) => {
+          if (event?.type !== 'turn/start') return
+          if (changed === session) {
+            finish('turn-start')
+            return
+          }
+          // `session` 对象身份对不上时按 id 兜一次（两个替身指向同一会话的情形）。
+          if (sessionId !== undefined && changed?.id === sessionId) finish('turn-start')
+        }, { global: true })
+        if (typeof disposer === 'function') addCleanup(disposer)
+      } catch (error) {
+        // 注册不上不致命：兜底重读还在。但要留痕，否则「为什么等了 5 秒」无从查起。
+        noteRetry(
+          'PARK-WAKE',
+          'no-session-event-hook',
+          `could not subscribe to session/event (${error instanceof Error ? error.message : String(error)}); falling back to the ${RELAY_TURN_RECHECK_MS}ms log re-read`,
+        )
+      }
+
+      // ② 取消：子代理那条调用被 abort / interrupt 时立即收尾。
+      if (signal !== undefined && signal !== null) {
+        if (signal.aborted === true) {
+          finish('abort')
+          return
+        }
+        if (typeof signal.addEventListener === 'function') {
+          const onAbort = () => finish('abort')
+          try {
+            signal.addEventListener('abort', onAbort, { once: true })
+            addCleanup(() => signal.removeEventListener('abort', onAbort))
+          } catch {
+            // 信号对象不可订阅时只能靠 deadline 兜底。
+          }
+        }
+      }
+
+      // ③ 父 agent 被释放：再等下去只会等到满上限。
+      try {
+        const disposer = ctx.on('agent/disposed', (payload) => {
+          if (payload?.agent === agent) finish('disposed')
+        })
+        if (typeof disposer === 'function') addCleanup(disposer)
+      } catch {
+        // 同 ①：不致命。
+      }
+
+      // ④ 硬上限。
+      const remaining = deadlineAt - Date.now()
+      if (!Number.isFinite(remaining) || remaining <= 0) {
+        finish('deadline')
+        return
+      }
+      const timer = setTimeout(() => finish('deadline'), remaining)
+      addCleanup(() => clearTimeout(timer))
+
+      // ⑤ 兜底重读（事件没送到时唯一的希望）。
+      const recheck = setInterval(() => {
+        if (Date.now() >= deadlineAt) {
+          finish('deadline')
+          return
+        }
+        if (openTurnStateOf(session) === true) finish('recheck')
+      }, Math.max(1, Math.min(RELAY_TURN_RECHECK_MS, remaining)))
+      // 这个周期句柄不该让宿主进程多活：真正封顶的是 ④ 那个定时器。
+      if (typeof recheck?.unref === 'function') recheck.unref()
+      addCleanup(() => clearInterval(recheck))
+    })
+
 
     /**
      * 等一个 promise，但最多等 `ms` 毫秒；超时返回 `fallback`。
@@ -1747,25 +1939,29 @@ export function apply(ctx, config) {
     })
 
     /**
-     * 唤醒父会话之后**重试一次**转呈，成功则返回用户的决定。
+     * 把这次转呈**挂起**，等父会话的下一个打开回合，然后转呈一次；拿到用户的决定就返回它。
      *
      * 这一段解决的是「回合刚好关着」那一类个例（见文件头）。它的判据、上限与失败取向
-     * 都写在文件头那一节里，这里只补充三处实现细节：
+     * 都写在文件头那一节里，这里只补充五处实现细节：
      *
      *   1. **回合已经开着时不必等通知。** 那种情况说明失败之后、进入这里之前，回合被
      *      **别的东西**打开了（用户自己发了消息等）—— 直接重试就是最优解，而通知是
      *      另一条独立的路。这一支也顺手让「通知被关掉」的部署仍能享受到重试。
      *   2. **回合关着时先等通知的送达结果。** 通知是唯一会唤醒父会话的东西
      *      （`sendMessage` → `steer` → `wakeup = true`）；它没送出去就说明不会有人来开
-     *      回合，那这个窗口从头到尾都不该开。等待本身也有上限（`NOTIFY_ACK_TIMEOUT_MS`）——
-     *      一次本地投递不该挂住，真挂住了就不重试，这与「没送达」是同一处置。
-     *   3. **只在「缺打开回合」这一种失败上重试。** 判定依据是错误原文里的
+     *      回合，那这个等待从头到尾都不该开。等待本身也有上限（`NOTIFY_ACK_TIMEOUT_MS`）——
+     *      一次本地投递不该挂住，真挂住了就不等，这与「没送达」是同一处置。
+     *   3. **只在「缺打开回合」这一种失败上等待。** 判定依据是错误原文里的
      *      `outside an open turn`。别的失败（父会话已销毁、审批服务消失）等下去不会变好，
      *      而且重试它们有可能造成**重复询问** —— 而这一种**不可能**，因为上游那条守卫
      *      在 `append('approval/asked')` **之前**。
+     *   4. **每次醒来都要再验一次。** `turn/start` 之后回合同样可能已经关了（协调者读完
+     *      通知就回复），所以「收到信号」≠「现在能问」；验不过就继续挂起（也计入次数上限）。
+     *   5. **不往 `approval-wait` 登记表里占位。** 挂起期间还没有卡给用户看，占位会让
+     *      两个 interrupt 方在整个等待里都不判停滞 —— 详见文件头。
      *
      * @param context - 失败原因、父会话、工具名、子会话 id、原子请求与通知的 promise。
-     * @returns 重试成功时的用户决定；没有重试、或重试仍失败时为 undefined。
+     * @returns 重试成功时的用户决定；没有等待、或等不到时为 undefined。
      */
     const retryRelayAfterWake = async (context) => {
       const { error, parent: root, agent, toolName: name, childId: id, original: why, request: source, notice } = context
@@ -1802,65 +1998,144 @@ export function apply(ctx, config) {
           noteRetry('SKIPPED', 'notice-not-delivered', 'nothing will wake the parent session, so waiting would be pointless')
           return undefined
         }
+      }
 
-        noteRetry('WAITING', undefined, `waiting up to ${relayRetryWindowMs}ms for the woken parent session to open a turn`)
-        const deadline = Date.now() + relayRetryWindowMs
+      const parentSession = root?.session
+      const parentSessionId = typeof parentSession?.id === 'string' ? parentSession.id : undefined
+      const deadlineAt = Date.now() + relayRetryWindowMs
+      let attempts = 0
+      /** 本轮是否已经有「回合开着」的证据。没有就先挂起等信号。 */
+      let turnOpen = initial === true
+
+      if (turnOpen !== true) {
+        noteRetry(
+          'PARK-ENTER',
+          undefined,
+          `the relay is parked until this conversation opens a turn (up to ${relayRetryWindowMs}ms, at most ${relayRetryMaxAttempts} attempts); the child call stays blocked meanwhile`,
+        )
+      }
+
+      try {
         for (;;) {
           if (source?.signal?.aborted === true) {
             noteRetry('SKIPPED', 'signal-aborted')
+            noteRetry('PARK-EXIT', 'aborted', `attempts=${attempts}`)
             return undefined
           }
-          const observed = openTurnStateOf(root?.session)
-          if (observed === true) break
-          if (observed === undefined) {
-            noteRetry('SKIPPED', 'turn-state-unreadable')
-            return undefined
-          }
-          const remaining = deadline - Date.now()
-          if (remaining <= 0) {
-            noteRetry('FAILED', 'window-elapsed', `the parent session did not open a turn within ${relayRetryWindowMs}ms`)
-            return undefined
-          }
-          await sleep(Math.min(RELAY_RETRY_POLL_MS, remaining))
-        }
-      }
 
-      // ── 重试转呈（载荷与原次**逐字相同**：用户看到的卡不该因重试而变样）─────────
-      try {
-        const approval = ctx.get('approval')
-        if (approval === undefined || approval === null || typeof approval.request !== 'function') {
-          noteRetry('FAILED', 'no-approval-service')
+          if (turnOpen !== true) {
+            const waited = await waitForParentTurn({
+              session: parentSession,
+              sessionId: parentSessionId,
+              agent: root,
+              signal: source?.signal,
+              deadlineAt,
+            })
+            noteRetry('PARK-WAKE', waited.kind)
+
+            if (waited.kind === 'abort') {
+              noteRetry('SKIPPED', 'signal-aborted')
+              noteRetry('PARK-EXIT', 'aborted', `attempts=${attempts}`)
+              return undefined
+            }
+            if (waited.kind === 'disposed') {
+              // 父会话没了：再等下去只会等到满上限，而且那张卡再也没有地方可去。
+              noteRetry('SKIPPED', 'parent-disposed', 'the relaying agent was disposed while the relay was parked')
+              noteRetry('PARK-EXIT', 'parent-disposed', `attempts=${attempts}`)
+              return undefined
+            }
+            if (waited.kind === 'deadline') {
+              noteRetry('FAILED', 'window-elapsed', `this conversation did not open a turn within ${relayRetryWindowMs}ms`)
+              noteRetry('PARK-EXIT', 'timeout', `attempts=${attempts}`)
+              return undefined
+            }
+
+            // 醒来之后**再验一次**：`turn/start` 之后回合同样可能已经关了。
+            const observed = openTurnStateOf(parentSession)
+            if (observed === undefined) {
+              noteRetry('SKIPPED', 'turn-state-unreadable')
+              noteRetry('PARK-EXIT', 'unreadable', `attempts=${attempts}`)
+              return undefined
+            }
+            if (observed !== true) {
+              noteRetry('PARK-EXIT', 'turn-closed-again', `attempts=${attempts}`)
+              if (Date.now() >= deadlineAt) {
+                noteRetry('FAILED', 'window-elapsed', `this conversation did not keep a turn open within ${relayRetryWindowMs}ms`)
+                return undefined
+              }
+              noteRetry('PARK-ENTER', undefined, 'the turn had already closed again; parking for the next one')
+              continue
+            }
+          }
+          turnOpen = false
+
+          // 次数上限：`turn/start` 频繁开合时，「每次醒都问一次」必须有界（见常量注释）。
+          if (attempts >= relayRetryMaxAttempts) {
+            noteRetry('FAILED', 'attempts-exhausted', `gave up after ${attempts} attempts within ${relayRetryWindowMs}ms`)
+            noteRetry('PARK-EXIT', 'attempts-exhausted', `attempts=${attempts}`)
+            return undefined
+          }
+          attempts += 1
+
+          // ── 重试转呈（载荷与原次**逐字相同**：用户看到的卡不该因重试而变样）─────────
+          const approval = ctx.get('approval')
+          if (approval === undefined || approval === null || typeof approval.request !== 'function') {
+            noteRetry('FAILED', 'no-approval-service')
+            noteRetry('PARK-EXIT', 'no-approval-service', `attempts=${attempts}`)
+            return undefined
+          }
+          // ⚠️ 等待期间父会话的策略**可能已经变了**（用户切到「永不需要批准」等）。
+          // 那时再问只会被 `decide()` 的第一行按 `never` 判成 `rejected` —— 这与本模块
+          // 贯穿始终的取向相反：**绝不在非交互式会话上装 `ask`**。所以这里重读一次。
+          if (effectivePolicyOf(ctx, root?.session) !== 'ask') {
+            noteRetry('SKIPPED', 'parent-not-interactive')
+            noteRetry('PARK-EXIT', 'parent-not-interactive', `attempts=${attempts}`)
+            return undefined
+          }
+          // 重试同样是一次**真实的等待**：卡一旦落到主对话里，那两个 interrupt 方读的
+          // 就是同一张登记表，所以这里也要先登记、再 await、最后在 `finally` 里撤销。
+          // （漏掉这一处的话，重试走出来的卡恰恰是最容易被打断的那一类 —— 它出现的
+          // 场景本来就是「父会话刚被唤醒」。）
+          const waitIds = idsOf(agent)
+          let outcome
+          let failure
+          waitEnter(waitIds)
+          noteWait('ENTER', waitIds, 'retry')
+          try {
+            outcome = await approval.request(buildRelayPayload({ root, name, id, why, source }))
+          } catch (retryError) {
+            failure = retryError
+          } finally {
+            waitExit(waitIds)
+            noteWait('EXIT', waitIds, `retry outcome=${String(outcome)}`)
+          }
+
+          if (failure === undefined) {
+            noteRetry('RETRIED', undefined, `the retried relay reached the parent session; outcome=${String(outcome)}`)
+            noteRetry('PARK-EXIT', 'relayed', `attempts=${attempts}`)
+            return outcome
+          }
+
+          const failureMessage = failure instanceof Error ? failure.message : String(failure)
+          noteRetry('FAILED', 'retry-threw', failureMessage)
+          // 又是「缺打开回合」：回合在验过之后、请求之前关掉了。挂起再来一次。
+          // ⚠️ 这一类重试**不可能**产生第二张卡：上游那条守卫在 `append('approval/asked')` 之前。
+          if (failureMessage.includes(OPEN_TURN_REQUIRED_HINT)) {
+            noteRetry('PARK-ENTER', undefined, 'the retry hit the same turn-boundary guard again; parking for the next turn')
+            continue
+          }
+          noteRetry('PARK-EXIT', 'retry-threw', `attempts=${attempts}`)
           return undefined
         }
-        // ⚠️ 等待期间父会话的策略**可能已经变了**（用户切到「永不需要批准」等）。
-        // 那时再问只会被 `decide()` 的第一行按 `never` 判成 `rejected` —— 这与本模块
-        // 贯穿始终的取向相反：**绝不在非交互式会话上装 `ask`**。所以这里重读一次。
-        if (effectivePolicyOf(ctx, root?.session) !== 'ask') {
-          noteRetry('SKIPPED', 'parent-not-interactive')
-          return undefined
-        }
-        // 重试同样是一次**真实的等待**：卡一旦落到主对话里，那两个 interrupt 方读的
-        // 就是同一张登记表，所以这里也要先登记、再 await、最后在 `finally` 里撤销。
-        // （漏掉这一处的话，重试走出来的卡恰恰是最容易被打断的那一类 —— 它出现的
-        // 场景本来就是「父会话刚被唤醒」。）
-        const waitIds = idsOf(agent)
-        let outcome
-        waitEnter(waitIds)
-        noteWait('ENTER', waitIds, 'retry')
-        try {
-          outcome = await approval.request(buildRelayPayload({ root, name, id, why, source }))
-        } finally {
-          waitExit(waitIds)
-          noteWait('EXIT', waitIds, `retry outcome=${String(outcome)}`)
-        }
-        noteRetry('RETRIED', undefined, `the retried relay reached the parent session; outcome=${String(outcome)}`)
-        return outcome
-      } catch (retryError) {
+      } catch (waitError) {
+        // 兜底：这一段里的任何意外都不得让这次工具调用**抛错**（那会把一次待审批
+        // 变成一个失败结果）。退回原路径与「等不到」是同一处置。
         noteRetry(
           'FAILED',
-          'retry-threw',
-          retryError instanceof Error ? retryError.message : String(retryError),
+          'wait-threw',
+          waitError instanceof Error ? waitError.message : String(waitError),
         )
+        noteRetry('PARK-EXIT', 'threw', `attempts=${attempts}`)
         return undefined
       }
     }
@@ -1960,19 +2235,26 @@ export function apply(ctx, config) {
               detail: original,
             })
 
-            // ── 唤醒之后重试一次转呈（本次修复的个例）────────────────────────────
+            // ── 挂起这次转呈，等父会话的下一个打开回合（本次修复）─────────────────
             //
             // 上面那条通知会把**空闲的父会话**唤醒（`sendMessage` 走 `steer` 且
-            // `wakeup = true`），所以「刚刚还没有打开的回合」通常在几毫秒后就开了。
-            // 这一段的全部作用就是抓住那个刚打开的回合并重试一次 —— 于是这类个例
-            // 从「用户得自己去子会话里找」变成「主对话里正常出现一张审批卡」。
+            // `wakeup = true`），于是那个「刚刚还没有打开的回合」很快就会开一次。
+            // 但它通常**读完通知就结束**（协调者没有别的事可做），而真正长时间开着回合
+            // 的时刻是**用户下一条消息到达之后** —— 所以这里不是「等几毫秒」，是
+            // 「挂起，直到父会话真的开出一个回合」，上限 10 分钟（可配）。
+            //
+            // ✅ 挂起期间子代理那条工具调用**继续阻塞** —— 这本来就等价于「等用户答复」，
+            //    也是这次修复的关键：只有把请求留着，用户回来时那张卡才有地方落。
             //
             // ⚠️ 它**必须**排在 `await next()` 之前：下游会把请求发给浏览器，而客户端
             // 会为那个不可见的子会话物化作用域并**接住**它 —— 那次 await 永远不返回。
-            // 排在后面的话，重试根本没有机会发生。
+            // 排在后面的话，等待根本没有机会发生。
             //
-            // ⚠️ 它**不改变** fail-closed 的性质：重试只有在**拿到了用户的决定**时才
-            // 返回那个决定；否则一律 `undefined`，调用方照旧 `return await next()`。
+            // ⚠️ 它**不改变** fail-closed 的性质：只有**拿到了用户的决定**时才返回那个
+            // 决定；否则一律 `undefined`，调用方照旧 `return await next()`。
+            //
+            // ⚠️ 它**不**往 `approval-wait` 登记表里占位，也**不**吞掉 abort：请求被
+            // 中止时立刻收尾（见 `waitForParentTurn` 的收尾说明）。
             const retried = await retryRelayAfterWake({
               error,
               agent,

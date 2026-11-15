@@ -51,6 +51,7 @@ node docs/test/watchdog-settings.mjs
 node docs/test/approval-wait-registry.mjs
 node docs/test/approval-gate-rules.mjs
 node docs/test/approval-gate-integration.mjs
+node docs/test/approval-relay-wait.mjs
 node docs/test/worker-guard.mjs
 node docs/test/minimal-guard-catalog.mjs
 node docs/test/preset-dispatch.mjs
