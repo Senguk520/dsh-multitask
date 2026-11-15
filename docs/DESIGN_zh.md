@@ -783,8 +783,8 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 | `MULTITASK-APPROVAL-NOTIFY-FAILED` | 通知本身发不出去（不影响审批结果） |
 | `MULTITASK-APPROVAL-RELAY-RETRY-RETRIED` | 通知唤醒父会话后重试转呈**成功**，用户的决定已拿到（含 outcome） |
 | `MULTITASK-APPROVAL-RELAY-RETRY-WAITING` | 正在等父会话的回合打开（`reason=turn-already-open` 时不必等） |
-| `MULTITASK-APPROVAL-RELAY-RETRY-SKIPPED reason=…` | 没有重试及原因（`disabled-by-config` / `not-a-turn-boundary-failure` / `notice-not-delivered` / `turn-state-unreadable` / `signal-aborted` / `parent-not-interactive`） |
-| `MULTITASK-APPROVAL-RELAY-RETRY-FAILED reason=…` | 重试没成功（`window-elapsed` / `retry-threw` / `no-approval-service`），已退回原路径 |
+| `MULTITASK-APPROVAL-RELAY-RETRY-SKIPPED reason=…` | 没有重试及原因（`disabled-by-config` / `not-a-turn-boundary-failure` / `notice-not-delivered` / `turn-state-unreadable` / `signal-aborted` / `parent-not-interactive` / `parent-disposed`） |
+| `MULTITASK-APPROVAL-RELAY-RETRY-FAILED reason=…` | 重试没成功（`window-elapsed` / `attempts-exhausted` / `retry-threw` / `no-approval-service`），已退回原路径 |
 
 `MULTITASK-APPROVAL-GATE-SKIPPED` 与 `ENGAGED` 都随计数递增，所以派了 N 个 worker
 却一个都没放开时，日志里能看出「跳过了几次、每次为什么」。
@@ -804,16 +804,20 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 
 ### 边界：这个模块不提供什么
 
-- **父会话空闲时，转呈要靠「唤醒 + 重试」这一条路兜住，它有一个窗口上限。**
+- **父会话空闲时，转呈要靠「唤醒 + 重试」这一条路兜住，它有两个上限。**
   `approval.request` 要求父会话有一个打开的回合，否则抛错。这种「回合刚好关着」的个例
   **不是随机故障**：后台派单时协调者派完就不等了，父会话的回合随之结束，子代理后面才动手 ——
   所以它在一部分请求上稳定复现。这一前提现在由人格与同名段遮蔽**显式**保证
   （见「协调者何时结束回合」），不再是宿主的默认行为。
-  本模块的处置是：转呈失败 → 发通知（那条通知会把空闲的父会话唤醒）→ 等回合打开 → 重试一次。
-  于是这类个例通常**几毫秒**就回到正常路径（主对话里出现一张审批卡）。
+  本模块的处置是：转呈失败 → 发通知（那条通知会把空闲的父会话唤醒）→ **挂起**这次转呈，
+  等父会话**下一个 `turn/start`** 再转呈，最多 **20** 次。
+  于是这类个例通常回到正常路径：父会话**正开着回合**时，审批卡**几秒内**就出现；
+  回合没开时，卡要等你**下一次发言**把回合打开才出现（见上面的「冷启动」）。
   仍然有三条边界：① 只在**通知确实送达**时才等（没有送达就没东西会去唤醒父会话）；
   ② 只在**「缺打开回合」这一种失败**上重试（别的失败重试不会变好，还可能造成重复询问）；
-  ③ 窗口默认 10 秒（`config.relayRetryWindowMs`，设 0 关闭），耗尽后退回原路径并 fail-closed。
+  ③ 等待由**两个**上限夹住 —— `config.relayRetryWindowMs`（默认 10 分钟）与
+  `config.relayRetryMaxAttempts`（默认 20 次），`relayRetryWindowMs: 0` 关闭挂起重试 ——
+  任一用尽即退回原路径并 fail-closed。
 - **兜底通知不是批准，重试成功才是「已批准」。** 转呈失败后，本模块会尽力通过 Agent 消息通道
   （`subagents.sendMessage`）让主对话出现一条来自该子代理的消息，写明**是哪个子会话、
   想执行什么、去哪里作答**。这段文案刻意写成**条件式**（「若本对话里出现了审批卡就在这里作答，
@@ -850,8 +854,9 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 |---|---|---|
 | `classify` | `true` | 第一级（规则表）总开关。`false` = 危险命令不再被拦下询问；第二级转呈仍在 |
 | `relay` | `true` | 第二级（转呈）总开关。`false` = 子代理的请求不再落到主对话 |
-| `relayRetryWindowMs` | `10000` | 「回合刚好关着」时等父会话开回合的上限（毫秒）。`0` = 关闭重试 |
-| `notifyOnRelayFailure` | `true` | 转呈失败时的兜底通知。`false` 关掉它（重试照常进行） |
+| `relayRetryWindowMs` | `600000` | 「回合刚好关着」时**挂起**等父会话下一个打开回合的上限（毫秒，默认 10 分钟）。`0` = 关闭挂起重试 |
+| `relayRetryMaxAttempts` | `20` | 挂起期间的最大重试次数。父会话的回合可能**开了又关**，每次 `turn/start` 都会试一次；达到这个次数就退回原路径（与上面的时间上限**任一**用尽即结束） |
+| `notifyOnRelayFailure` | `true` | 转呈失败时的兜底通知，而它同时也是**唯一能唤醒空闲父会话**的东西。设 `false` 关掉它：父会话**已经有打开的回合**时转呈照常进行；但那个回合**关着**时没有任何东西会去开回合，挂起这一步根本不会启动，请求当场退回子会话 |
 | `extraDangerPatterns` | `[]` | 追加危险模式，每项 `{ id, re }` 或裸字符串 / 正则 |
 | `safePatterns` | `[]` | 追加「命中也不问」的放行模式 |
 | `shellTools` | `['pwsh', 'bash']` | 追加需要看命令文本的工具名 |
@@ -866,8 +871,9 @@ header，那会抛 `session header uses retired policy baseline fields`）。
   危险。所以它默认**刻意留空**：写错它等于静默放行一条危险命令，而「少问一次」与「多放一次」
   在日志上都看不出来（一次都没问，就没有 `MULTITASK-APPROVAL-ASK` 可对账）。
   要加它，必须有与 `DANGER_PATTERNS` 那几条同等强度的依据，并且两侧用例一起跑。
-- `relayRetryWindowMs` 的非法值（负数、`NaN`、非数字）一律**退回默认 10 秒**，而不是被读成
+- `relayRetryWindowMs` 的非法值（负数、`NaN`、非数字）一律**退回默认 10 分钟**，而不是被读成
   「不限制」—— 无限等待会让子代理在父会话永不醒来时被永久挂住，那正是本模块最不该制造的状态。
+  `relayRetryMaxAttempts` 的非法值（小于 `1`、`NaN`、非数字）同样**退回默认 20 次**。
 - `shellTools` / `fileTools` 里**名称写错不会报错**，只会静默漏判（命令照旧在沙箱下执行）。
   所以默认只列本 composition 真的会注册的那几个，宁可少列。
 
@@ -1285,8 +1291,9 @@ dsh-multitask: coordinator scope engaged — withheld N tool(s): edit, pwsh, rea
 | 一条**来自该子代理的消息**，写着「a decision from you is waiting」并给出子会话 id，**随后**出现审批卡 | 第一次转呈失败、通知已发出、重试成功。消息与卡片是**同一件事**：消息是唤醒手段，卡片才是作答处 |
 | **只有那条消息，没有卡片** | 重试没能成功（窗口耗尽等）—— 这是**通知，不是批准**；按消息里的 id 打开那个子会话作答 |
 
-判据是**卡片是否存在**，不是「有没有消息」：重试会**同时**留下消息与卡片，窗口默认 10 秒，
-所以要等窗口过完再看一眼。批准/拒绝**只能在那个子会话里完成**，消息通道不携带审批结果。
+判据是**卡片是否存在**，不是「有没有消息」：重试会**同时**留下消息与卡片，而挂起期间
+两者都还没到 —— 所以复核要等**父会话的下一个回合打开之后**再做（上限默认 10 分钟、最多
+20 次，任一用尽即止），不要在挂起期间去找。批准/拒绝**只能在那个子会话里完成**，消息通道不携带审批结果。
 `approval/asked` 里应当只有**一条** `Multitask approval gate: a delegated Subagent …`
 —— 出现两条说明重试造成了重复询问，那是缺陷。
 
