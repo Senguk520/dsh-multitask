@@ -85,6 +85,8 @@
  * 'subagent:delegation', ... })` 注册在**子代理自己的 ctx 层**上的，文本逐字为
  * `operations that require approval are rejected automatically`。只要这句还在，模型就会
  * 自我审查、不去发起需要审批的调用 —— 于是第二级闸门永远等不到请求。
+ * 同一段的**尾句** `do not retry the denied operation` 也要一起换：本模块的挂起语义是
+ * 「还没裁决、正在等」，挨着「被拒的调用」会被读成裁决已经发生（见 `APPROVAL_TAIL`）。
  *
  * **不能**用「再注册一个同名 context」覆盖它：同层重名直接抛错
  * （`prompt context "..." is already registered in this scope`），而
@@ -2041,6 +2043,10 @@ export function apply(ctx, config) {
    * 触发条件是**内容**（必须含 `are rejected automatically`）而不是只有名字：上游改了措辞
    * 时本模块**不猜**，宁可少改一次也不写错话，并留一条 warn 让人知道需要跟进。
    *
+   * 改写覆盖**两句**：前半句（会自动拒绝）+ 尾句（不要去重试「被拒的」那次调用）。
+   * 尾句单独一次 replace，所以它认不出时前半句照旧改 —— 后半句是新增的坑（挂起期间
+   * 「还在等」被读成「已经被拒」），不是原改写的前提。
+   *
    * 注册在**子代理自己的 ctx** 上，所以只影响这个子代理的提示词组装，兄弟与父会话都看不到。
    *
    * @param agent - 已放开的子代理。
@@ -2095,7 +2101,12 @@ export function apply(ctx, config) {
         return entry
       }
       touched = true
-      return { ...entry, text: entry.text.replace(APPROVAL_CLAIM, RELAYED_CLAIM) }
+      return {
+        ...entry,
+        // 两处替换：前半句（「会自动拒绝」）+ 尾句（「不要去重试那次被拒的调用」）。
+        // 尾句不认得上游原话时原样留着 —— 单独一次 replace，所以前半句的改写照旧生效。
+        text: entry.text.replace(APPROVAL_CLAIM, RELAYED_CLAIM).replace(APPROVAL_TAIL, RELAYED_TAIL),
+      }
     })
     if (!touched) return assembled
     return { ...assembled, contexts }
@@ -3143,14 +3154,43 @@ export function apply(ctx, config) {
 const APPROVAL_CLAIM = 'operations that require approval are rejected automatically'
 
 /**
- * 替换文本：只说事实，且**分三种情形**（桌面端实测表明，一句不带分支的话会被 worker 读错）。
+ * 同一段上游文本的**尾句**（逐字）。
+ *
+ * 为什么它也要换掉：前半句改成「答复到达前一直阻塞」之后，紧挨着的
+ * `do not retry the denied operation` 会把 worker 读成**裁决已经发生、我被拒了** ——
+ * 而本模块的挂起语义恰恰是「还没裁决、正在等」。两句自相矛盾时，worker 按最坏的那句
+ * 行动（绕道去达成同一效果），那正是这段改写要堵的坑。
+ *
+ * 为什么不并成一个大跨度：上游只改尾句措辞时，前半句的改写仍然生效，闸门不会因为
+ * 尾句漂移而整个静默失效。尾句认不出就原样留着。
+ */
+const APPROVAL_TAIL =
+  'When the task needs access beyond that scope, do not retry the denied operation; state the limitation in your reply so the delegating agent can handle it'
+
+/**
+ * 前半句的替换文本：只说事实，且**分三种情形**（桌面端实测表明，一句不带分支的话会被 worker 读错）。
  *
  *   ① 有应答者 ⇒ 转呈到父会话，由人批准后**放行**；
  *   ② 没有应答者 / 转呈本身失败 ⇒ **fail-closed**，这次调用**不会得到放行**
  *      （刻意不写「自动拒绝」：那会让 worker 以为已经有人否决了它）；
- *   ③ 得到答复之前**一直阻塞** ⇒ 不要重试、不要换一条路做同一件事。
+ *   ③ 得到答复之前**一直阻塞**，而「还在等」**不是**「已经被拒」。
  *
- * 第 ③ 条是针对实测里最常见的错法：worker 以为被拒，于是绕道去达成同一效果。
+ * 「不要重试 / 不要绕道 / 把限制写进回复」这三件事**只出现一次**，放在尾句里
+ * （`RELAYED_TAIL`）—— 那里原本正是上游写 `denied` 的地方，替换后整段不再有任何
+ * 「裁决已经发生」的暗示。
+ *
  * 结尾不带句号 —— 原文在 `APPROVAL_CLAIM` 之后本来就有一个句号。
  */
-const RELAYED_CLAIM = 'operations that require approval are routed to the user through the parent conversation whenever an answerer is available (for example when a human is in the foreground), and the call runs only after a human allows it. With no answerer, or when the relay itself fails, the call is not allowed — it fails closed. Until an answer arrives that call stays blocked: do not retry it, do not reach the same effect by another route, and if the wait runs long, report it as awaiting a decision'
+const RELAYED_CLAIM =
+  'operations that require approval are routed to the user through the parent conversation whenever an answerer is available (for example when a human is in the foreground), and the call runs only after a human allows it. With no answerer, or when the relay itself fails, the call is not allowed — it fails closed. Until an answer arrives that call stays blocked; waiting is not a refusal, and a long wait is not a decision'
+
+/**
+ * 尾句的替换文本。
+ *
+ * 保留上游那层意思（不要重试、把限制写进回复、由委派方处置），但**去掉 `denied`** ——
+ * 挂起期间裁决还没发生，条件式（「若回来时不被允许，**或**等待过久」）才是两种结局都为真的。
+ *
+ * 结尾同样不带句号：原文尾句后面本来就有一个句号。
+ */
+const RELAYED_TAIL =
+  'If the call comes back not allowed, or the wait runs long, do not retry it and do not reach the same effect by another route; state the limitation in your reply so the delegating agent can handle it'

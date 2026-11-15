@@ -653,6 +653,10 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 **② 纠正那句误导性提示。** 上游把委派上下文注册在**子代理自己的 ctx 层**上，
 文本里含 `operations that require approval are rejected automatically`。
 只要这句还在，模型就会自我审查、不去发起需要审批的调用 —— 于是第二级永远等不到请求。
+同一条的**第二句**（`do not retry the denied operation`）也一起改写：挂起语义下那次调用
+**还在等**、裁决尚未发生，而 worker 把紧挨着「stays blocked」的「denied」读成**已经被拒**
+就会绕道去达成同一效果，而不是等答复（实际文案见 `approval-gate.mjs` 的
+`RELAYED_CLAIM` / `RELAYED_TAIL`；尾句是单独一次替换，上游只改尾句时前半句照旧改）。
 
 **不能**用「再注册一个同名 context」覆盖它：同层重名直接抛错
 （`prompt context "…" is already registered in this scope`），而 `context()` 只做

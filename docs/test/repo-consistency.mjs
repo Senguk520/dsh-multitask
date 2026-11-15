@@ -1393,6 +1393,13 @@ test('M3 改写定位用的条目名与上游逐字一致（spelling 漂了就�
     'approval-gate.mjs 里找不到用来识别原话的片段 —— ' +
       '没有它就无法判断「这条文本是否仍然误导」，改写会退化成盲改',
   )
+  // 尾句原话（上游 SUBAGENT_DELEGATION_CONTEXT 的第二句，`denied` 就在它里面）：
+  // 它在挂起语义下会被读成「裁决已经发生」，所以它同样要能被逐字认出来并替换。
+  assert(
+    gate.includes('do not retry the denied operation'),
+    'approval-gate.mjs 里找不到上游尾句的片段 —— ' +
+      '尾句认不出就会被原样留给模型，worker 会把「还在等」读成「已经被拒」',
+  )
 })
 
 test('M4 approval/policy 的写入省略 source（结论对，理由需如实）', () => {

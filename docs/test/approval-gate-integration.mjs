@@ -436,6 +436,17 @@ await testAsync('I8 改写在子代理自己的 scope 上注册，且只动那�
     delegation.text.includes('routed to the user'),
     '改写后的文本应当说明请求会交给用户裁决',
   )
+  // ⚠️ 尾句必须一起换（本次补齐）：前一句已经是「答复到达前一直阻塞」，紧跟着
+  //    「do not retry the denied operation」会被 worker 读成「裁决已经发生、我被拒了」。
+  assert(
+    !delegation.text.includes('denied operation'),
+    '尾句「do not retry the denied operation」必须一起换掉 —— ' +
+      '它就挨着「答复到达前一直阻塞」，留着等于告诉 worker 裁决已经发生',
+  )
+  assert(
+    delegation.text.includes('state the limitation in your reply'),
+    '尾句改写后仍要保留「把限制写进回复、由委派方处理」这层意思',
+  )
   // 其余条目必须原样
   assert(out.contexts.find((c) => c.name === 'other').text === 'untouched', '不该动别的 context')
   assert(out.sections === assembled.sections, '不该动 sections')
@@ -860,7 +871,7 @@ await testAsync('I28 转呈失败：发了通知，且返回值仍是下游结�
 
   const { ctx, handlers } = fakeCtx({ services })
   // ⚠️ `relayRetryWindowMs: 0` 把「唤醒后重试」关掉，这条用例才只测通知本身：
-  // 开着它的话，本用例会在等父会话开回合上真的耗满那个窗口（默认 10 秒），
+  // 开着它的话，本用例会在等父会话开回合上真的耗满那个窗口（默认 10 分钟），
   // 而它要断言的东西（通知发了、返回值不变）与等不等得到回合毫无关系。
   apply(ctx, { enabled: true, relayRetryWindowMs: 0 })
   const relay = handlerFor(handlers, 'approval/request')
@@ -1037,7 +1048,7 @@ await testAsync('I36 下游永不返回（真实挂起形态）：通知仍然�
 
   const { ctx, handlers } = fakeCtx({ services })
   // ⚠️ `relayRetryWindowMs: 0`：本用例只测「通知与下游的先后」，与「等不等得到回合」
-  // 无关。开着重试窗口的话，这里会真的耗满 10 秒才发现父会话根本不会开回合。
+  // 无关。开着重试窗口的话，这里会真的耗满 10 分钟才发现父会话根本不会开回合。
   apply(ctx, { enabled: true, relayRetryWindowMs: 0 })
   const relay = handlerFor(handlers, 'approval/request')
 
@@ -1070,7 +1081,7 @@ await testAsync('I36 下游永不返回（真实挂起形态）：通知仍然�
 // 本模块抓住那个回合并重试一次，于是这类个例从「用户得自己去子会话里找」
 // 变成「主对话里正常出现一张审批卡」。
 //
-// 每一条都覆盖一个**不能错**的分支：它们错的方向要么是「白等 10 秒」，
+// 每一条都覆盖一个**不能错**的分支：它们错的方向要么是「白等 10 分钟」，
 // 要么是「在非交互式会话上发起询问」，要么是「重复询问」。
 console.log('\n--- 4c. 唤醒后重试：回合刚开时把卡片送到主对话 ---')
 
