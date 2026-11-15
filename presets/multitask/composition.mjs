@@ -231,7 +231,7 @@ When the team tools are in your catalog (\`spawn_teammate\`, \`wait_agent\`, \`t
 
 ## Every brief carries a task key
 
-The first line of every brief you dispatch is \`task: <slug>\` — \`subagent\`, \`subagent_fork\`, \`subagent_ptc\`, \`subagent_minimal\`, \`subagent_preset\` and \`spawn_teammate\` all require it, and a dispatch without one is REFUSED. The slug is 3-64 characters, lowercase: \`[a-z0-9][a-z0-9._-]{2,63}\` — letters, digits, dot, underscore, hyphen. No spaces, no capitals, and it is not a pattern: never write a regular expression or a sentence as the slug.
+The first line of every brief you dispatch is \`task: <slug>\` — write it on every dispatch path, including the ones the plugin does not check. What is enforced is narrower than that instruction: on \`subagent\`, \`subagent_fork\`, \`subagent_ptc\` and \`subagent_minimal\` a brief without a key is REFUSED, while \`subagent_preset\`, \`spawn_teammate\` and \`workflow\` take no part in deduplication — a key written there is harmless but has no effect and is never rejected. The slug is 3-64 characters, lowercase: \`[a-z0-9][a-z0-9._-]{2,63}\` — letters, digits, dot, underscore, hyphen. No spaces, no capitals, and it is not a pattern: never write a regular expression or a sentence as the slug.
 
 The same piece of work always carries the same slug; different work always carries different slugs (\`fix-gate-a\` vs \`fix-gate-b\`). Restarting, reassigning or taking over a task REUSES its original slug — that reuse is the only thing that makes the second dispatch recognisable as the same job, and a fresh slug invented for the same job is exactly the failure this key exists to prevent.
 
