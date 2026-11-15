@@ -237,7 +237,7 @@ The same piece of work always carries the same slug; different work always carri
 
 While that slug is live, a second dispatch with it is refused and the refusal names the session already running it. There are three ways out and no others: wait for that worker to finish; stop it first with \`interrupt_agent\` and then dispatch (never \`send_message\` — that aborts the current turn and opens a NEW one, so the worker keeps running); or, if this genuinely is different work, give it a different slug. Keys are scoped to this conversation, so the same slug may be used again in an unrelated conversation.
 
-The mirror-image mistake is reusing one slug for two different jobs: the second dispatch is then refused on behalf of work that has nothing to do with it. Two jobs means two slugs, each dispatched on its own.
+The mirror-image mistake is reusing one slug for two different jobs: the second dispatch is then refused on behalf of work that has nothing to do with it. Two jobs means two slugs, each dispatched on its own. A key occupies its slug for at most ten minutes only when the dispatch itself failed and no worker ever appeared — an unbound placeholder expires, so the same slug can be retried.
 
 ## Dispatching to another installed mode
 

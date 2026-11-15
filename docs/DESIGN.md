@@ -738,7 +738,9 @@ Three easy ways to get the diagnosis wrong:
 
 ### The criterion: an explicit key, not semantic similarity
 
-Every brief must carry a line `task: <slug>` (or `task=<slug>`; leading whitespace, an optional list marker, and any case of `task` are accepted). Grammar: 3-64 characters, lowercase, `[a-z0-9][a-z0-9._-]{2,63}`. The same check covers the four worker tools, `subagent_preset`, and `spawn_teammate`.
+Every brief must carry a line `task: <slug>` (or `task=<slug>`; leading whitespace, an optional list marker, and any case of `task` are accepted). Grammar: 3-64 characters, lowercase, `[a-z0-9][a-z0-9._-]{2,63}`. The check is enforced on the four verified dispatch paths only — `subagent`, `subagent_fork`, `subagent_ptc`, `subagent_minimal`, whose brief field is `prompt` (`description` is the display label and only a fallback).
+
+**The boundary of that enforcement is deliberate.** `spawn_teammate`, `subagent_preset` and `workflow` are dispatch-shaped, but their brief schema is not verified in this repository, so their arguments are passed through untouched with one `TASK-KEY-SKIPPED reason=unknown-schema` info line per tool (once per session, so the log does not fill up). The orientation is **miss a duplicate rather than block a dispatch we cannot parse**: a guard that hard-rejects a tool whose brief field name it guessed wrong turns a legitimate delegation path into a dead end, while the cost of letting it through is only that a same-key collision on those paths is not detected — the pre-module behaviour. That cost is stated in the README, and it is the honest description of what this mechanism covers.
 
 The module runs in `tools/pre-execute` and refuses the dispatch when:
 
@@ -750,25 +752,29 @@ The module runs in `tools/pre-execute` and refuses the dispatch when:
 | the key is live in this conversation | deny, naming the running worker's session id (first 8 characters) and its running time |
 | otherwise | allow, and record the claim |
 
+Those rows apply to the four verified tools; a tool whose brief cannot be read never reaches this table.
+
 A dispatch is refused **only** while a key is live; nothing else about a brief is questioned. The check runs after `next()`, so another guard's rejection is never overwritten, and the decision is a single function (`judge`) so the discrimination test can neuter it and prove the assertions are looking at it.
 
 ### Scope: per parent conversation
 
 Registry key = `parentSessionId + '::' + slug`, held in `globalThis['dsh-multitask:task-key:v1']` as `{ claims: Map, gone: string[] }`. Two unrelated main conversations may use the same slug without blocking each other, while two dispatches from one conversation collide — which is exactly the case that writes the same files.
 
-### Release: on dispose plus a liveness sweep, and no timeout
+### Release: on dispose, a liveness sweep, and a TTL for the unbound placeholder only
 
 `agent/disposed` clears the claim whose child session id matches. In addition, every check sweeps the registry: a claim whose session no longer answers `agents.get(id)` — and that had been confirmed live at least once — is released, so a missed dispose cannot hold a key forever. The child's session id is bound when the child appears (`agent/created`), and only when the binding is unambiguous: exactly one unbound claim for that parent. With several briefs in flight the id stays unbound rather than being attached to the wrong job, and the refusal then says the id is not known yet instead of inventing one.
 
-There is deliberately **no time TTL**. A job that legitimately runs 40 minutes must not be judged stale: a timeout would refuse the takeover at the moment it is needed and wave the duplicate through at the moment it is dangerous.
+A **bound** claim has deliberately **no time TTL**. A job that legitimately runs 40 minutes must not be judged stale: a timeout would refuse the takeover at the moment it is needed and wave the duplicate through at the moment it is dangerous.
+
+An **unbound** placeholder is the one exception, and it is the fix for a real permanent lock: pre-execute admits the dispatch, then the dispatch itself fails (the host's `subagent.maxActiveSubagents` cap, a provider error), so no child session is ever created — `agent/created` never fires, `bound` stays `false` and `ids` stays empty. Without an expiry that slug is claimed for the rest of the conversation, and the coordinator has to invent a new one, even though restarting the same task is exactly the case that must reuse its slug. So an unbound placeholder older than `UNBOUND_CLAIM_TTL_MS` (600000 ms = 10 minutes) is released on the next check, with `TASK-KEY-RELEASED reason=unbound-expired`, and the same slug can be claimed again. Bound claims are never touched by this rule.
 
 ### Fail-closed where the answer is unknown, silent where the mechanism breaks
 
-An unparseable or ambiguous brief is refused, because guessing the job's identity is precisely how one job becomes two. An *exception inside the module* degrades the other way: the dispatch is allowed and one `warn` line is logged (`TASK-KEY-SKIPPED`), which is the pre-module behaviour. "This brief is malformed" is a fact the coordinator can fix; "the registry is unavailable" is not, and turning the second into a refusal would block work for a reason nobody can act on.
+An unparseable or ambiguous brief **that can be read** is refused, because guessing the job's identity is precisely how one job becomes two; a tool whose brief cannot be read at all is let through, for the reason given above. An *exception inside the module* degrades the same way: the dispatch is allowed and one `warn` line is logged (`TASK-KEY-SKIPPED`), which is the pre-module behaviour. "This brief is malformed" is a fact the coordinator can fix; "the registry is unavailable" is not, and turning the second into a refusal would block work for a reason nobody can act on.
 
 ### How to confirm it is working
 
-`TASK-KEY-ENGAGED` at load, `TASK-KEY-CLAIMED` per admitted dispatch (with the slug), `TASK-KEY-REFUSED` per refusal. The refusal text is itself the audit: it names the live worker, its running time and the two ways out.
+`TASK-KEY-ENGAGED` at load, `TASK-KEY-CLAIMED` per admitted dispatch (with the slug), `TASK-KEY-REFUSED` per refusal, `TASK-KEY-RELEASED reason=unbound-expired` when a failed dispatch's placeholder expires, and `TASK-KEY-SKIPPED reason=unknown-schema` once per dispatch-shaped tool whose brief schema is not verified. The refusal text is itself the audit: it names the live worker, its running time and the two ways out.
 
 ---
 

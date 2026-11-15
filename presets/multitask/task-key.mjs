@@ -21,13 +21,25 @@
  *
  * ── 行为 ─────────────────────────────────────────────────────────────────────
  *
- * 挂 `tools/pre-execute`。当 `exec.name` 属于派遣类工具时：
+ * 挂 `tools/pre-execute`。**只对四个已确证 schema 的派遣工具强制**
+ * （`VERIFIED_DISPATCH_TOOLS`：`subagent` / `subagent_fork` / `subagent_ptc` /
+ * `subagent_minimal`；任务书字段是 `prompt`，`description` 只作兜底）。当
+ * `exec.name` 属于这四个时：
  *
  *   · 没有任务键            → 拒绝（deny），文案要求补 `task: <slug>`
  *   · 有键但文法不合法      → 拒绝，文案给出文法
  *   · 一份 brief 里两个不同的键 → 拒绝（解析不确定 ⇒ fail-closed）
  *   · 有键且该键**在运行中** → 拒绝，文案给出已有 worker 的会话 id 前 8 位与已运行时长
  *   · 有键且无冲突          → 登记后放行
+ *
+ * 其余派遣类工具（`spawn_teammate` / `subagent_preset` / `workflow` 以及任何
+ * schema 未在本仓库确证的工具）**一律放行**，并记一行
+ * `TASK-KEY-SKIPPED reason=unknown-schema tool=<name>`（同一次会话内同一个工具只记一次，
+ * 避免刷屏）。
+ *
+ * ⚠️ 这条边界是刻意的：**这个守卫宁可漏拦，也不能堵死它看不懂的派遣路径。**
+ * 一个解析不出 brief 的工具被硬拒，等于把一条合法派遣路径变成不可用；而漏拦的
+ * 后果只是「团队工具下的同键并发不被检测」—— 也就是回到加本模块之前。
  *
  * ── 登记表契约（跨文件约定，别改字面量）──────────────────────────────────────
  *
@@ -51,15 +63,27 @@
  * 释放：`agent/disposed` 时清掉对应键；每次检查前再顺带做过期清理 ——
  * 对**已不再活跃**的会话 id 视为释放（判据是 `agents.get(id) === undefined`，
  * 且该 id 曾被确认活着；`agents` 服务不可用时退回 `gone` 名单）。
- * **刻意不设纯时间 TTL**：一个长任务跑 40 分钟不该被判过期。
+ * **已绑定的 claim 绝不做时间过期**：一个长任务跑 40 分钟不该被判过期。
+ *
+ * 唯一的例外是**未绑定的占位**：pre-execute 放行之后派遣本身失败（宿主
+ * `subagent.maxActiveSubagents` 上限、provider 抛错等），子会话从未创建 ⇒
+ * `agent/created` 不触发 ⇒ `bound` 永远是 false、`ids` 为空。这种占位若一直留着，
+ * 该 slug 在本对话内就**永久被占**，协调者只能换 slug —— 而「重启同一个任务」本应
+ * 复用原 slug。所以 `UNBOUND_CLAIM_TTL_MS`（默认 600000 = 10 分钟）之后，它在下次
+ * 检查时被释放并允许重新登记，同时记 `TASK-KEY-RELEASED reason=unbound-expired`。
+ * 已绑定的 claim 不受这一条影响。
  *
  * ── 失败取向 ─────────────────────────────────────────────────────────────────
  *
- * **fail-closed**：解析不确定（brief 取不到、键文法不合法、一份 brief 两个键）
- * 一律拒绝，并说明要求。但**只**为这些情况拒绝 —— 别的工具、别的方向（worker →
+ * **fail-closed**：在**能读到 brief** 的前提下解析不确定（键文法不合法、一份 brief
+ * 两个键）一律拒绝，并说明要求。但**只**为这些情况拒绝 —— 别的工具、别的方向（worker →
  * 父会话的汇报、以及 worker 自己的任何调用）一个字都不碰。
  *
- * 唯一的「安静」路径是机制本身出意外（监听器抛错）：那退成放行 + 一行 warn，
+ * **宁可漏拦，不可堵死**：brief 字段一个都取不到的工具（schema 未确证）放行 + 一行
+ * `info`（`TASK-KEY-SKIPPED reason=unknown-schema`），而不是硬拒 —— 理由见上面
+ * 「行为」那一节。
+ *
+ * 另一条「安静」路径是机制本身出意外（监听器抛错）：那退成放行 + 一行 warn，
  * 因为本模块的失败不该把一次正常派发变成拒绝。**功能上**这等于回到加本模块之前。
  *
  * @module dsh-multitask/presets/multitask/task-key
@@ -96,30 +120,53 @@ export const REGISTRY_KEY = 'dsh-multitask:task-key:v1'
 export const SLUG_PATTERN = /^[a-z0-9][a-z0-9._-]{2,63}$/
 
 /**
- * 派遣类工具名 —— 只有这些调用的参数里**一定**有任务书。
+ * 派遣类工具名 —— 只有这些调用的参数里**一定**有任务书（任务键就从里面解析）。
  *
- * 前四个是本模式自己的四条委派路径（`composition.mjs` 的四行 `toolName`，逐字一致）；
- * `subagent_preset` 是跨模式派发（`preset-dispatch.mjs` 注册）；`spawn_teammate` 是
- * 团队工具（团队构建下才在协调者目录里，不在时这个字符串永远匹配不到任何调用）。
+ * 分成两组，因为「是不是派遣」与「schema 是否已确证」是两件事：
+ *
+ *   · `VERIFIED_DISPATCH_TOOLS` —— 已确证 schema，**强制**检查；
+ *   · `UNVERIFIED_DISPATCH_TOOLS` —— 是派遣，但 brief 字段名在本仓库与解包副本里
+ *     都没有确证，**放行**并记一行 skip（宁可漏拦，不可堵死）。
+ *
+ * 四个已确证的名字是本模式自己的四条委派路径（`composition.mjs` 的四行 `toolName`，
+ * 逐字一致）。`subagent_preset` 是跨模式派发（`preset-dispatch.mjs` 注册）；
+ * `spawn_teammate` 是团队工具（团队构建下才在协调者目录里）；`workflow` 是宿主的
+ * 编排工具 —— 三者的 brief 字段都**没有**在本仓库里确证。
  */
-export const DISPATCH_TOOLS = [
-  'subagent',
-  'subagent_fork',
-  'subagent_ptc',
-  'subagent_minimal',
-  'subagent_preset',
-  'spawn_teammate',
-]
+export const VERIFIED_DISPATCH_TOOLS = ['subagent', 'subagent_fork', 'subagent_ptc', 'subagent_minimal']
+
+/** 派遣类、但 brief schema 未确证的工具：放行 + 一次 `info`（见文件头）。 */
+export const UNVERIFIED_DISPATCH_TOOLS = ['spawn_teammate', 'subagent_preset', 'workflow']
+
+/**
+ * 全部派遣类工具（已确证 + 未确证）。
+ *
+ * 保留这个导出只是因为它是**对外契约**的并集（判别力测试用它对「强制所有工具」做
+ * 变异）；决策本身按上面两组分别处理，**不要**用它来判断是否强制。
+ */
+export const DISPATCH_TOOLS = [...VERIFIED_DISPATCH_TOOLS, ...UNVERIFIED_DISPATCH_TOOLS]
+
+/**
+ * 未绑定占位的存活上限（毫秒）。
+ *
+ * 只对**未绑定**的占位生效：pre-execute 放行之后派遣失败（宿主并发上限、provider 抛错），
+ * 子会话从未创建，`agent/created` 不会来把 id 绑上去。没有这个上限，那个 slug 在本对话内
+ * 就永久被占，而「重启同一个任务」本应复用 slug。
+ *
+ * **已绑定的 claim 永不过期**：一个跑 40 分钟的长任务不该被判过期 —— 那会在最需要接手的
+ * 时刻拒绝接手。这里刻意不做成配置读取：本模块没有配置面（`composition.mjs` 只传
+ * `enabled`），多一个阈值旋钮只会让行为在部署之间悄悄漂移。
+ */
+export const UNBOUND_CLAIM_TTL_MS = 600000
 
 /**
  * 任务书可能出现的参数字段，**按顺序取第一个存在的字符串**。
  *
  * 真实 schema（`.tmp-asar/tool-subagent.js` 的 `parameters`）：brief 在 `prompt`，
  * 而 `description` 是必填的「3-5 个词的显示标签」，**不是**任务书 —— 它排在最后，
- * 只在某个工具的 brief 字段叫别的名字时兜底（`spawn_teammate` 的 schema 不在本仓库里，
- * 所以多留几个候选，而不是猜一个）。
+ * 只在 `prompt` 缺失时兜底。四个已确证工具都吃这一对字段名。
  */
-const BRIEF_FIELDS = ['prompt', 'message', 'brief', 'instructions', 'description']
+const BRIEF_FIELDS = ['prompt', 'description']
 
 /** 「专用任务键字段」的候选名：某些工具可能有独立的 `task` 字段而不是行内约定。 */
 const KEY_FIELDS = ['task', 'task_key', 'taskKey', 'slug']
@@ -245,8 +292,11 @@ export function parseTaskKey(brief) {
 /**
  * 从工具参数里取出**任务书文本**。
  *
- * 顺序见 `BRIEF_FIELDS` 的注释：先 `prompt`（真实 schema 的 brief 字段），
- * 再几个兜底名，最后才 `description`。
+ * 顺序见 `BRIEF_FIELDS` 的注释：先 `prompt`（四个已确证工具的 brief 字段），
+ * 再 `description`（显示标签，只作兜底）。
+ *
+ * ⚠️ 它只对**已确证 schema** 的工具被调用：别的工具连 brief 字段名都不知道，
+ * 取不到就该放行，而不是把 `missing` 当成「没有任务键」去拒绝（见文件头）。
  *
  * @param args - 工具的 `arguments`。
  * @returns `{ text, field }`，或 `undefined`（一个候选字段都没有）。
@@ -379,19 +429,25 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 过期清理：把**已经不在**的会话上的占位删掉。
+   * 过期清理：把**已经失效**的占位删掉。
    *
-   * 两个判据，任一成立即释放：
+   * 三个判据，任一成立即释放：
    *   1. 该会话 id 出现在 `gone` 名单里（`agent/disposed` 记录的兜底）；
    *   2. `agents.get()` 明确不认识它，**且**它曾被确认活着（`claim.bound`）——
-   *      加 `bound` 这个前置是为了不在绑定瞬间把刚登记的占位误删。
+   *      加 `bound` 这个前置是为了不在绑定瞬间把刚登记的占位误删；
+   *   3. **未绑定**的占位超过了 `UNBOUND_CLAIM_TTL_MS`（见该常量的注释）：
+   *      pre-execute 放行之后派遣失败（宿主并发上限、provider 抛错），子会话从未
+   *      创建 ⇒ 这个占位永远不会被绑定。不释放，该 slug 就在本对话内永久被占，
+   *      而「重启同一个任务」本应复用 slug。
    *
-   * ⚠️ 这里**没有**时间 TTL，也不会有：一个长任务跑 40 分钟不该被判过期。
+   * ⚠️ 判据 3 **只**看未绑定的占位。已绑定的 claim 绝不做时间过期：一个长任务跑
+   * 40 分钟不该被判过期 —— 那会在最需要接手的时候拒绝接手。
    *
    * @param table - 登记表。
    * @param callerIds - 当前调用方的 id 候选（用来判断「父会话是不是也没了」）。
+   * @param now - 当前时间（`Date.now()`；判别力测试会把它整体推移）。
    */
-  const prune = (table, callerIds) => {
+  const prune = (table, callerIds, now) => {
     const gone = table.gone
     for (const [key, claim] of [...table.claims.entries()]) {
       if (claim === null || typeof claim !== 'object') {
@@ -402,6 +458,14 @@ export function apply(ctx, config) {
       const name = ids.find((id) => gone.includes(id))
       if (name !== undefined) {
         table.claims.delete(key)
+        continue
+      }
+      // 未绑定的占位：派遣失败后它不会再被绑定，超过阈值就放开这个 slug。
+      const unbound = claim.bound !== true || ids.length === 0
+      const startedAt = typeof claim.startedAt === 'number' ? claim.startedAt : undefined
+      if (unbound && startedAt !== undefined && now - startedAt > UNBOUND_CLAIM_TTL_MS) {
+        table.claims.delete(key)
+        logReleased(claim, now)
         continue
       }
       if (claim.bound === true && livenessOf(ids) === false) {
@@ -419,10 +483,34 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 判定一次派遣调用（**唯一**的放行/拒绝决策点）。
+   * 记一行「占位被释放」（marker 与 `TASK-KEY-CLAIMED` / `-REFUSED` 同款）。
+   *
+   * 文案里的 `reason=unbound-expired` 是**日志契约**：协调者与测试按它 grep。
+   *
+   * @param claim - 被释放的占位。
+   * @param now - 当前时间。
+   */
+  const logReleased = (claim, now) => {
+    const startedAt = typeof claim?.startedAt === 'number' ? claim.startedAt : now
+    try {
+      ctx.logger?.info?.(
+        `dsh-multitask: TASK-KEY-RELEASED slug=${JSON.stringify(claim?.slug)} tool=${JSON.stringify(
+          claim?.tool,
+        )} reason=unbound-expired age=${formatDuration(now - startedAt)}`,
+      )
+    } catch {
+      // 同上：日志不可用不影响派发。
+    }
+  }
+
+  /**
+   * 判定一次**已确证工具**的派遣调用（**唯一**的放行/拒绝决策点）。
    *
    * 刻意收成一个函数：判别力测试要把它整段改成恒放行，然后确认主用例变红
-   * （见 `test/task-key.mjs` 第 8 条）。决策分散在多个分支里就无法证明断言还在看它。
+   * （见 `test/task-key.mjs` 第 6 组）。决策分散在多个分支里就无法证明断言还在看它。
+   *
+   * ⚠️ 它**只**被 `VERIFIED_DISPATCH_TOOLS` 的调用走到。一个解析不出 brief 的工具
+   * 不该走到这里 —— 走到这里就意味着「没有任务键」⇒ 硬拒（问题 B）。
    *
    * @param exec - 工具执行输入。
    * @param now - 当前时间（`Date.now()`）。
@@ -486,7 +574,7 @@ export function apply(ctx, config) {
       return { kind: 'allow' }
     }
 
-    prune(table, callerIds)
+    prune(table, callerIds, now)
 
     const key = `${callerIds[0]}::${parsed.slug}`
     const existing = table.claims.get(key)
@@ -518,6 +606,23 @@ export function apply(ctx, config) {
   // 先 `next()` 再判：**绝不覆盖别人的拒绝**（与 `approval-gate.mjs` 的分流同向）。
   // 上游说 allow 之后才轮到本模块表态，于是「别的守卫已经拒了」这件事不会被本模块
   // 改写成一个看起来完全不同的理由。
+  //
+  // ⚠️ 强制面**只有四个已确证 schema 的工具**。其余派遣类工具（brief 字段名没有
+  // 确证）一律放行 + 一次 `info`：一个解析不出 brief 的工具被硬拒，就是把一条合法
+  // 派遣路径堵死；漏拦只是回到加本模块之前（团队工具下同键并发不被检测）。
+  const skipped = new Set()
+  const skipOnce = (tool) => {
+    if (skipped.has(tool)) return
+    skipped.add(tool)
+    try {
+      ctx.logger?.info?.(
+        `dsh-multitask: TASK-KEY-SKIPPED reason=unknown-schema tool=${JSON.stringify(tool)}`,
+      )
+    } catch {
+      // 同上。
+    }
+  }
+
   ctx.on('tools/pre-execute', async (exec, next) => {
     let downstream
     try {
@@ -529,9 +634,14 @@ export function apply(ctx, config) {
     try {
       if (downstream?.kind !== 'allow') return downstream
       const tool = exec?.name
-      if (typeof tool !== 'string' || !DISPATCH_TOOLS.includes(tool)) return downstream
+      if (typeof tool !== 'string') return downstream
       // 方向闸门：worker 的调用一个字都不碰（见 `isDelegatedChild` 的注释）。
       if (isDelegatedChild(exec?.agent)) return downstream
+      if (!VERIFIED_DISPATCH_TOOLS.includes(tool)) {
+        // 连派遣类都算不上的工具（`read` / `pwsh` / …）：一个字都不碰，也不记日志。
+        if (UNVERIFIED_DISPATCH_TOOLS.includes(tool)) skipOnce(tool)
+        return downstream
+      }
 
       const verdict = judge(exec, Date.now())
       if (verdict.kind === 'deny') {
