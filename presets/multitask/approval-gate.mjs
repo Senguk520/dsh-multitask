@@ -112,6 +112,49 @@
  * ⚠️ 本级的失败方向是**安全的**：漏判一个模式 = 和「没有本模块」完全一样（命令照旧在
  * 沙箱下执行），不会放宽任何东西。所以它只可能**增加**一次询问，绝不可能减少保护。
  *
+ * ── C1-b 的判据是**三层**：只读豁免 + 文本模式 + 目标判据（本次修复）────────────
+ *
+ * 曾经这里只有一层：一张按**命令文本**匹配的正则表。那个判据有个结构性问题 ——
+ * 它分不清「同一个动作的两个方向」，下面三条命令在文本层面同形：
+ *
+ *     Remove-Item -Recurse -Force C:\proj\src          ← 真的在删源码树
+ *     Remove-Item -Recurse -Force $env:TEMP\dsh-mut-x  ← 在删自己刚写的临时目录
+ *     Get-Content app.log | Select-String 'shutdown'   ← 只读审计，一个字节都没改
+ *
+ * 第二条与第三条都只是**误拦**，而误拦的代价不是「多一次点击」：反复点允许会把人训练成
+ * 闭眼点允许，那比不拦更糟。所以判据从「命令长得像什么」改成「**解析后的目标**是什么」。
+ * 三层，优先级自上而下（命中任何一层的结论就定了，不再往下看）：
+ *
+ *   ① **只读豁免**（`isReadOnlyCommand`）。整条命令里没有任何变更类调用 —— 每个语句段的
+ *      命令名都在只读登记表里，且引号之外没有重定向 / 命令替换 / 逗号 / 圆括号 / 花括号
+ *      （后两者里的子表达式与脚本块**都会执行**）⇒ **永不**判危险。它只豁免**内置**模式：
+ *      `config.extraDangerPatterns` 加的模式照旧生效 —— 那是用户明确要求要问的东西，
+ *      不该被本模块的降噪顺手关掉。
+ *   ② **文本模式**（`DANGER_PATTERNS`）。与**文件目标无关**的危险动作（`git push --force`、
+ *      发布外发、提权、注册表、计划任务、服务、`Start-Process`、凭据写入、动态求值…）
+ *      **保持原样，一条都不放宽**。它们没有「目标」可解析，文本就是它们全部的信息。
+ *   ③ **目标判据**（`judgeShellDeletionTargets`）。只对**删除类**模式（`DELETION_PATTERN_IDS`）
+ *      生效：把命令里的路径令牌解析成绝对路径（`$env:NAME` / `~` / 相对路径按 `cwd` 展开，
+ *      展开放不出来的就判否），再逐个看目标落在哪：
+ *
+ *        · 全部严格落在 `defaultTempRoots()` 下 ⇒ **放行**（临时目录是所有进程共享的草稿纸）；
+ *        · 落在 workspace 内、**非递归**、basename 命中本机临时产物形态 ⇒ **放行**
+ *          （`.tmp-*` / `tmp-*` / `out-*` / `_verify*` / `_probe*` / `*.log|.tgz|.tmp|.bak`）；
+ *        · `-Recurse` 且目标在 workspace 内 ⇒ **拦**（那是源码树，删错了不可逆）；
+ *        · 落在系统目录 / 任何允许根之外 ⇒ **拦**；
+ *        · 目标解析不出来（含 `..` 上溯段、未定义变量、空目标、多语句、逗号粘连的
+ *          多路径、引号外元字符）⇒ **拦**（fail-closed）。
+ *
+ * ⚠️ 两条放行分支**不**看命令里有没有 `-ErrorAction`、有没有变量、有没有 `throw` 守卫 ——
+ * 那些都能被绕，而且 `throw` 与「这次删除是否真的被限制在一个文件上」毫无因果关系。
+ * 判据只看**解析后的目标**；解析不出来就回落成拦（fail-closed）。
+ *
+ * 三种决定各有一条可 grep 的 info 日志，见 `targetDecisionLine()`：
+ *
+ *     MULTITASK-APPROVAL-TARGET-EXEMPT      按目标判据放行（`branch=` 说明命中哪一档）
+ *     MULTITASK-APPROVAL-TARGET-BLOCKED     目标确实危险 ⇒ 照问（`reason=` 说明哪一类）
+ *     MULTITASK-APPROVAL-TARGET-FAIL-CLOSED 目标解析失败 ⇒ 回落成拦截（fail-closed）
+ *
  * ── C1-b 覆盖范围：连 PTC 程序**内部**的调用也过这里（比预期更好）────────────
  *
  * `run_code` 的 PTC 桥在派发子调用时构造的输入是
@@ -160,6 +203,9 @@
  *
  *     MULTITASK-APPROVAL-GATE-ENGAGED     策略已放开、闸门已就位
  *     MULTITASK-APPROVAL-GATE-SKIPPED     跳过了（reason=… 说明为什么）
+ *     MULTITASK-APPROVAL-TARGET-EXEMPT     按**解析后的目标**放行（branch=read-only|temp-root|workspace-scratch）
+ *     MULTITASK-APPROVAL-TARGET-BLOCKED    目标解析出来了、且确实危险 ⇒ 照问（reason=…）
+ *     MULTITASK-APPROVAL-TARGET-FAIL-CLOSED 目标解析失败 ⇒ 回落成拦截（fail-closed，reason=…）
  *     MULTITASK-APPROVAL-ASK              第一级判定为危险，向用户发起审批
  *     MULTITASK-APPROVAL-RELAYED          第二级把子代理请求转呈给了父会话
  *     MULTITASK-APPROVAL-RELAY-FAILED     转呈失败（reason=…），已退回原路径
@@ -637,19 +683,246 @@ function compilePatterns(entries, warn) {
   return out
 }
 
+// ── 第一层：只读豁免 ──────────────────────────────────────────────────────────
+
+/**
+ * 纯只读命令的**命令名**（全小写）。
+ *
+ * ── 为什么要单开一层，而不是给正则表打补丁 ──────────────────────────────────
+ *
+ * 实测误拦：`Get-Content app.log | Select-String 'shutdown'` 被判成 `power-state`，
+ * 只因为它**提到**了 `shutdown` 这个词 —— 而那正是一次日志审计要做的事。同类还有
+ * `Select-String 'Remove-Item -Recurse -Force'`（命中 `remove-item-force`）。
+ * 这类误拦没法靠「把正则写窄一点」解决：词是同一个词，区别在于**它出现在哪里**
+ * （命令位 vs 数据里），而那要求判据知道命令的结构 —— 于是它必须有独立的一层。
+ *
+ * ── 判据是什么 ──────────────────────────────────────────────────────────────
+ *
+ * 「整条命令里**没有任何变更类调用**」：按引号之外的 `|` / `;` / `&` / 换行切成语句段，
+ * 每一段的**命令名**都必须在下面这张登记表里（或命中只读名字形态）。任何一段认不出来
+ * ⇒ 不是只读（fail-closed）。引号外出现重定向 / 命令替换 / 逗号 / 圆括号 / 花括号 ⇒
+ * 不是只读（见 `SEGMENT_REJECT_CHARACTERS`：括号里的子表达式与脚本块**都会执行**）。
+ *
+ * ⚠️ 登记表刻意**短且保守**，两个已知的「故意不收」值得写下来：
+ *
+ *   · `ForEach-Object` / `%` / `Invoke-*`：它们的参数是脚本块，块里可以执行任意东西。
+ *     `Get-ChildItem | ForEach-Object { Remove-Item $_ }` 这种写法一整条都不许被豁免。
+ *   · `git`：`git -c core.pager=…` / `git -c core.fsmonitor=…` 能借配置执行任意命令，
+ *     `git --output=<file>` 会写文件。要在词法上把它们排除干净，就得再做一层与被替换掉的
+ *     「文本判据」同形的猜测 —— 那正是本次要去掉的东西。所以宁可让它落到第 ② 层
+ *     （`git log | Select-String shutdown` 会照问一次），也不在这里开一个真洞。
+ *
+ * 残留风险（已知并接受）：第三方模块自定义的 `Get-Foo` 若带副作用，会被这层放过；
+ * 后果等同于「没有本模块」（命令照旧在沙箱下执行），不是新增的放行能力。
+ */
+const READ_ONLY_COMMAND_NAMES = new Set([
+  // PowerShell 的对象类（`Get-*` / `Format-*` / `Convert*-*` 另有名字形态规则，见下）
+  'select-object',
+  'select-string',
+  'where-object',
+  'sort-object',
+  'group-object',
+  'measure-object',
+  'compare-object',
+  'format-table',
+  'format-list',
+  'format-wide',
+  'format-custom',
+  'format-hex',
+  'out-string',
+  'out-host',
+  'out-null',
+  'test-path',
+  'resolve-path',
+  'join-path',
+  'split-path',
+  'write-output',
+  'write-host',
+  'write-verbose',
+  'write-debug',
+  'write-warning',
+  'write-information',
+  'write-progress',
+  'echo',
+  // cmd / POSIX 的读取类（只收**不可能**改盘的那些）
+  'ls',
+  'dir',
+  'cat',
+  'type',
+  'head',
+  'tail',
+  'more',
+  'grep',
+  'egrep',
+  'fgrep',
+  'rg',
+  'findstr',
+  'wc',
+  'cut',
+  'tr',
+  'file',
+  'stat',
+  'diff',
+  'cmp',
+  'jq',
+  'tree',
+  'sort',
+  'uniq',
+  'pwd',
+  'whoami',
+  'hostname',
+  'uname',
+  'id',
+  'printenv',
+  'du',
+  'df',
+  'md5sum',
+  'sha1sum',
+  'sha256sum',
+])
+
+/**
+ * 只读命令的**名字形态**（PowerShell 的「动词-名词」约定里只有取用类）。
+ *
+ * ⚠️ `format-` 与 `measure-` 刻意**不在**前缀里，尽管它们大多是只读的：
+ *
+ *   · `Format-Volume` 是**格式化卷**（`format-volume` 那条内置模式的 PowerShell 形态）；
+ *     若放 `format-` 进前缀，`Format-Volume -DriveLetter D` 就会被判成只读，而那条内置
+ *     危险模式随即被跳过 —— 这是一次真实的漏判，不是理论风险。
+ *   · `Measure-Command` 会**真的执行**它的参数；把 `measure-` 当前缀等于给「执行」发豁免。
+ *
+ * 所以这两个动词只收**具体**安全的名字（在 `READ_ONLY_COMMAND_NAMES` 里逐个列），
+ * 而不是按前缀放行 —— 「前缀白名单必须窄到不可能包含写动词」是这个模块的红线。
+ */
+const READ_ONLY_COMMAND_PATTERN = /^(?:get|test|select|convertto|convertfrom|resolve|join|split)-[a-z0-9]+(?:-[a-z0-9]+)*$/
+
+/**
+ * 切段时收集的**拒绝清单元字符**（引号外出现任何一个 ⇒ 不再解析、直接判否）。
+ *
+ * 每一个都有实测或结构上的理由：
+ *
+ *   `>` `<`   重定向 —— 它本身就是一次写入（`echo hi > /etc/passwd`）。
+ *   `&`       串联与后台执行；`&&` / `||` 会把第二条命令藏进同一行。
+ *   `` ` ``   POSIX / PowerShell 的命令替换。
+ *   `,`       1.2.10 实测的 E3：`-LiteralPath "A","B"` 两个路径**无空格**粘成一个令牌，
+ *             前缀比较必然判「在根下」，整条命令借道放行。
+ *   `(` `)`   **子表达式会执行**：`Get-Content (Remove-Item -Force C:\Windows\x)` 的命令名
+ *             是只读的 `Get-Content`，而括号里的那条真的会跑。只读豁免一旦放过它，
+ *             就是给「只读外壳 + 变更内核」开一条稳定通道。
+ *   `{` `}`   **脚本块也会执行**：`Get-ChildItem | Where-Object { Remove-Item $_.FullName }`
+ *             同理。所以 `Where-Object { … }` 这种写法整条都不许被豁免（它落回文本模式，
+ *             `'a|sh'` 之类仍会被引号字面量豁免挡住，只是不再享受**整条只读**这一档）。
+ *
+ * 判否的代价只是「少一档豁免」（命令照旧按文本模式判，也照旧在沙箱下执行），
+ * 而放过的代价是一条真实的漏判 —— 方向是明确的。
+ */
+const SEGMENT_REJECT_CHARACTERS = new Set(['>', '<', '&', '`', ',', '(', ')', '{', '}'])
+
+/**
+ * 按**引号之外**的语句分隔符切段，并收集拒绝清单里的元字符。
+ *
+ * 引号内的 `|` / `;` / 逗号是**数据**（`Select-String -Pattern 'log|sh'`），不是分隔符 ——
+ * 这是本函数必须自己扫字符、而不能直接 `split(/\|/)` 的唯一理由。
+ *
+ * @param command - 命令文本。
+ * @returns `{ segments, rejected }`：语句段数组与「引号外出现过哪些拒绝字符」。
+ */
+function splitShellSegments(command) {
+  const segments = []
+  const rejected = []
+  let current = ''
+  let quote
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i]
+    if (quote !== undefined) {
+      current += ch
+      if (ch === quote) quote = undefined
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      current += ch
+      continue
+    }
+    if (SEGMENT_REJECT_CHARACTERS.has(ch)) {
+      if (!rejected.includes(ch)) rejected.push(ch)
+      current += ch
+      continue
+    }
+    if (ch === '|' || ch === ';' || ch === '\n' || ch === '\r') {
+      segments.push(current)
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  segments.push(current)
+  // 引号没闭合：不猜它想干什么。
+  if (quote !== undefined && !rejected.includes('unbalanced-quote')) rejected.push('unbalanced-quote')
+  return { segments, rejected }
+}
+
+/**
+ * 取一个语句段的**命令名**（全小写）。
+ *
+ * 跳过开头的分组符号（`(` / `{`），因为 `(Get-ChildItem x)` 与 `{ Get-Content y }` 里的
+ * 命令名一样是第一个词。空段（`Get-Content x;` 的尾段）返回 undefined。
+ *
+ * @param segment - 语句段。
+ * @returns 命令名，或 undefined。
+ */
+function commandNameOf(segment) {
+  const trimmed = String(segment).trim().replace(/^[({[]+/, '').trim()
+  if (trimmed === '') return undefined
+  const token = trimmed.split(/\s+/)[0].replace(/^["']|["']$/g, '')
+  if (token === '') return undefined
+  return token.toLowerCase()
+}
+
+/**
+ * 判定一条命令是不是**纯只读**（整条命令里没有任何变更类调用）。
+ *
+ * 纯函数、无副作用、不抛错 —— 可独立单测（这正是它被抽出来的理由）。
+ *
+ * @param command - 命令文本。
+ * @returns 纯只读时为 true。
+ */
+export function isReadOnlyCommand(command) {
+  if (typeof command !== 'string' || command.trim() === '') return false
+  const { segments, rejected } = splitShellSegments(command)
+  if (rejected.length > 0) return false
+  let sawCommand = false
+  for (const segment of segments) {
+    const name = commandNameOf(segment)
+    if (name === undefined) continue
+    sawCommand = true
+    if (READ_ONLY_COMMAND_NAMES.has(name)) continue
+    if (READ_ONLY_COMMAND_PATTERN.test(name)) continue
+    return false
+  }
+  return sawCommand
+}
+
 /**
  * 对一条 shell 命令做确定性危险判定。
  *
  * 纯函数、无副作用、不抛错 —— 这样可以脱离 DSH 运行时被测试与复用。
  * `SAFE_PATTERNS` 优先于危险表（它是误报出口）。
  *
+ * ⚠️ 判定顺序见文件头「三层判据」：**只读豁免先于**文本模式，而它只豁免**内置**模式
+ * （`BUILTIN_PATTERN_IDS`）。用户通过 `config.extraDangerPatterns` 加的模式不在那个集合里，
+ * 因此永远不会被本模块的降噪顺手关掉 —— 那是用户明确要求要问的东西。
+ *
  * @param command - 命令文本。
  * @param danger - 已编译的危险模式表。
  * @param safe - 已编译的放行模式表。
+ * @param options - `{ readOnlyExemption: false }` 可**关掉**只读豁免，仅供诊断/判别力测试
+ *   使用（用它才能证明「某条命令是被只读层放行的，而不是本来就不命中」）。
  * @returns 命中时的模式 id，否则 undefined。
  */
-export function classifyShellCommand(command, danger = DANGER_PATTERNS, safe = SAFE_PATTERNS) {
+export function classifyShellCommand(command, danger = DANGER_PATTERNS, safe = SAFE_PATTERNS, options = {}) {
   if (typeof command !== 'string' || command.trim() === '') return undefined
+  const readOnly = options?.readOnlyExemption === false ? false : isReadOnlyCommand(command)
   for (const { re } of safe) {
     try {
       if (re.test(command)) return undefined
@@ -659,6 +932,8 @@ export function classifyShellCommand(command, danger = DANGER_PATTERNS, safe = S
   }
   for (const { id, re } of danger) {
     try {
+      // 只读命令不再受**内置**模式约束（第一层）。
+      if (readOnly && BUILTIN_PATTERN_IDS.has(id)) continue
       if (!TEXTUAL_PATTERN_IDS.has(id)) {
         if (re.test(command)) return id
         continue
@@ -927,6 +1202,18 @@ function isQuotedDataLiteral(command, index) {
 const TEXTUAL_PATTERN_IDS = new Set(['pipe-to-shell', 'pipe-to-iex', 'invoke-expression'])
 
 /**
+ * **内置**危险模式的 id 集合 —— 只读豁免（第一层）的作用范围。
+ *
+ * 它是从 `DANGER_PATTERNS` 现算的，而不是再抄一遍：抄一份的话，往表里加一条新模式却忘了
+ * 往这里补，那条新模式就会**静默**变得不可被豁免（方向是安全的，但行为与文件头写的
+ * 「内置模式都可豁免」不一致，而这种不一致没人会发现）。
+ *
+ * ⚠️ 用户 `config.extraDangerPatterns` 的 id **不在**这里 —— 那些模式永远不会被只读豁免
+ * 放行，因为它们是用户明确要求要问的。
+ */
+const BUILTIN_PATTERN_IDS = new Set(DANGER_PATTERNS.map((entry) => entry.id))
+
+/**
  * 判断一个路径是否落在**允许根**之下（含根目录本身）。
  *
  * 只做词法比较，不碰文件系统 —— 与 `escapesWorkspace` 同一取向：不需要真的解析，
@@ -996,6 +1283,14 @@ const SHELL_METACHARACTERS = /[;|&`$><,\n\r]/
 /**
  * 判断一条**删除**命令是否只作用于允许根（默认是临时目录）。
  *
+ * ⚠️ **第一级不再调用它**（本次修复：判据改成 `judgeShellDeletionTargets` 的「解析后的
+ * 目标」）。保留它的理由有两条，都是硬的：① 它是**导出 API**，脱机脚本与外部使用者可能
+ * 在用；② T1–T9 用它钉住 `isUnderRoots` / 词法前缀比较那一层的性质 —— 那层仍然是新判据
+ * 的地基（新判据直接复用 `isUnderRoots` + `hasTraversalSegment`）。
+ *
+ * 它与新判据的**实质差别**：它是按**令牌长相**判的（含元字符就判否、只认绝对路径），
+ * 所以 `$env:TEMP\dsh-mut-x` 一律要问；新判据把那个令牌**解析成绝对路径**之后再判。
+ *
  * 判定刻意保守，四条缺一不可：
  *   1. 命令行里**没有** shell 元字符（管道、串联、重定向、变量展开、命令替换、逗号都不认）；
  *   2. 至少有一个**绝对路径**参数；
@@ -1047,26 +1342,490 @@ export function confinedToRoots(command, roots, caseInsensitive) {
   return paths.every((token) => isUnderRoots(token, roots, caseInsensitive))
 }
 
+// ── 第三层：按**解析后的目标**判定删除 ────────────────────────────────────────
+
+/**
+ * 命令由哪个解释器族执行 —— 决定「哪些引用能展开」。
+ *
+ * ── 为什么必须区分（这条不做区分就是一个真实的洞）────────────────────────────
+ *
+ * `$env:TEMP` 只在 PowerShell 里指向环境变量。在同一条命令交给 `bash` 时，`$env` 是一个
+ * （通常空的）shell 变量、`$env:TEMP` 实际展开成 `:TEMP`，而 `%TEMP%` 在 bash / pwsh 里
+ * **根本不会展开**。若一律按 PowerShell 语义展开，`bash` 侧一条
+ * `rm -rf %TEMP%/x` 就会被算成「在临时目录里」而放行 —— 而它真正删的是当前目录下一个
+ * 名字就叫 `%TEMP%` 的路径。判据必须按**真正会执行它的那个解释器**来展开，展不开就判否。
+ *
+ * @param toolName - 工具名（`pwsh` / `bash` / 用户追加的）。
+ * @returns `'powershell'` / `'posix'` / `'unknown'`。
+ */
+function shellFamilyOf(toolName) {
+  const name = typeof toolName === 'string' ? toolName.toLowerCase() : ''
+  if (name === '') return 'unknown'
+  if (name.includes('pwsh') || name.includes('powershell')) return 'powershell'
+  if (/(?:^|[-_.\\/])(?:ba|z|k|da)?sh$/.test(name)) return 'posix'
+  return 'unknown'
+}
+
+/**
+ * 取本机家目录（不 import `node:os`，见 `defaultTempRoots` 里同一条约定）。
+ *
+ * @returns 家目录，或 undefined。
+ */
+function homeDirectory() {
+  for (const key of ['USERPROFILE', 'HOME']) {
+    const value = process.env[key]
+    if (typeof value === 'string' && value.trim() !== '') return value
+  }
+  return undefined
+}
+
+/**
+ * 展开一个路径令牌里**可以确定**的引用。
+ *
+ * 支持且只支持三种（其余一律判否，见下）：
+ *   - PowerShell 族：`$env:NAME` / `${env:NAME}`
+ *   - POSIX 族：`$NAME` / `${NAME}`
+ *   - 两族都支持：前导 `~`
+ *
+ * ⚠️ 刻意**不**支持 `%NAME%`（cmd 语法）与裸 `$VAR` 在 PowerShell 里的展开：它们在不同
+ * 解释器里含义不同，认错一次就等于「按错误的路径判放行」。而认不出时判否的代价只是多问
+ * 一次 —— 方向是对的。
+ *
+ * @param text - 路径令牌原文。
+ * @param family - `shellFamilyOf()` 的结果。
+ * @returns `{ ok, value }`：`ok` 为 false 表示**展不开**（变量未定义 / 不认识的写法）。
+ */
+function expandPathReferences(text, family) {
+  const lookup = (key) => {
+    const value = process.env[key]
+    return typeof value === 'string' && value.trim() !== '' ? value : undefined
+  }
+  let out = text
+  if (family === 'powershell') {
+    out = out.replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/gi, (match, key) => lookup(key) ?? match)
+    out = out.replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (match, key) => lookup(key) ?? match)
+  } else if (family === 'posix') {
+    out = out.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, key) => lookup(key) ?? match)
+    out = out.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, key) => lookup(key) ?? match)
+  }
+  if (family !== 'unknown' && (out === '~' || out.startsWith('~/') || out.startsWith('~\\'))) {
+    const home = homeDirectory()
+    if (home !== undefined) out = `${home}${out.slice(1)}`
+  }
+  // 展开之后仍然带着引用记号 ⇒ 我们**不知道**它指向哪里。这是 fail-closed 的入口：
+  // `$p`（上一条语句赋值的变量）、`%TEMP%`（本族不展开）、未定义的环境变量全走这条。
+  if (/[$%`~]/.test(out)) return { ok: false, value: out }
+  return { ok: true, value: out }
+}
+
+/**
+ * 把一个语句段切成令牌，并记下每个令牌**是否含单引号**（单引号内不做引用展开）。
+ *
+ * 只有这个信息是判定需要的 —— 双引号里 `$env:TEMP` 仍会被 PowerShell 展开，单引号里
+ * 则是字面量。剥引号本身对路径比较没影响（`inspectPath` 会处理首尾引号），所以这里只记
+ * 「是不是字面量」。
+ *
+ * @param segment - 语句段。
+ * @returns `{ value, literal }` 数组；`""` 会保留成一个 value 为空的令牌（据此判「空目标」）。
+ */
+function tokenizeSegment(segment) {
+  const out = []
+  let current = ''
+  let quote
+  let literal = false
+  let sawQuote = false
+  const flush = () => {
+    if (current !== '' || sawQuote) out.push({ value: current, literal })
+    current = ''
+    literal = false
+    sawQuote = false
+  }
+  for (let i = 0; i < segment.length; i += 1) {
+    const ch = segment[i]
+    if (quote !== undefined) {
+      if (ch === quote) {
+        quote = undefined
+        continue
+      }
+      current += ch
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      sawQuote = true
+      if (ch === "'") literal = true
+      continue
+    }
+    if (/\s/.test(ch)) {
+      flush()
+      continue
+    }
+    current += ch
+  }
+  flush()
+  return out
+}
+
+/** 递归删除的开关形态（PowerShell `-Recurse` / rm `-r|-rf|-fr` / cmd `/s`）。 */
+const RECURSIVE_FLAG = /^(?:-(?:r|rf|fr|rec|recur|recurse|recursive)|--recursive|\/s)$/i
+
+/** cmd 风格的短开关（`/s` / `/q`）—— 不是路径，但也不能当路径判否。 */
+const CMD_SWITCH = /^\/[A-Za-z]$/
+
+/**
+ * 本机临时产物的 basename 形态 —— workspace 内那一档放行的判据。
+ *
+ * 选取依据是**本仓库自己**与同类工作流真正会留下的中间产物：`.tmp-asar-read.mjs`、
+ * `.tmp-rc1.txt`、`_probe-guard-fanout.mjs`、`out-*.log`、`*.tgz`、`*.bak`。它们都能重建，
+ * 删错的代价是重跑一次命令；而给它们每一条都弹一次卡，代价是用户开始闭眼点允许。
+ *
+ * ⚠️ 这张表**只对非递归删除**生效（递归的那条由 workspace 判据直接拦死），所以它不需要
+ * 关心「这个 basename 其实是目录」——非递归 `Remove-Item -Force` 删不掉非空目录。
+ *
+ * @param basename - 目标的最后一段。
+ * @returns 命中本机临时产物形态时为 true。
+ */
+export function isScratchArtifactName(basename) {
+  if (typeof basename !== 'string' || basename === '') return false
+  const name = basename.toLowerCase()
+  for (const prefix of ['.tmp-', 'tmp-', 'out-', '_verify', '_probe']) {
+    if (name.startsWith(prefix)) return true
+  }
+  for (const suffix of ['.log', '.tgz', '.tmp', '.bak']) {
+    if (name.endsWith(suffix)) return true
+  }
+  return false
+}
+
+/**
+ * 「像凭据/密钥」的 basename —— 即使它同时长得像临时产物也**不**放行。
+ *
+ * 这一条堵的是「豁免被借道」里最讨巧的一种：把私钥存成 `out-key.pem` 或 `_verify-env`，
+ * 它就会同时命中临时产物形态。豁免只该覆盖「能重建的中间产物」，凭据永远不属于那一类。
+ *
+ * @param basename - 目标的最后一段。
+ * @returns 像凭据时为 true。
+ */
+export function isSensitiveBasename(basename) {
+  if (typeof basename !== 'string' || basename === '') return false
+  if (/\.(?:pem|key|pfx|p12|kdbx|p8)$/i.test(basename)) return true
+  return /(?:^|[._-])(?:env|id_rsa|id_dsa|id_ecdsa|id_ed25519|credentials?|secrets?|passwd|password|token|apikey|api_key)(?:[._-]|$)/i.test(
+    basename,
+  )
+}
+
+/**
+ * 取规范化路径的最后一段。
+ *
+ * @param normalized - 已把 `\` 换成 `/` 的路径。
+ * @returns 最后一段（可能是空串）。
+ */
+function basenameOf(normalized) {
+  const trimmed = String(normalized).replace(/\/+$/, '')
+  const parts = trimmed.split('/')
+  return parts.length === 0 ? '' : parts[parts.length - 1]
+}
+
+/**
+ * 是否**严格**落在某个允许根**之下**（不含根目录本身）。
+ *
+ * 比 `isUnderRoots` 多一条：允许根本身不算。删掉整个临时根（`rm -rf $env:TEMP`）会连带
+ * 抹掉别的进程正在用的草稿，它不属于「清理自己的临时文件」；而 `isUnderRoots` 为了
+ * `write` 那一档必须包含根本身（往 `%TEMP%` 直接写文件是正常操作）。
+ *
+ * @param target - 目标路径。
+ * @param roots - 已规范化的允许根。
+ * @param caseInsensitive - 是否大小写不敏感。
+ * @returns 严格在根下时为 true。
+ */
+function isStrictlyUnderRoots(target, roots, caseInsensitive) {
+  if (!isUnderRoots(target, roots, caseInsensitive)) return false
+  const fold = (text) => (caseInsensitive ? text.toLowerCase() : text)
+  const normalized = fold(inspectPath(target).normalized).replace(/\/+$/, '')
+  for (const root of roots) {
+    if (fold(String(root)).replace(/\/+$/, '') === normalized) return false
+  }
+  return true
+}
+
+/**
+ * 把一条删除命令的路径令牌解析成**绝对目标**。
+ *
+ * 纯函数、无副作用、不抛错。失败时返回 `{ ok: false, reason }`，由调用方 fail-closed ——
+ * **判不出来就不许放行**，这是本层的核心取向。
+ *
+ * 每种失败都有自己的 `reason`（它就是 info 日志里的那个字段，也是排查「为什么又问了」的
+ * 唯一入口）：
+ *
+ *     no-command            没有命令文本
+ *     no-command-name       语句段里认不出命令名
+ *     multi-statement       不止一条语句（`a; b`、`a | b`）—— 目标不再唯一
+ *     unsafe-syntax         引号外出现了重定向 / `$(` / 反引号 / `&` / 逗号 / 引号未闭合
+ *     unresolved-reference  路径里有展不开的引用（未定义变量、单引号里的 `$env:…`）
+ *     empty-target          目标为空字符串
+ *     traversal             路径含 `..` 段（纯词法前缀比较挡不住它，见 `isUnderRoots`）
+ *     no-cwd                相对路径但没有工作目录可挂靠
+ *     no-target             一条路径令牌都没有（`Remove-Item -Force`）
+ *
+ * @param command - 命令文本。
+ * @param options - `{ cwd, shell, tempRoots, caseInsensitive }`（只有 `cwd` / `shell` 参与解析）。
+ * @returns `{ ok, reason, targets, recursive }`。
+ */
+export function resolveShellTargets(command, options) {
+  const fail = (reason, targets = [], recursive = false) => ({ ok: false, reason, targets, recursive })
+  if (typeof command !== 'string' || command.trim() === '') return fail('no-command')
+
+  const { segments, rejected } = splitShellSegments(command)
+  if (rejected.length > 0) return fail('unsafe-syntax')
+
+  const live = segments.filter((segment) => commandNameOf(segment) !== undefined)
+  if (live.length === 0) return fail('no-command-name')
+  if (live.length > 1) return fail('multi-statement')
+
+  const tokens = tokenizeSegment(live[0])
+  if (tokens.length === 0) return fail('no-command-name')
+
+  const family = shellFamilyOf(options?.shell)
+  const cwd = inspectPath(options?.cwd).normalized.replace(/\/+$/, '')
+  const targets = []
+  let recursive = false
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]
+    // 第 0 个是命令名本身（`Remove-Item` / `rm`），不是它的参数。
+    if (index === 0) continue
+    const raw = token.value
+    if (raw === '') return fail('empty-target', targets, recursive)
+    if (CMD_SWITCH.test(raw)) {
+      if (RECURSIVE_FLAG.test(raw)) recursive = true
+      continue
+    }
+    if (raw.startsWith('-')) {
+      if (RECURSIVE_FLAG.test(raw)) recursive = true
+      continue
+    }
+    // `-ErrorAction Continue` 这类纯枚举值不是路径。
+    if (OPTION_VALUE_KEYWORDS.has(raw.toLowerCase())) continue
+
+    const expanded = token.literal ? { ok: !/[$%`~]/.test(raw), value: raw } : expandPathReferences(raw, family)
+    if (!expanded.ok) return fail('unresolved-reference', targets, recursive)
+
+    const inspected = inspectPath(expanded.value)
+    if (inspected.normalized === '') return fail('empty-target', targets, recursive)
+    if (hasTraversalSegment(inspected.normalized)) return fail('traversal', targets, recursive)
+
+    let normalized
+    if (inspected.absolute) {
+      normalized = collapseSegments(inspected.normalized)
+    } else {
+      if (cwd === '') return fail('no-cwd', targets, recursive)
+      normalized = collapseSegments(`${cwd}/${inspected.normalized}`)
+    }
+    if (hasTraversalSegment(normalized)) return fail('traversal', targets, recursive)
+    targets.push(normalized)
+  }
+
+  if (targets.length === 0) return fail('no-target', targets, recursive)
+  return { ok: true, reason: undefined, targets, recursive }
+}
+
+/**
+ * 按**解析后的目标**判定一条删除命令要不要放行（第三层判据）。
+ *
+ * 纯函数、无副作用、不抛错 —— 可独立单测。返回三态，而不是一个布尔：
+ *
+ *     { exempt: true,  failClosed: false, branches: ['temp-root'], … }       放行
+ *     { exempt: false, failClosed: false, reason: 'recursive-in-workspace' } 照问（目标危险）
+ *     { exempt: false, failClosed: true,  reason: 'unresolved-reference' }   照问（解析失败）
+ *
+ * 三态是必须的：前两者在调用方看来都是「要问」，但**为什么问**完全不同 —— 前者说明判据
+ * 工作正常且目标确实危险，后者说明判据没能完成工作（fail-closed 兜住了）。日志要能分开。
+ *
+ * ── 放行分支（逐条目标判定，任何一个目标不合格就整体不放行）──────────────────
+ *
+ *   ① 严格落在 `tempRoots` 之下 ⇒ `temp-root`。**递归也放行**：临时目录是共享草稿纸，
+ *      `Remove-Item -Recurse -Force $env:TEMP\dsh-mut-x` 是实测被误拦的形态，而它与
+ *      `rm -rf /tmp/x` 在旧判据 `confinedToRoots` 里本来就是放行的（见 T1 / T9）。
+ *   ② 落在 workspace 内 + **非递归** + basename 像本机临时产物 + 不像凭据 ⇒ `workspace-scratch`。
+ *
+ * ── 拦截分支 ────────────────────────────────────────────────────────────────
+ *
+ *   · `-Recurse` 且目标在 workspace 内 ⇒ `recursive-in-workspace`（源码树，删错不可逆）；
+ *   · 目标在 workspace 之外且不在任何临时根下 ⇒ `outside-roots`（系统目录、家目录、根）；
+ *   · basename 像凭据 ⇒ `sensitive-name`（不允许借「临时产物」的形态放过私钥）；
+ *   · 其它 workspace 内的非递归删除 ⇒ `workspace-not-scratch`（源码 / 配置文件的普通删除）。
+ *
+ * @param command - 命令文本。
+ * @param options - `{ cwd, tempRoots, caseInsensitive, shell }`。
+ * @returns 见上。
+ */
+export function judgeShellDeletionTargets(command, options) {
+  const tempRoots = Array.isArray(options?.tempRoots) ? options.tempRoots : []
+  const caseInsensitive = options?.caseInsensitive === true
+  const cwd = options?.cwd
+  const resolution = resolveShellTargets(command, options)
+  const recursive = resolution.recursive === true
+
+  if (resolution.ok !== true) {
+    return {
+      exempt: false,
+      failClosed: true,
+      reason: typeof resolution.reason === 'string' ? resolution.reason : 'unresolved',
+      branches: [],
+      targets: resolution.targets,
+      recursive,
+    }
+  }
+
+  const branches = []
+  let blocker
+  for (const target of resolution.targets) {
+    if (isStrictlyUnderRoots(target, tempRoots, caseInsensitive)) {
+      if (!branches.includes('temp-root')) branches.push('temp-root')
+      continue
+    }
+    if (escapesWorkspace(target, cwd, caseInsensitive)) {
+      if (blocker === undefined) blocker = 'outside-roots'
+      continue
+    }
+    // 到了这里：目标在 workspace 内。
+    if (recursive) {
+      if (blocker === undefined) blocker = 'recursive-in-workspace'
+      continue
+    }
+    const basename = basenameOf(inspectPath(target).normalized)
+    if (isSensitiveBasename(basename)) {
+      if (blocker === undefined) blocker = 'sensitive-name'
+      continue
+    }
+    if (!isScratchArtifactName(basename)) {
+      if (blocker === undefined) blocker = 'workspace-not-scratch'
+      continue
+    }
+    if (!branches.includes('workspace-scratch')) branches.push('workspace-scratch')
+  }
+
+  if (blocker !== undefined) {
+    return { exempt: false, failClosed: false, reason: blocker, branches, targets: resolution.targets, recursive }
+  }
+  if (branches.length === 0) {
+    return { exempt: false, failClosed: true, reason: 'no-target', branches, targets: resolution.targets, recursive }
+  }
+  return { exempt: true, failClosed: false, reason: undefined, branches, targets: resolution.targets, recursive }
+}
+
+/**
+ * 把一次「按目标判定」的结果拼成一行可 grep 的 info 日志。
+ *
+ * 抽成纯函数是为了让它**可被断言**：日志文案是这套判据唯一的可观测面，而
+ * 「放行为什么放行 / 拦为什么拦」如果只写在注释里，下次改动时没人能凭日志核对。
+ * `apply` 里只做一件事：`ctx.logger.info(targetDecisionLine(decision))`。
+ *
+ * @param decision - `classifyExecution` 里组装的 `{ kind, branch, reason, tool, pattern, targets }`。
+ * @returns 日志行；输入不可用时为空串（调用方据此跳过）。
+ */
+export function targetDecisionLine(decision) {
+  if (decision === null || typeof decision !== 'object') return ''
+  const tool = typeof decision.tool === 'string' ? JSON.stringify(decision.tool) : '"?"'
+  const pattern = typeof decision.pattern === 'string' ? ` pattern=${decision.pattern}` : ''
+  const targets =
+    Array.isArray(decision.targets) && decision.targets.length > 0
+      ? ` targets=${decision.targets.map((entry) => JSON.stringify(entry)).join(',')}`
+      : ''
+  if (decision.kind === 'exempt') {
+    return (
+      `dsh-multitask: MULTITASK-APPROVAL-TARGET-EXEMPT branch=${String(decision.branch ?? 'unknown')}` +
+      ` tool=${tool}${pattern}${targets} — released because of the resolved target(s), not the command text`
+    )
+  }
+  if (decision.kind === 'fail-closed') {
+    return (
+      `dsh-multitask: MULTITASK-APPROVAL-TARGET-FAIL-CLOSED reason=${String(decision.reason ?? 'unknown')}` +
+      ` tool=${tool}${pattern}${targets} — the targets could not be resolved, so the ask is kept (fail-closed)`
+    )
+  }
+  return (
+    `dsh-multitask: MULTITASK-APPROVAL-TARGET-BLOCKED reason=${String(decision.reason ?? 'unknown')}` +
+    ` tool=${tool}${pattern}${targets} — the resolved target(s) are genuinely destructive`
+  )
+}
+
 /**
  * 判定一次工具调用是否需要征求用户同意（第一级闸门）。
  *
+ * ── 三层判据与它们的日志（本次修复）─────────────────────────────────────────
+ *
+ * 顺序见文件头：**只读豁免 → 文本模式 → 目标判据**。这里只做编排，三个判据本身都是
+ * 独立的纯函数（`isReadOnlyCommand` / `classifyShellCommand` / `judgeShellDeletionTargets`），
+ * 可以各自单测，不必构造整个工具调用。
+ *
+ * `options.note` 是可选的**日志回调**（`apply` 里接到 `ctx.logger.info`）：纯函数不该
+ * 自己写日志，而「为什么这一次没问 / 为什么还是问了」必须可 grep —— 所以由调用方注入。
+ *
  * @param exec - 工具执行输入（含 `name` / `arguments`）。
- * @param options - 编译好的模式表、工具名集合、工作区信息与允许根。
+ * @param options - 编译好的模式表、工具名集合、工作区信息、允许根，以及可选的 `note`。
  * @returns 命中时的描述，否则 undefined。
  */
 export function classifyExecution(exec, options) {
   const toolName = exec?.name
   if (typeof toolName !== 'string' || toolName === '') return undefined
   const tempRoots = Array.isArray(options?.tempRoots) ? options.tempRoots : []
+  const note = typeof options?.note === 'function' ? options.note : undefined
 
   if (options.shellTools.has(toolName)) {
     const command = stringArg(exec, 'command')
     const hit = classifyShellCommand(command, options.danger, options.safe)
-    if (hit === undefined) return undefined
-    // 删除类命令：只有当它**只**碰允许根（临时目录）时才算清理，不打扰用户。
-    if (DELETION_PATTERN_IDS.has(hit) && confinedToRoots(command, tempRoots, options.caseInsensitive)) {
+
+    if (hit === undefined) {
+      // 走到这里只可能是两种情形：「本来就没有模式命中」与「只读豁免挡掉了命中」。
+      // 只有后者值得记一条 info —— 前者每次只读调用都记，日志会被淹没。
+      // 判别方法：关掉只读豁免再判一次，仍然不命中就说明本来就没事。
+      if (isReadOnlyCommand(command)) {
+        const textual = classifyShellCommand(command, options.danger, options.safe, { readOnlyExemption: false })
+        if (textual !== undefined) {
+          note?.({
+            kind: 'exempt',
+            branch: 'read-only',
+            tool: toolName,
+            pattern: textual,
+            targets: [],
+          })
+        }
+      }
       return undefined
     }
+
+    // ── 目标判据：只对删除类模式生效（其它危险动作与文件目标无关，见文件头 ②）──
+    if (DELETION_PATTERN_IDS.has(hit)) {
+      const verdict = judgeShellDeletionTargets(command, {
+        cwd: options.cwd,
+        tempRoots,
+        caseInsensitive: options.caseInsensitive,
+        shell: toolName,
+      })
+      if (verdict.exempt) {
+        // 按**解析后的目标**放行（不是按命令文本放行）—— 这是本次要做的降噪。
+        note?.({
+          kind: 'exempt',
+          branch: verdict.branches.length === 0 ? 'unknown' : verdict.branches.join('+'),
+          tool: toolName,
+          pattern: hit,
+          targets: verdict.targets,
+          recursive: verdict.recursive === true,
+        })
+        return undefined
+      }
+      // 解析失败 ⇒ 回落成拦截（fail-closed）；解析成功但目标危险 ⇒ 照问。两者都要留痕。
+      note?.({
+        kind: verdict.failClosed ? 'fail-closed' : 'blocked',
+        reason: verdict.reason,
+        tool: toolName,
+        pattern: hit,
+        targets: verdict.targets,
+        recursive: verdict.recursive === true,
+      })
+    }
+
     return { kind: 'shell', pattern: hit, command }
   }
 
@@ -1591,6 +2350,33 @@ export function apply(ctx, config) {
   // **不** prepend：先让上游的策略（若有）表态，只在它说 `allow` 时把结果**升级**为
   // `ask`。这样本模块永远不会覆盖别人的拒绝，也不会与它们抢跑。
   if (config?.classify !== false) {
+    /**
+     * 把「按目标判定」的结果写进 info 日志（`classifyExecution` 通过 `note` 回调送过来）。
+     *
+     * ── 为什么这条日志是必须的，而不是装饰 ─────────────────────────────────────
+     *
+     * 本次修复把判据从「命令文本」换成了「解析后的目标」—— 它**不打扰用户**，也就是
+     * **没有任何界面反馈**。少了这行，就没有任何办法回答「这条命令为什么没弹卡」
+     * （用户唯一能看到的事实是「没弹」）。三个标记分工明确：
+     *
+     *     TARGET-EXEMPT     放行，`branch=` 说明命中哪一档（read-only / temp-root / …）
+     *     TARGET-BLOCKED    目标确实危险 ⇒ 照问，`reason=` 说明哪一类
+     *     TARGET-FAIL-CLOSED 解析失败 ⇒ 回落成拦截（fail-closed），`reason=` 说明卡在哪
+     *
+     * 日志用心跳无害的 info：它是「判据做了什么决定」的审计，不是错误。
+     *
+     * @param decision - `classifyExecution` 组装的判定描述。
+     */
+    const noteTargetDecision = (decision) => {
+      const line = targetDecisionLine(decision)
+      if (line === '') return
+      try {
+        ctx.logger?.info?.(line)
+      } catch {
+        // 与其它日志点同理：日志通道不可用不能反过来炸掉审批。
+      }
+    }
+
     ctx.on('tools/pre-execute', async (exec, next) => {
       const downstream = await next()
       try {
@@ -1627,7 +2413,16 @@ export function apply(ctx, config) {
         }
 
         const cwd = agent?.session?.header?.cwd
-        const hit = classifyExecution(exec, { shellTools, fileTools, danger, safe, cwd, caseInsensitive, tempRoots })
+        const hit = classifyExecution(exec, {
+          shellTools,
+          fileTools,
+          danger,
+          safe,
+          cwd,
+          caseInsensitive,
+          tempRoots,
+          note: noteTargetDecision,
+        })
         if (hit === undefined) return downstream
 
         const label = hit.kind === 'shell' ? hit.command : hit.filePath
