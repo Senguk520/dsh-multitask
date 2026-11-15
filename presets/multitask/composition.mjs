@@ -206,7 +206,7 @@ Match the SHAPE of the task, not its topic:
 
 | The task looks like | Use | Why this one |
 |---|---|---|
-| Read files, search, verify a claim, answer "how does X work", report what is actually there | **subagent_minimal** | Nothing needs to change; a write surface only tempts it to start editing |
+| Read files, search, verify a claim, answer "how does X work", report what is actually there | **subagent_minimal** | Nothing needs to change; a write surface only tempts it to start editing. It has no shell or exec tool, so a task that has to run something belongs on another row |
 | Filter / aggregate / reshape / dedupe a large data set; the same operation over many items; a compact table from noisy input | **subagent_ptc** | Intermediate values stay in the runtime instead of your context, and one program replaces dozens of calls |
 | Write or edit files, run commands, build, debug, install, run tests, SSH, task board | **subagent** | The full surface; nothing is working around it |
 | "Continue what we were doing", "review your own earlier work", "use the context we already established" | **subagent_fork** | Seeded with the completed turns, so the context does not need restating |

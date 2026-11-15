@@ -333,6 +333,8 @@ Authorisation is **one-shot every time**: "Allow once" authorises that call only
 
 **With a background dispatch whose turn has ended**, the first relay fails (it needs the parent session to have an open turn). The plugin then sends a message from that Subagent into the main conversation, naming which child session it is, what it wants to run, and where to answer — and **that message itself wakes the idle parent session**, so the plugin immediately retries the relay against the turn it just opened; if the parent session reads the message and ends its turn again, the relay keeps parking for the next one (at most 20 attempts, 10 minutes by default). In practice an ordinary approval card therefore appears in the main conversation within seconds; answer it there.
 
+**Cold start**: when the coordinator has already ended its turn, the first card does **not** appear immediately — it is parked until a turn opens, and your next message opens one, so the card lands right after it. That is the host's turn constraint (`approval.request()` throws outright while no turn is open), not this plugin giving up on the retry.
+
 Only if that window elapses with the parent session never opening a turn (**10 minutes** by default, at most **20** attempts) does the request fall back to the child session named in the message — then open it and decide there. **The message is not an approval** — the message channel carries no approval result, so reading it as a go-ahead would bypass the gate; until you answer, that call stays blocked. While an answer is pending — **including the whole time it is still parked** — the coordinator must not steer that worker: an interruption settles the pending approval as cancelled and throws the answer away.
 
 ### Which commands it stops for

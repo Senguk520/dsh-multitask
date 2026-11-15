@@ -3142,5 +3142,15 @@ export function apply(ctx, config) {
 /** 上游委派上下文里那句**与放开后的策略相矛盾**的原话（逐字，用来定位要改写的条目）。 */
 const APPROVAL_CLAIM = 'operations that require approval are rejected automatically'
 
-/** 替换文本：只说事实 —— 需要审批的调用**会**被路由给用户裁决。 */
-const RELAYED_CLAIM = 'operations that require approval are routed to the user for a decision, and a rejection is final for that call'
+/**
+ * 替换文本：只说事实，且**分三种情形**（桌面端实测表明，一句不带分支的话会被 worker 读错）。
+ *
+ *   ① 有应答者 ⇒ 转呈到父会话，由人批准后**放行**；
+ *   ② 没有应答者 / 转呈本身失败 ⇒ **fail-closed**，这次调用**不会得到放行**
+ *      （刻意不写「自动拒绝」：那会让 worker 以为已经有人否决了它）；
+ *   ③ 得到答复之前**一直阻塞** ⇒ 不要重试、不要换一条路做同一件事。
+ *
+ * 第 ③ 条是针对实测里最常见的错法：worker 以为被拒，于是绕道去达成同一效果。
+ * 结尾不带句号 —— 原文在 `APPROVAL_CLAIM` 之后本来就有一个句号。
+ */
+const RELAYED_CLAIM = 'operations that require approval are routed to the user through the parent conversation whenever an answerer is available (for example when a human is in the foreground), and the call runs only after a human allows it. With no answerer, or when the relay itself fails, the call is not allowed — it fails closed. Until an answer arrives that call stays blocked: do not retry it, do not reach the same effect by another route, and if the wait runs long, report it as awaiting a decision'

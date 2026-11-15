@@ -732,6 +732,8 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 交回下游，由上游按老样子处理，最坏结果是 fail-closed 的 `unavailable`，
 并记一条 `MULTITASK-APPROVAL-RELAY-FAILED`。**绝不**因为转呈不了就把一次拒绝变成放行。
 
+**冷启动是宿主侧限制。** 父会话没有打开的回合时（`turnOpen` 为假），宿主的 `approval.request()` 直接抛错，而开回合不是插件能做得到的事 —— 所以协调者已经结束回合时，第一张卡只会被 **park**，不会立刻出现。插件侧的上限因此只有一件事：**下一次开回合立刻重投**，卡会随用户的下一条消息出现，不会更早。
+
 ### 门控：只在交互式会话启用（红线）
 
 **父会话**的有效策略必须是 `ask`，否则本模块**一个字都不动**：

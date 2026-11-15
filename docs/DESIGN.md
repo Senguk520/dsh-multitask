@@ -492,6 +492,8 @@ With multi-level delegation (a subagent that delegated again), this module **wal
 
 **When the relay fails it falls back to the original path** (the parent session has no open turn right now, the parent session has ended, the service is missing…): hand it back downstream and let upstream handle it the old way, worst case a fail-closed `unavailable`, and log `MULTITASK-APPROVAL-RELAY-FAILED`. It **never** turns a rejection into an allow just because it could not relay.
 
+**Cold start is a host-side limitation.** The host's `approval.request()` throws outright while the parent session has no open turn (`turnOpen` is false), and opening a turn is not something a plugin can do — so when the coordinator has already ended its turn, the first card is **parked** instead of shown. This module's ceiling is exactly one thing: **re-deliver the moment the next turn opens**, which is why the card appears with the user's next message and never earlier.
+
 ### Gating: enabled only in interactive sessions (a red line)
 
 The **parent session's** effective policy must be `ask`, otherwise this module **does not move a single character**: the subagent stays at `never`, **byte-for-byte identical** to running without this module. Headless / unattended deployments rely on `never` to guarantee "never get hung waiting for an answer that never comes"; this module never installs `ask` into such an environment.
