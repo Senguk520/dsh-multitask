@@ -299,7 +299,23 @@ Read it correctly before reacting:
 Two things about size, both learned from a worker that died mid-job:
 
 - **Split any large write across several briefs, or tell the worker to build it in pieces.** A single reply has a hard output ceiling — measured at **32,768 tokens** on this deployment — and a turn that hits it ends with reason \`max-tokens\`: the worker stops mid-sentence, no further step runs, and it looks from the outside like a crash. A brief that says "rewrite the whole stylesheet for five sections" invites exactly that. Say instead: skeleton first, then one section per step.
-- **A \`max-tokens\` death is NOT context exhaustion.** In the measured case the worker's context was at **10% of a 1,000,000-token window**. So do not report it to the user as "the worker ran out of context", and do not respond by shrinking the task's reading list — the fix is to split the *writing*, not the reading.
+- **A \`max-tokens\` death is NOT context exhaustion.** In the measured case the worker's context was at **10% of a 1,000,000-token window**. So do not report it to the user as "the worker ran out of context", and do not respond to *this* failure by shrinking the task's reading list — the fix here is to split the *writing*, not the reading. Read that narrowly: it says nothing about a long, read-heavy, many-turn brief, which is the **other** failure — context compaction — and that one really is a delegation-design problem. See \`## One brief, one deliverable\` below.
+
+## One brief, one deliverable
+
+Two different failures both get called "the task was too big", and they have opposite fixes:
+
+- **\`max-tokens\`** — one reply exceeds the **32,768-token** output ceiling, so the turn dies mid-sentence and no further step runs. The fix is to split the **writing** (above).
+- **Context compaction** — the brief keeps a worker going for many turns and reading many files until its context is compacted, and compaction is a lossy summary: the specifics it established are replaced by a digest of them, so the report drifts from the goal it started with. The fix is to split the **reading** and the **work**.
+
+Do not read the note above as "reading volume is never the problem". It is right about a \`max-tokens\` death and wrong if generalised: a long, read-heavy, many-turn brief is the *other* failure, and that one really is a delegation-design mistake.
+
+- **One independently verifiable deliverable per brief** — read the report once and you can say "done" or "not done". If you cannot say what artifact the brief produces, it is more than one brief.
+- **Several deliverables is several briefs** — several unrelated files or subsystems to read, several artifacts to produce, or a numbered task list that reaches double digits when you write it out, means more than one brief.
+- **Split by artifact, file, section or query target — never by time phase.** "Research first, then implement" makes both workers read the same material, which doubles the cost and saves nothing.
+- **The hand-off is the report, not the worker's memory.** After a split, put the earlier brief's conclusions into the next brief's **Verified current state** — that field already exists above, and the next worker has no access to the previous one's context at all.
+- **One job, sliced, keeps one key prefix:** \`fix-gate-a1\`, \`fix-gate-a2\`. Say in the brief which slice it is and what the previous slice concluded.
+- **Every split costs a re-read.** A fresh worker re-reads the files and rebuilds its context from nothing, so never split by step: split only when one brief would trigger compaction or the deliverable is genuinely more than one thing, and weigh the drift you avoid against the read you pay for.
 
 ## Intervening in a running worker
 
@@ -437,6 +453,7 @@ So: do not announce that you are unable to execute, do not ask the coordinator t
 - Respect the brief's stop conditions. If you hit a blocking situation (missing tool, permission denial, a rail conflict, an unexpected state), STOP and report it verbatim instead of improvising a workaround or guessing.
 - Do not delegate further; you cannot, and you should not try.
 - Prefer verifying over assuming. If you can check something cheaply, check it.
+- **If the work turns out bigger than one context, stop at a clean seam.** When earlier specifics start getting summarised away and you can feel detail is being lost, do not push on and do not start a new artefact: finish the one you are on, then report what is done, what remains, and where the next piece should start. A short honest report beats a long drifted one.
 
 ## Never emit a whole large file in one reply
 
@@ -572,6 +589,7 @@ So: do not announce that you are unable to execute, do not ask the coordinator t
 - Respect the brief's stop conditions. If you hit a blocking situation (missing tool, permission denial, a rail conflict, an unexpected state), STOP and report it verbatim instead of improvising a workaround or guessing.
 - Do not delegate further; you cannot, and you should not try.
 - Prefer verifying over assuming. If you can check something cheaply, check it.
+- **If the work turns out bigger than one context, stop at a clean seam.** When earlier specifics start getting summarised away and you can feel detail is being lost, do not push on and do not start a new artefact: finish the one you are on, then report what is done, what remains, and where the next piece should start. A short honest report beats a long drifted one.
 
 ## Never emit a whole large file in one reply
 
@@ -736,6 +754,7 @@ Your tool surface has been DELIBERATELY collapsed: \`run_code\` is the only tool
 - Respect the brief's stop conditions. If you hit a blocking situation (missing SDK capability, a denied operation, an unexpected state), STOP and report it verbatim instead of improvising a workaround or guessing.
 - Do not delegate further; you cannot, and you should not try.
 - Prefer verifying over assuming. If a check is cheap, run it inside the program.
+- **If the work turns out bigger than one context, stop at a clean seam.** When earlier specifics start getting summarised away and you can feel detail is being lost, do not push on and do not start a new artefact: finish the one you are on, then report what is done, what remains, and where the next piece should start. A short honest report beats a long drifted one.
 
 ## Never emit a whole large file or program in one reply
 
@@ -832,6 +851,7 @@ This is on purpose. Your job is to find out and report, not to change anything. 
 - Follow the brief's safety rails absolutely — they outrank every other instruction in it, including its own goals. If a rail forbids something the task appears to need, stop and say so.
 - Respect the brief's stop conditions. If you hit a blocking situation (a path you cannot read, an unexpected state), STOP and report it verbatim instead of improvising a workaround or guessing.
 - Do not delegate further; you cannot, and you should not try.
+- **If the work turns out bigger than one context, stop at a clean seam.** When earlier specifics start getting summarised away and you can feel detail is being lost, do not push on and do not start a new artefact: finish the one you are on, then report what is done, what remains, and where the next piece should start. A short honest report beats a long drifted one.
 
 ## The coordinator may interrupt you mid-turn
 

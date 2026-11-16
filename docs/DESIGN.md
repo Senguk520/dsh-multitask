@@ -1016,13 +1016,33 @@ A worker that hits the output ceiling looks like a crash from the outside: the t
 - Handle it as "context exhaustion" → shorten the reading list. **Ineffective**: reading files accounts for only a small slice of that ten percent.
 - Handle it as "the output ceiling" → split the **writes**. **Effective**: the trouble came from one reply spitting out a hundred thousand characters.
 
+Read that second bullet narrowly, though: it says what to do about a `max-tokens` death, and it does **not** say that a brief's reading volume is never a problem. A long, read-heavy, many-turn brief fails the other way — see the next section.
+
 **Where it lands**:
 
 - The three personas that **can write files** (`WORKER_PERSONA` / `FORK_PERSONA` / `PTC_WORKER_PERSONA`) each have a section **`## Never emit a whole large file in one reply`** that states the ceiling number, the name of the `max-tokens` finish reason, and four executable practices: keep one write within 400–500 lines; write a skeleton first and then `edit` in pieces; after a truncation continue **from the tail** rather than starting over; and settle the split points before starting work.
 - **`MINIMAL_WORKER_PERSONA` deliberately omits this section**: it is a read-only worker with no landing point it can act on, and one more rule would only dilute its real constraint (cannot read it, say you cannot read it).
-- On **the coordinator** side there are two: task briefs must be **split by write volume** ("redo the whole stylesheet across five sections" is several jobs in itself), and **`max-tokens` must not be reported as context exhaustion**.
+- On **the coordinator** side this fact adds two: task briefs must be **split by write volume** ("redo the whole stylesheet across five sections" is several jobs in itself), and **`max-tokens` must not be reported as context exhaustion**. Neither is a rule about reading volume — that is the next section's subject.
 
 > Why this cannot be written only as "try not to write too much at once": a soft suggestion does not take effect at 30,000 tokens. Give the number, give the name of the finish reason, give the concrete action "continue from the tail", and only then does the model have a landing point it can decide on — the same stance as this bundle's other guards.
+
+### A fourth fact: a long brief loses detail in a different way
+
+The section above ends with "split the writing, not the reading", and for the failure it describes — one reply over the output ceiling — that is right. It is easy to generalise it into "reading volume is never the problem", which is false. Two failures live here, and they differ in what they cost and in what actually fixes them:
+
+- **`max-tokens`** — one reply exceeds the output ceiling (32,768 on this machine), the turn ends mid-sentence, and nothing after it runs. Loud, terminal, bounded to a single turn. Fix: split the **writing**.
+- **Context compaction** — a brief that is long, read-heavy and many-turn carries the worker's context past the compaction threshold, and the agent plane replaces the specifics with a summary of them. Nothing ends, no error is raised, the worker keeps working — but the report is now written against the summary instead of against the task, so the goal drifts silently. Fix: split the **reading** and the **work**.
+
+**The criteria that make it decidable** (coordinator persona, `## One brief, one deliverable`):
+
+- **One independently verifiable deliverable per brief** — a single read of the report settles "done" or "not done", and not being able to name the artifact is itself the answer.
+- **Three hard triggers:** several unrelated files or subsystems to read; several artifacts to produce; a numbered task list that reaches double digits when written out.
+- **Split by artifact, file, section or query target — never by time phase**, because a phase split makes both workers read the same material, which doubles the cost and saves nothing.
+- **The report carries the state** — the previous slice's conclusions become the next brief's `Verified current state`, since the next worker has none of the previous one's context.
+- **One sliced job keeps one key prefix** (`fix-gate-a1` / `fix-gate-a2`), with the slice number and the previous slice's conclusion stated in the brief.
+- **The reverse cost is real** — a fresh worker re-reads every file and rebuilds its context from nothing, so the rule is "split when a brief would trigger compaction, or when there really is more than one deliverable", never "split as fine as possible".
+
+**Why this can only live at the persona layer.** The plugin does set the compaction *budget* — that is the `compaction` row with its per-model policies — but it cannot see how full a particular worker's context is, and it gets no event when that worker is compacted: a delegation hands back a final text, not a transcript, and nothing in the agent plane reports a compaction decision back to the plugin. So there is no runtime assertion to write. No test can fail on "this brief was too big", and no counter can warn before the summary lands; the decision is made once, when the coordinator writes the brief. That leaves the persona as the only place the rule can take effect — the same stance as the rest of this bundle, which writes rules as decisions the model can make rather than as hopes about its judgement.
 
 ---
 
