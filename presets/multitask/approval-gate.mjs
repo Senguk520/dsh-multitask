@@ -3179,10 +3179,17 @@ const APPROVAL_TAIL =
  * （`RELAYED_TAIL`）—— 那里原本正是上游写 `denied` 的地方，替换后整段不再有任何
  * 「裁决已经发生」的暗示。
  *
+ * ④ **被闸门拦下的调用在模型侧不留痕迹**（桌面端冒烟第 6 步的实测误判来源）：闸门拦下 →
+ * 用户允许 → 调用照常返回成功，worker 的上下文里没有卡面文案、没有标记、没有错误，
+ * 只是「慢了一阵」。于是 worker 把「看不到审批痕迹」读成「没有被审批过」，写出
+ * `APPROVALS=none` 并断言闸门没生效 —— 一个**从缺失证据推出的反向结论**。所以这里
+ * 必须先说清「放行后就是个普通返回」，再明确「没有审批文案 ≠ 没被检查过」，
+ * 并把可用词限定为**观察到的现象**（异常慢、或结果 not allowed）。
+ *
  * 结尾不带句号 —— 原文在 `APPROVAL_CLAIM` 之后本来就有一个句号。
  */
 const RELAYED_CLAIM =
-  'operations that require approval are routed to the user through the parent conversation whenever an answerer is available (for example when a human is in the foreground), and the call runs only after a human allows it. With no answerer, or when the relay itself fails, the call is not allowed — it fails closed. Until an answer arrives that call stays blocked; waiting is not a refusal, and a long wait is not a decision'
+  'operations that require approval are routed to the user through the parent conversation whenever an answerer is available (for example when a human is in the foreground), and the call runs only after a human allows it. With no answerer, or when the relay itself fails, the call is not allowed — it fails closed. Until an answer arrives that call stays blocked; waiting is not a refusal, and a long wait is not a decision. A gated call leaves no trace in your context: once allowed it simply returns, sometimes much later, and you get no prompt, no marker and no error. So the absence of approval text is NOT evidence that nothing was checked — if you need to report on it, report what you observed (an unusually slow call, or a result that came back not allowed), never an inference from a missing prompt'
 
 /**
  * 尾句的替换文本。
