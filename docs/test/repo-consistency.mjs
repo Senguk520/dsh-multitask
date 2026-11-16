@@ -1366,6 +1366,193 @@ test('M14 ★ 会写文件的 worker 必须知道「一次回复的输出上限�
   )
 })
 
+test('M15 ★ 任务书要按 worker 的上下文大小切分这条规则必须逐字在位（M14 只管得住输出上限那一半）', () => {
+  // ── 这条守的是什么 ────────────────────────────────────────────────────────
+  //
+  // 新加的规则：协调者必须按 worker 的**上下文大小**切任务书 —— 一个 brief =
+  // 一个可独立验收的产物。因为长、读得多、跑很多轮的任务书会把 worker 的上下文推过
+  // 压缩阈值，agent plane 用摘要替换掉那些具体细节：没有任何东西结束、没有报错，
+  // 报告却开始对着摘要写而不是对着任务写，目标静默漂移。
+  //
+  // ⚠️ M14 只钉住了**另一半**：一次回复的输出上限（`max-tokens` / 32,768），那半边
+  // 的修法是「按**写入量**拆」。按**阅读量**拆是另一个方向的失效、相反的修法，M14
+  // 覆盖不到它。于是下面这三种改动此前一条断言都不会红：
+  //   · 删掉 `## One brief, one deliverable` 整节；
+  //   · 删掉四份人格里那条 worker bullet（`:456` / `:592` / `:757` / `:854`）；
+  //   · 把 `never by time phase` 改写成 `avoid time phases`（读起来一样，禁令降级成建议）。
+  // 这条规则是纯提示词，没有任何运行时机制会因为它的缺席而报错 —— 唯一的守卫就是这里。
+  //
+  // 四件事必须同时成立，缺一件它就退化成一段好听的意图描述：
+  //   ① 小节在，且位置对：紧跟「任务书必须带什么」之后（这一节用到的
+  //      `Verified current state` 就是那一节里的字段）、「中途插手 worker」之前；
+  //   ② 小节内那几句**判据**逐字在位（改写成同义空话等于没有规则）；
+  //   ③ 「`max-tokens` 不是上下文耗尽」那句保持**收窄**并指向这一节（否则读者会把
+  //      两个相反的失效重新合成一句「任务太大了」）；
+  //   ④ 四份人格里那条 worker bullet **逐字一致**（同一句话手抄四份，一份漂了就会
+  //      出现「两个 worker 守两种规矩」）。
+  //
+  // ⚠️ 判据做**逐字**比对，不做关键词模糊匹配：这条规则的可执行性全在那几句原文上，
+  // 软化改写恰恰是这里要抓的改动 —— 而模糊匹配对它无感。
+  const SECTION = '## One brief, one deliverable'
+  const BEFORE = '## Every task brief must carry'
+  const AFTER = '## Intervening in a running worker'
+
+  /**
+   * 小节内必须逐字出现的判据性短语，以及各自丢了会怎样。
+   * 顺序与人格里的出现顺序一致（读失败信息时好对照）。
+   */
+  const PHRASES = [
+    [
+      'compaction is a lossy summary',
+      '「压缩是有损摘要」这个前提没了 —— 没有它，这一节就退化成「别让任务太大」的偏好，' +
+        '而不是「具体细节被摘要替换、报告开始偏离目标」这个真实机制',
+    ],
+    [
+      'One independently verifiable deliverable per brief',
+      '验收判据本身被改写了 —— 它是整节唯一可执行的判据（读一遍报告就能判「做到 / 没做到」），' +
+        '改成空话之后协调者没有任何东西可以照着切',
+    ],
+    [
+      'never by time phase',
+      '「按产物 / 文件 / 节 / 查询目标切，绝不按时间阶段切」这条禁令被改写了 —— ' +
+        '按阶段切会让两个 worker 读同一份材料，成本翻倍而什么都没省',
+    ],
+    [
+      'Verified current state',
+      '切分后的交接字段名丢了 —— 它与 `## Every task brief must carry` 里那一项逐字对应，' +
+        '改名会让「交接靠报告、不靠 worker 的记忆」这句落空（新 worker 拿不到上一片的任何上下文）',
+    ],
+    [
+      'fix-gate-a1',
+      '切片键的示例丢了 —— 规则要求同一件工作的各片沿用同一键前缀，' +
+        '示例没了模型就没有可照抄的写法，切片会各自起名',
+    ],
+    [
+      'Every split costs a re-read',
+      '反向成本那句没了 —— 少了它，这一节会被读成「越切越细」，' +
+        '而每切一刀，新 worker 都要从零重读全部文件、重建上下文',
+    ],
+  ]
+
+  assert(loaded.composition !== undefined, 'composition.mjs 没加载成功，M15 无法判定')
+  // 两边都按 LF 归一：本文件与人格都可能落在 CRLF 检出上，逐字比对不该被行尾格式干扰。
+  const source = read(COMPOSITION).replace(/\r\n/g, '\n')
+
+  // ① 小节在，且夹在「任务书必须带什么」与「中途插手 worker」之间。
+  //
+  // ⚠️ 必须匹配**行首**的标题。`## One brief, one deliverable` 这个字样在紧邻的上一节
+  // 末尾还有一份行内引用（「See `## One brief, one deliverable` below」），用普通
+  // `indexOf` 会命中那一份，于是「整节被删掉」也照样绿。
+  const headingAt = source.indexOf(`\n${SECTION}\n`)
+  assert(
+    headingAt !== -1,
+    `composition.mjs 里找不到行首标题 \`${SECTION}\` —— 整节被删掉了？` +
+      '这正是 M15 要挡的回归：删掉它 M14 仍然全绿，' +
+      '而协调者会重新把「读得多、跑很多轮」的任务书当成一件事派出去',
+  )
+  const beforeAt = source.indexOf(`\n${BEFORE}\n`)
+  const afterAt = source.indexOf(`\n${AFTER}\n`)
+  assert(
+    beforeAt !== -1 && afterAt !== -1,
+    `找不到定位用的相邻小节（\`${BEFORE}\` / \`${AFTER}\`）—— 位置判据失去参照，` +
+      '先确认这两节是不是被改名了',
+  )
+  assert(
+    beforeAt < headingAt,
+    `\`${SECTION}\` 跑到了 \`${BEFORE}\` 前面 —— 这一节讲的「交接用 Verified current state」` +
+      '指的是上面那一节的字段，挪到前面就没有先行定义了',
+  )
+  assert(
+    headingAt < afterAt,
+    `\`${SECTION}\` 跑到了 \`${AFTER}\` 后面 —— 它讲的是**写任务书**时的切分，` +
+      '必须排在「中途插手运行中的 worker」之前',
+  )
+
+  // ② 小节正文逐字带着那六句判据。
+  const bodyStart = headingAt + 1 + SECTION.length
+  const bodyEnd = source.indexOf('\n## ', bodyStart)
+  assert(bodyEnd !== -1, `\`${SECTION}\` 之后找不到任何一级小节标题 —— 这一节把后面的结构吃掉了？`)
+  const body = source.slice(bodyStart, bodyEnd)
+  const missing = PHRASES.filter(([phrase]) => !body.includes(phrase))
+  assert(
+    missing.length === 0,
+    `\`${SECTION}\` 里少了 ${missing.length} 处判据性短语（逐字比对）：\n        - ` +
+      missing.map(([phrase, why]) => `\`${phrase}\`：${why}`).join('\n        - ') +
+      '\n        可能是有人「精简 / 润色」了这一节，或把它改成了同义的空话 —— ' +
+      '几种改法读起来都还是那个意思，但规则已经不可执行了',
+  )
+
+  // ③ 上面那句收窄必须还在，而且必须在**同一行**里指向这一节。
+  //
+  // 它原来只说「`max-tokens` 不是上下文耗尽」，很容易被读成「阅读量永远不是问题」，
+  // 于是顺手把另一半（压缩）也否定掉。把指向删掉不会让任何测试红 —— 直到现在。
+  const coordinatorText = loaded.composition.COORDINATOR_PERSONA
+  assert(
+    typeof coordinatorText === 'string' && coordinatorText !== '',
+    'composition 里没有导出 COORDINATOR_PERSONA',
+  )
+  const coordinator = coordinatorText.replace(/\r\n/g, '\n')
+  const narrowing = coordinator.split('\n').filter((line) => line.includes('NOT context exhaustion'))
+  assert(
+    narrowing.length > 0,
+    'COORDINATOR_PERSONA 里已经没有 "NOT context exhaustion" 了 —— 那句收窄被删掉之后，' +
+      '「输出上限」与「上下文压缩」两个**相反**的失效会被重新合成一句「任务太大了」，' +
+      '而修法正好相反：一个拆写入，一个拆阅读 + 拆工作',
+  )
+  const unPointed = narrowing.filter(
+    (line) => !line.includes('context compaction') || !line.includes('`## One brief, one deliverable`'),
+  )
+  assert(
+    unPointed.length === 0,
+    '收窄那句不再同时带着「context compaction」与对 `## One brief, one deliverable` 的指向 —— ' +
+      '现在这一行是：\n        ' +
+      unPointed[0] +
+      '\n        去掉指向的后果：读者只看到「这不是上下文耗尽」，于是把「读得多也会坏」这半也一起否定掉。' +
+      '这一段必须保持「这句只对 max-tokens 成立，另一半去新节看」的形状',
+  )
+
+  // ④ 四份人格里那条 worker bullet 必须**整行逐字一致**。
+  //
+  // 整行取而不是只比前缀：这句话把「什么时候停、停下来说什么」写在同一个句子后半段里，
+  // 只比前缀等于只钉住了半句，后半段被改软照样绿。
+  const BULLET = '- **If the work turns out bigger than one context, stop at a clean seam.**'
+  const WORKERS = ['WORKER_PERSONA', 'FORK_PERSONA', 'PTC_WORKER_PERSONA', 'MINIMAL_WORKER_PERSONA']
+  const bullets = []
+  for (const name of WORKERS) {
+    const text = loaded.composition[name]
+    assert(typeof text === 'string' && text !== '', `composition 里没有导出 ${name}`)
+    const lines = text.replace(/\r\n/g, '\n').split('\n').filter((line) => line.startsWith(BULLET))
+    assert(
+      lines.length === 1,
+      `${name} 里这条 bullet 出现了 ${lines.length} 次（应为 1 次）—— ` +
+        '0 次说明它被删了（该 worker 会一路跑到上下文被压缩，报告从目标上漂走），' +
+        '多次则说明有人重复粘贴了',
+    )
+    bullets.push([name, lines[0]])
+  }
+  const reference = bullets[0]
+  for (const [name, line] of bullets.slice(1)) {
+    assert(
+      line === reference[1],
+      `${name} 的这条 bullet 与 ${reference[0]} 不再逐字一致 —— 四份人格是同一句话手抄四份，` +
+        '抄漂一处就会出现「两个 worker 守两种规矩」，协调者写任务书时无从知道该信哪一份：\n' +
+        `        期望（${reference[0]}）：${reference[1]}\n` +
+        `        实际（${name}）：${line}`,
+    )
+  }
+
+  // ⚠️ 「四份一致」只证明**抄得一样**，不证明这句话本身还有内容：四份同时被改写成一句
+  // 软话（「尽量不要超出你的上下文」）时上面那条照样绿。所以再把它的可执行部分钉一次。
+  const ACTIONABLE =
+    'finish the one you are on, then report what is done, what remains, and where the next piece should start'
+  assert(
+    reference[1].includes(ACTIONABLE),
+    `${reference[0]} 的这条 bullet 后半句（停下 → 收尾当前产物 → 报告三件事）被改写了 —— ` +
+      '只留「超出上下文就停」而不说停下来做什么，worker 会停在那里等指令，' +
+      '协调者拿不到「这段做完了什么、还差什么、下一段从哪开始」',
+  )
+})
+
 // ── 2c. approval-gate 的静态约束 ─────────────────────────────────────────────
 //
 // 这三条锁的是「改一处、坏一片」的三个位置。它们都不是风格问题，各有确切的坏后果：
