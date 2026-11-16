@@ -986,6 +986,8 @@ It also **cannot read its own session id** (that lives in metadata it cannot see
 
 So all four personas say it plainly: **what you have read, run and concluded is not wiped**; what is lost is the **rest of that turn** (the tool batch in flight, the steps it had not reached yet, any reply it was still composing) — and **an approval request that was waiting for the user is settled as `cancelled`**, so the click the user already made is thrown away; a new instruction **outranks the original brief** where they conflict; **do not redo the work from the start**; and **report across the interrupt boundary** (how far you got before it, what you did after it) — otherwise the coordinator cannot tell whether the correction took.
 
+Both sides can be blind to whether an approval exists at all: an aborted worker turn may leave little or no trace of the request it lost, and a card that never relayed leaves nothing whatsoever in the coordinator's conversation. So the personas forbid reading an absent marker as evidence in either direction — it means "unknown", never "no approval was pending".
+
 ⚠️ Each copy must be written to its own mechanism; they must not be copied from one another:
 
 - The **PTC** copy adds that **a killed program does not hand back what it never printed** — another reason it requires printing decision-ready results as it computes: printed state survives an interrupt, unprinted state does not.

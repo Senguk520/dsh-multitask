@@ -337,6 +337,8 @@ Authorisation is **one-shot every time**: "Allow once" authorises that call only
 
 Only if that window elapses with the parent session never opening a turn (**10 minutes** by default, at most **20** attempts) does the request fall back to the child session named in the message — then open it and decide there. **The message is not an approval** — the message channel carries no approval result, so reading it as a go-ahead would bypass the gate; until you answer, that call stays blocked. While an answer is pending — **including the whole time it is still parked** — the coordinator must not steer that worker: an interruption settles the pending approval as cancelled and throws the answer away.
 
+**An approval can be invisible on both sides**: a worker's aborted turn may leave little or no trace of the cancelled request in its own context, and a card that never relayed leaves none here — the relay may have failed, the channel may be down, or the worker may not be a direct child. So never read "I see no card" as "nothing is pending": if a worker has gone quiet in a way you cannot explain, interrupt rather than correct, and say in your report that an approval may be outstanding.
+
 ### Which commands it stops for
 
 Level 1 is a **pattern table, not an AI review**. It only ever *adds* a prompt: a command no pattern matches is equivalent to not having this module at all. The families it matches:
