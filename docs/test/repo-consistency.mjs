@@ -1557,28 +1557,41 @@ test('M15 ★ 任务书要按 worker 的上下文大小切分这条规则必须�
 //
 // 这三条锁的是「改一处、坏一片」的三个位置。它们都不是风格问题，各有确切的坏后果：
 //
-//   1. **`subagent:delegation` 的条目名** —— 改写靠这个名字定位那条 context。名字漂了
-//      就等于**静默不改**，而后果是模型继续自我审查、第二级闸门永远等不到请求
+//   1. **改写按内容定位，且两种措辞都认** —— 曾经这里靠**段名**（`subagent:delegation`）
+//      定位。桌面端 v3 冒烟证明那个范围太窄：`dsh-user-approval` 的策略上下文
+//      （`approval:policy`）说的是 `actions that require approval are rejected automatically`
+//      —— 是 `actions`，不是委派段里的 `operations`。按段名挑永远改不到它，只认一种措辞
+//      也永远改不到它；漏掉的后果是模型继续自我审查、第二级闸门永远等不到请求
 //      （连日志都不会有，因为「没找到」与「不需要改」在代码里是同一个分支）。
 //   2. **`approval/policy` 必须省略 `source`** —— 事件校验只允许 `source: 'delegation'`，
 //      带上它会让 `session.append` 直接抛错，而那时正在创建会话。
 //   3. **`ask` 决策的三个字段** —— `kind` 写错会让上游把它当成未知决定；少了
 //      `displayReason` 面板就没有本地化文案。
-console.log('\n--- 2c. approval-gate 的静态约束（名字漂了就静默失效）---')
+console.log('\n--- 2c. approval-gate 的静态约束（判据漂了就静默失效）---')
 
-test('M3 改写定位用的条目名与上游逐字一致（spelling 漂了就静默不改）', () => {
+test('M3 改写按内容定位，两种措辞都认（退回段名 = 静默漏改）', () => {
   const gate = read(APPROVAL_GATE)
-  // 定位上游那条委派上下文的条目名（`dsh-subagent` 的 applyChildComposition 里逐字写的）。
-  assert(
-    gate.includes("entry?.name !== 'subagent:delegation'"),
-    'approval-gate.mjs 里找不到对条目名 "subagent:delegation" 的判定 —— ' +
-      '这个名字是定位上游那条委派上下文的唯一依据，写错就等于静默不改写',
-  )
-  // 纠错依据的那句原话（上游 SUBAGENT_DELEGATION_CONTEXT 里逐字存在的片段）。
+  // 纠错依据的那句原话，**两种已确认措辞**：委派段（`dsh-subagent` 的
+  // SUBAGENT_DELEGATION_CONTEXT）写 `operations`，策略段（`dsh-user-approval` 的
+  // NEVER_SENTENCE）写 `actions`。少认一种就等于少改一处，而那一处正是冒烟里被读到的。
   assert(
     gate.includes('operations that require approval are rejected automatically'),
-    'approval-gate.mjs 里找不到用来识别原话的片段 —— ' +
+    'approval-gate.mjs 里找不到委派段的原话（`operations … rejected automatically`）—— ' +
       '没有它就无法判断「这条文本是否仍然误导」，改写会退化成盲改',
+  )
+  assert(
+    gate.includes('actions that require approval are rejected automatically'),
+    'approval-gate.mjs 里找不到策略段的原话（`actions … rejected automatically`）—— ' +
+      '`dsh-user-approval` 的 NEVER_SENTENCE 用的是 `actions` 而不是 `operations`，' +
+      '只认后者会让 `approval:policy` 那一段永远轮不到改写',
+  )
+  // ⚠️ 反向：按段名挑的老写法不许回来。它正是本轮修掉的那个缺口 —— 一句话可能活在
+  // 多个段落里，按段名挑等于把其余几处静默留在模型眼前。
+  assert(
+    !/entry\?\.name !== 'subagent:delegation'/.test(gate),
+    'approval-gate.mjs 里又出现了按段名 `subagent:delegation` 定位改写的写法 —— ' +
+      '那句话同样活在 `approval:policy`（措辞是 `actions …`）里，按段名挑会静默漏改，' +
+      '而模型读到之后照样自我审查',
   )
   // 尾句原话（上游 SUBAGENT_DELEGATION_CONTEXT 的第二句，`denied` 就在它里面）：
   // 它在挂起语义下会被读成「裁决已经发生」，所以它同样要能被逐字认出来并替换。

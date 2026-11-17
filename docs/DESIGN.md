@@ -447,6 +447,8 @@ There is **no** way to override it by "registering another context with the same
 
 The trigger is deliberately **content**, not just the name: it rewrites only when the text really does contain that sentence, otherwise it returns the input untouched and logs a warn with `reason=context-wording-changed` — when upstream changes the wording we **do not guess**; better to skip one rewrite than to write something false.
 
+**The rewrite matches on the claim, not on the section it lives in.** One sentence was not enough: `dsh-user-approval`'s `approval:policy` context renders `NEVER_SENTENCE`, which is worded `actions that require approval are rejected automatically` (`actions`, not `operations`), so a section-name filter plus a single wording left that context untouched — and in the desktop v3 smoke run two independent workers still reported the sentence while their calls were being relayed and allowed. There is a second, structural reason: the model-facing `systemPromptUpdate` is `in-history` (`dsh-llm-deepseek` declares it), so every assembly **appends** the new system text as a fresh node and the first node keeps its text — an old sentence baked into the transcript stays there for good, next to the corrected one. This rewrite can only fix **the assembly in front of it**, never nodes already committed; what it guarantees is that no later assembly produces the false sentence anywhere and in any of the known wordings, and that a section already rewritten is left byte-for-byte alone.
+
 **③ Two-stage triage and relay.** See the next two sections.
 
 ### Stage one: deterministic rules, not Auto review

@@ -93,10 +93,32 @@
  * `SystemPrompt.context()` 只做**跨层遮蔽**（scoped 遮蔽 global）。本模块的层在子代理
  * 层**之上**，注册同名条目只会被子代理层遮蔽 —— 徒劳。
  *
- * 所以改写走 `system-prompt/assemble` 瀑布：在**组装结果**上把那一条的文本换掉。
+ * 所以改写走 `system-prompt/assemble` 瀑布：在**组装结果**上把文本换掉。
  * 这是唯一可行的位置（上游自带的 invariant 插件也用同一个瀑布做后置校验）。
- * 触发条件是**内容**而不是名字：只有文本里确实含那句假陈述时才改写，否则原样返回并
- * 记一条 warn —— 上游改了措辞时我们**不猜**，宁可少改一次也不写错话。
+ *
+ * ── 改写的范围是「**任何**含该陈述的段落」，不是「delegation 那一条」──────────────
+ *
+ * 曾经这里只按**段名**挑：`entry.name === 'subagent:delegation'` 才动。那个范围太窄 ——
+ * 桌面端 v3 冒烟里两个**互不相干**的 worker 都报告「说明里写着需要审批的操作会被自动拒绝」，
+ * 而同一批测试里它们那条需要审批的递归删除**确实被闸门拦下、弹卡、放行**了。行为和文案相反，
+ * 有两处独立原因：
+ *
+ *   1. **这句话不止活在一个段落里。** `dsh-user-approval` 注册的 `approval:policy` 按当前
+ *      有效策略渲染 `effective(agent) === 'never' ? NEVER_SENTENCE : ASK_SENTENCE`，而
+ *      `NEVER_SENTENCE` 说的是 `actions that require approval are rejected automatically`
+ *      （`actions`，不是 `operations`）。按段名挑、外加只认一种措辞 ⇒ 这一处**永远不会**
+ *      轮到改写。所以判据从段名换成**内容**，并且两种措辞都认（见 `APPROVAL_CLAIMS`）。
+ *   2. **已经写进历史的旧句不会被后来的正确文本顶掉。** 模型侧 `systemPromptUpdate` 是
+ *      `in-history` 语义（`dsh-llm-deepseek` 就是这么声明的）：每次组装把**新的** system
+ *      文本**追加**成一条新节点，第 0 条原样留着（`SystemPromptProjection.project` 在
+ *      `inHistory` 为真时走 `surfaceOp: 'append'`）。于是子会话第一次组装时烘进去的旧句
+ *      **永久留在历史里**，后面的正确文本只是排在它后面 —— 模型两段都看得到，它没记错。
+ *      这一段历史本模块改不到（它只改**本次组装**的结果），能做的只是让**此后**每一次组装
+ *      都不再产出那句假话，任何一处都不再漏。
+ *
+ * 仍然**不按段名挑**是刻意的：上游再往别的段落里塞这句话、或再换一种措辞，本模块不需要
+ * 跟着改。触发条件是**内容**：文本里确实含那句假陈述时才改写；一段都不含就原样返回并记
+ * 一条 warn —— 上游改了措辞时我们**不猜**，宁可少改一次也不写错话。
  *
  * ── C1-b：第一级为什么是**确定性规则**而不是 Auto 审查 ────────────────────────
  *
@@ -1996,7 +2018,7 @@ export function apply(ctx, config) {
    */
   const released = new WeakSet()
 
-  /** 已经注册过委托上下文改写的子代理（改写的注册也只能一次）。 */
+  /** 已经挂上「改写假陈述」后置钩子的子代理（钩子的注册也只能一次）。 */
   const rewritten = new WeakSet()
 
   /**
@@ -2038,24 +2060,73 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 把子代理的委派上下文改写为「可以请求批准」的版本。
+   * 「这次组装里一段都没找到那句假陈述」—— 只提示**一次**。
    *
-   * 触发条件是**内容**（必须含 `are rejected automatically`）而不是只有名字：上游改了措辞
-   * 时本模块**不猜**，宁可少改一次也不写错话，并留一条 warn 让人知道需要跟进。
+   * ⚠️ `wordingNoticed` 闸门必须有：本函数跑在**每次**提示词组装上（热路径），而「没找到」
+   * 在措辞漂移之后是个**恒定**条件 —— 没有这道闸，一个长请求里每次组装都会追加一条 info，
+   * 日志会被这一件事淹掉（而它只需要看一次）。
+   */
+  const noteWordingChanged = () => {
+    if (wordingNoticed) return
+    wordingNoticed = true
+    noteSkipped(
+      'context-wording-changed',
+      'no assembled prompt context contains the "rejected automatically" claim; the rewrite was skipped (check whether the new wording is still accurate, or whether the claim moved out of reach)',
+    )
+  }
+
+  /**
+   * 把一条文本里的假陈述换成已经写好的那段真话（`RELAYED_CLAIM`）。
    *
-   * 改写覆盖**两句**：前半句（会自动拒绝）+ 尾句（不要去重试「被拒的」那次调用）。
-   * 尾句单独一次 replace，所以它认不出时前半句照旧改 —— 后半句是新增的坑（挂起期间
-   * 「还在等」被读成「已经被拒」），不是原改写的前提。
+   * 三处替换，**各自独立**：认不出其中一处时其余照旧生效，绝不猜着改。
+   *
+   *   ① 假陈述本身 → `RELAYED_CLAIM`（转呈 / fail-closed / 等待不等于拒绝 / 看不到痕迹
+   *      不等于没被审批，全部复用同一段文案，避免同一个上下文里出现两种说法）；
+   *   ② `NEVER_SENTENCE` 的**前框**「审批提示已**禁用**」→ 宿主给 `ask` 用的那个词
+   *      （不换会留下「已禁用：……请求会转呈给用户」这种自相矛盾的段落）；
+   *   ③ 它的**后框**「别发起沙箱升级请求」→ 删掉（放开后这句是假的：闸门要的正是让它发起）。
+   *
+   * ②③ 只在上游原文里出现时才动，所以委派那段（没有前后框）只受 ① 与尾句影响。
+   *
+   * @param text - 待改写的整段文本。
+   * @param claim - 命中的那种措辞（`operations …` 或 `actions …`）。
+   * @returns 改写后的文本。
+   */
+  const rewriteClaimText = (text, claim) => {
+    const rewrittenClaim = text.replace(claim, RELAYED_CLAIM)
+    const framedPrefix = rewrittenClaim.replace(POLICY_DISABLED_PREFIX, POLICY_ENABLED_PREFIX)
+    const droppedTail = framedPrefix.includes(POLICY_ESCALATION_TAIL)
+      ? framedPrefix.replace(POLICY_ESCALATION_TAIL, '.')
+      : framedPrefix
+    // 尾句不认得上游原话时原样留着 —— 单独一次 replace，所以前面的改写照旧生效。
+    return droppedTail.replace(APPROVAL_TAIL, RELAYED_TAIL)
+  }
+
+  /**
+   * 挂上「把假陈述改掉」的后置改写 —— 覆盖**任何**含该陈述的段落，不按段名挑。
+   *
+   * 触发条件是**内容**（见 `APPROVAL_CLAIMS` 的两种措辞）而不是段名：上游改了措辞或换到
+   * 别的段落里时，本模块不需要跟着改；认不出时**不猜**，宁可少改一次也不写错话，并留一条
+   * warn 让人知道需要跟进。
+   *
+   * 改写覆盖三处：假陈述本身、`NEVER_SENTENCE` 的前框（「审批提示已禁用」）、尾句
+   * （「不要去重试『被拒的』那次调用」）。三处各自独立替换，所以认不出其中一处时其余照旧
+   * 生效 —— 后半句是新增的坑（挂起期间「还在等」被读成「已经被拒」），不是改写的前提。
    *
    * 注册在**子代理自己的 ctx** 上，所以只影响这个子代理的提示词组装，兄弟与父会话都看不到。
+   * 也正因为只有**被放开过的**子代理才会挂上它，「把这段改写成『会问用户』」才是如实的：
+   * 没被放开的（父会话本来就不是 `ask`）根本走不到这里，它们的 `never` 文案保持原样。
+   *
+   * ⚠️ 能力边界：本函数只改**本次组装**的结果。已经写进 `system/message` 的旧节点它改不到
+   * —— `in-history` 路由上那次追加会永久留在历史里（见文件头与 `docs/DESIGN.md`）。
    *
    * @param agent - 已放开的子代理。
    */
-  const rewriteDelegationContext = (agent) => {
+  const installContextRewrite = (agent) => {
     if (rewritten.has(agent)) return
     const childCtx = agent?.ctx
     if (typeof childCtx.on !== 'function') {
-      noteSkipped('no-child-ctx', 'the subagent scope exposes no event registry; its delegation context still claims approvals are rejected automatically')
+      noteSkipped('no-child-ctx', 'the subagent scope exposes no event registry; its prompt contexts still claim approvals are rejected automatically')
       return
     }
     try {
@@ -2069,46 +2140,50 @@ export function apply(ctx, config) {
     } catch (error) {
       noteSkipped(
         'context-rewrite-threw',
-        `registering the delegation-context rewrite failed: ${error instanceof Error ? error.message : String(error)}`,
+        `registering the prompt-context rewrite failed: ${error instanceof Error ? error.message : String(error)}`,
       )
     }
   }
 
   /**
-   * 在组装结果上把 `subagent:delegation` 那条 context 换成不误导的文本。
+   * 在组装结果上把**任何**含那句假陈述的 context 换成不误导的文本。
+   *
+   * 曾经这里按段名挑（`entry.name === 'subagent:delegation'`），漏掉了 `dsh-user-approval`
+   * 注册的 `approval:policy` —— 它按当前策略渲染 `NEVER_SENTENCE`，而那一句用的是
+   * `actions …`（不是 `operations …`）。桌面端 v3 冒烟里两个 worker 读到的正是这类残留。
+   * 现在判据只有**内容**：含就改，一段都不含就原样返回。
    *
    * @param assembled - 上游组装结果。
-   * @returns 改写后的组装结果（不可改时原样返回）。
+   * @returns 改写后的组装结果（没有可改的内容时原样返回）。
    */
   const rewriteContexts = (assembled) => {
     if (assembled === null || typeof assembled !== 'object' || !Array.isArray(assembled.contexts)) return assembled
     let touched = false
+    let recognized = false
     const contexts = assembled.contexts.map((entry) => {
-      if (entry?.name !== 'subagent:delegation' || typeof entry.text !== 'string') return entry
-      if (!entry.text.includes(APPROVAL_CLAIM)) {
-        // 上游改了措辞 —— 只提示**一次**，让人去看一眼新文本是否仍然误导。
-        //
-        // ⚠️ 这里的 `wordingNoticed` 闸门是必须的：本函数跑在**每次**提示词组装上，
-        // 而「措辞不匹配」是个**恒定**条件 —— 没有这道闸，一个长请求里每次组装都会
-        // 追加一条 info，日志会被这一件事淹掉（而那件事只需要看一次）。
-        if (!wordingNoticed) {
-          wordingNoticed = true
-          noteSkipped(
-            'context-wording-changed',
-            'the delegation context no longer contains the "rejected automatically" claim; the rewrite was skipped (check whether the new wording is still accurate)',
-          )
-        }
+      if (typeof entry?.text !== 'string') return entry
+      // 幂等：本模块写过的段落再经过一次瀑布时**一个字都不动**，也不往下走「措辞变了」的
+      // 分支 —— 否则「我们已经改对了」会被误报成「上游改了措辞」，而那条 warn 只报一次，
+      // 报出去就没了，等于把真正的上游漂移掩盖掉。
+      //
+      // 这也顺带满足「一段里既有假陈述又有我们的改写时不要重复插入」：只要我们的文本
+      // 已经在里面，这段就不再动，绝不叠第二份。
+      if (entry.text.includes(RELAYED_CLAIM)) {
+        recognized = true
         return entry
       }
+      const claim = APPROVAL_CLAIMS.find((candidate) => entry.text.includes(candidate))
+      if (claim === undefined) return entry
+      recognized = true
       touched = true
-      return {
-        ...entry,
-        // 两处替换：前半句（「会自动拒绝」）+ 尾句（「不要去重试那次被拒的调用」）。
-        // 尾句不认得上游原话时原样留着 —— 单独一次 replace，所以前半句的改写照旧生效。
-        text: entry.text.replace(APPROVAL_CLAIM, RELAYED_CLAIM).replace(APPROVAL_TAIL, RELAYED_TAIL),
-      }
+      return { ...entry, text: rewriteClaimText(entry.text, claim) }
     })
-    if (!touched) return assembled
+    if (!touched) {
+      // 一段都不含：上游可能改了措辞，或者那句话搬到了本模块看不到的地方。原样返回并提示
+      // **一次**，让人去核对 —— 这是「不猜」的失败方向。
+      if (!recognized) noteWordingChanged()
+      return assembled
+    }
     return { ...assembled, contexts }
   }
 
@@ -2147,7 +2222,7 @@ export function apply(ctx, config) {
     // ── 已经就是 `ask` 时不必再写一条事件 ─────────────────────────────────────
     if (effectivePolicyOf(ctx, agent.session) === 'ask') {
       released.add(agent)
-      rewriteDelegationContext(agent)
+      installContextRewrite(agent)
       return
     }
 
@@ -2199,7 +2274,7 @@ export function apply(ctx, config) {
     released.add(agent)
 
     // 策略已放开 —— 现在把那句「会自动拒绝」的误导文案改掉，否则模型仍不发起请求。
-    rewriteDelegationContext(agent)
+    installContextRewrite(agent)
 
     try {
       ctx.logger?.info?.(
@@ -3150,8 +3225,46 @@ export function apply(ctx, config) {
   }
 }
 
-/** 上游委派上下文里那句**与放开后的策略相矛盾**的原话（逐字，用来定位要改写的条目）。 */
-const APPROVAL_CLAIM = 'operations that require approval are rejected automatically'
+/**
+ * 那句**与放开后的策略相矛盾**的原话 —— **两种已确认措辞**，用来定位要改写的文本。
+ *
+ * 为什么是数组而不是一个字符串：上游两处说的是同一件事，却用了不同的词。
+ *
+ *   · 委派上下文（`dsh-subagent` 的 `SUBAGENT_DELEGATION_CONTEXT`）：`operations …`；
+ *   · 策略上下文（`dsh-user-approval` 的 `NEVER_SENTENCE`）：`actions …`。
+ *
+ * 只认一种，另一种就会**原样漏过去**；而漏过去的那条正是桌面端 v3 冒烟里两个 worker
+ * 都读到的 —— 它们读到的时候，自己的调用正被转呈并放行。措辞再漂时按 `noteWordingChanged`
+ * 的约定收场（原样返回 + 一条 warn），不猜。
+ */
+const APPROVAL_CLAIMS = [
+  'operations that require approval are rejected automatically',
+  'actions that require approval are rejected automatically',
+]
+
+/**
+ * `NEVER_SENTENCE` 那句假陈述的**前框**（逐字）与它的如实替换。
+ *
+ * 为什么改写不能只换中间那句：`NEVER_SENTENCE` 的原文是
+ *
+ *     Approval prompts are disabled in this session: actions that require approval are
+ *     rejected automatically — do not request sandbox escalation (…).
+ *
+ * 只换中间一句会留下「审批提示已**禁用**：……请求会转呈给用户」这种自相矛盾的段落 ——
+ * 那比原文更糟（原文是自洽的假话，改一半是自相矛盾的话）。所以前框一起换，且换成
+ * 宿主自己给 `ask` 用的那个词（`enabled`），不另造措辞。
+ */
+const POLICY_DISABLED_PREFIX = 'Approval prompts are disabled in this session: '
+const POLICY_ENABLED_PREFIX = 'Approval prompts are enabled in this session: '
+
+/**
+ * `NEVER_SENTENCE` 的**后框**（逐字）：`— do not request sandbox escalation (…)`。
+ *
+ * 策略放开之后这句同样是假的（它让模型**别**发起升级请求，而闸门的意义正是让它发起）。
+ * 只在上游原文里出现时才删，所以对委派那段（没有前后框）零影响。
+ */
+const POLICY_ESCALATION_TAIL =
+  ' — do not request sandbox escalation (do not set `sandbox_permissions`).'
 
 /**
  * 同一段上游文本的**尾句**（逐字）。
@@ -3186,7 +3299,9 @@ const APPROVAL_TAIL =
  * 必须先说清「放行后就是个普通返回」，再明确「没有审批文案 ≠ 没被检查过」，
  * 并把可用词限定为**观察到的现象**（异常慢、或结果 not allowed）。
  *
- * 结尾不带句号 —— 原文在 `APPROVAL_CLAIM` 之后本来就有一个句号。
+ * 结尾不带句号 —— 两种措辞的下文都自带收尾：委派段里原文在 `APPROVAL_CLAIMS` 之后本来就
+ * 有一个句号；策略段（`NEVER_SENTENCE`）里跟着的是被删掉的 `POLICY_ESCALATION_TAIL`，
+ * 它会被换成一个句号。两处都不必在这里自己补。
  */
 const RELAYED_CLAIM =
   'operations that require approval are routed to the user through the parent conversation whenever an answerer is available (for example when a human is in the foreground), and the call runs only after a human allows it. With no answerer, or when the relay itself fails, the call is not allowed — it fails closed. Until an answer arrives that call stays blocked; waiting is not a refusal, and a long wait is not a decision. A gated call leaves no trace in your context: once allowed it simply returns, sometimes much later, and you get no prompt, no marker and no error. So the absence of approval text is NOT evidence that nothing was checked — if you need to report on it, report what you observed (an unusually slow call, or a result that came back not allowed), never an inference from a missing prompt'

@@ -488,6 +488,141 @@ await testAsync('I10 组装结果畸形时原样返回（不炸掉提示词组�
   }
 })
 
+await testAsync('I10a 假陈述在哪一段都要改：策略上下文（actions 措辞）与委派上下文一起改掉', async () => {
+  const approvals = fakeApproval(new Map())
+  const { parent, child, childEvents, services } = scene(approvals)
+  approvals.effectivePolicy = (session) => (session === parent.session ? 'ask' : 'never')
+
+  const { ctx, handlers } = fakeCtx({ services })
+  apply(ctx, { enabled: true })
+  handlerFor(handlers, 'agent/created').handler({ agent: child })
+  const reg = childEvents.find((e) => e.event === 'system-prompt/assemble')
+
+  // 两条上游原文，**措辞不同**：策略段（`dsh-user-approval` 的 NEVER_SENTENCE）说
+  // `actions …`，委派段（`dsh-subagent` 的 SUBAGENT_DELEGATION_CONTEXT）说 `operations …`。
+  // 旧实现按段名挑 + 只认 `operations`，所以第一条**永远不会**被改到 —— 桌面端 v3 冒烟里
+  // 两个 worker 读到的就是这类残留。
+  const policyText =
+    'Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set `sandbox_permissions`).'
+  const delegationText =
+    'You are a delegated subagent: your permission scope was fixed when you were started and cannot be widened from inside this session — operations that require approval are rejected automatically. When the task needs access beyond that scope, do not retry the denied operation; state the limitation in your reply so the delegating agent can handle it.'
+  const assembled = {
+    sections: [],
+    contexts: [
+      { name: 'approval:policy', text: policyText },
+      { name: 'subagent:delegation', text: delegationText },
+      { name: 'other', text: 'untouched' },
+    ],
+  }
+  const out = await reg.handler(assembled, {}, async () => assembled)
+
+  // ① 「任何位置」都要干净：不是「delegation 那一条干净了」就算完。
+  for (const entry of out.contexts) {
+    assert(
+      !entry.text.includes('rejected automatically'),
+      `任何位置都不该再留下「会自动拒绝」的假陈述，实际在 ${entry.name} 里还留着：${entry.text}`,
+    )
+  }
+  const rewrittenPolicy = out.contexts.find((c) => c.name === 'approval:policy')
+  assert(
+    rewrittenPolicy.text.includes('routed to the user'),
+    '策略段也必须换成本模块那段「转呈」文案 —— 否则模型仍然会自我审查、不去发起需要审批的调用',
+  )
+  // 只换中间一句会得到「审批提示已**禁用**：……请求会转呈给用户」这种自相矛盾的段落 ——
+  // 那比原文更糟（原文是自洽的假话，改一半是自相矛盾的话），所以前后框也要一起处理。
+  assert(
+    !rewrittenPolicy.text.includes('Approval prompts are disabled'),
+    '策略段的前框「Approval prompts are disabled」必须一起换掉，不能只换中间那句',
+  )
+  assert(
+    rewrittenPolicy.text.includes('Approval prompts are enabled in this session'),
+    '前框应当换成宿主自己给 `ask` 用的那个词（enabled），不另造措辞',
+  )
+  assert(
+    !rewrittenPolicy.text.includes('do not request sandbox escalation'),
+    '「别发起沙箱升级请求」在策略放开后是假话 —— 闸门要的正是让它发起',
+  )
+  const rewrittenDelegation = out.contexts.find((c) => c.name === 'subagent:delegation')
+  assert(rewrittenDelegation.text.includes('routed to the user'), '委派段照旧要改')
+  assert(
+    !rewrittenDelegation.text.includes('denied operation'),
+    '委派段的尾句照旧要改 —— 「还在等」不能被读成「已经被拒」',
+  )
+  assert(out.contexts.find((c) => c.name === 'other').text === 'untouched', '不含该陈述的段落一个字都不能动')
+})
+
+await testAsync('I10b 本来就没有那句假陈述：原样返回，证明不是无条件替换', async () => {
+  const approvals = fakeApproval(new Map())
+  const { parent, child, childEvents, services } = scene(approvals)
+  approvals.effectivePolicy = (session) => (session === parent.session ? 'ask' : 'never')
+
+  const { ctx, handlers, logs } = fakeCtx({ services })
+  apply(ctx, { enabled: true })
+  handlerFor(handlers, 'agent/created').handler({ agent: child })
+  const reg = childEvents.find((e) => e.event === 'system-prompt/assemble')
+
+  const assembled = {
+    sections: [],
+    contexts: [
+      {
+        name: 'approval:policy',
+        text:
+          'Approval prompts are enabled in this session: operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.',
+      },
+      { name: 'subagent:delegation', text: 'You are a delegated subagent. Continue the task; nothing here contradicts an interactive policy.' },
+      { name: 'other', text: 'untouched' },
+    ],
+  }
+  const out = await reg.handler(assembled, {}, async () => assembled)
+
+  // 同一个对象返回 = 一处都没改（不是「改成了相同文本」，而是根本没走改写分支）。
+  assert(out === assembled, '没有假陈述时应当原样返回同一个对象 —— 无条件替换会在这里暴露')
+  for (let index = 0; index < assembled.contexts.length; index += 1) {
+    assert(
+      out.contexts[index] === assembled.contexts[index],
+      `没有假陈述时不该产出新的 context 条目（第 ${index} 条被替换了）`,
+    )
+  }
+  // 失败方向：找不到那句就只提示一次，不猜着改。
+  assert(
+    logs.warn.some((m) => m.includes('reason=context-wording-changed')),
+    '一段都找不到时应当留一条可 grep 的提示，让人去核对新措辞（或那句话是否搬到了本模块看不到的地方）',
+  )
+})
+
+await testAsync('I10c 已改写过内容再经过一次瀑布：幂等，不重复叠加', async () => {
+  const approvals = fakeApproval(new Map())
+  const { parent, child, childEvents, services } = scene(approvals)
+  approvals.effectivePolicy = (session) => (session === parent.session ? 'ask' : 'never')
+
+  const { ctx, handlers, logs } = fakeCtx({ services })
+  apply(ctx, { enabled: true })
+  handlerFor(handlers, 'agent/created').handler({ agent: child })
+  const reg = childEvents.find((e) => e.event === 'system-prompt/assemble')
+
+  const claim =
+    'operations that require approval are rejected automatically. When the task needs access beyond that scope, do not retry the denied operation; state the limitation in your reply so the delegating agent can handle it.'
+  const assembled = { sections: [], contexts: [{ name: 'subagent:delegation', text: claim }] }
+  const first = await reg.handler(assembled, {}, async () => assembled)
+  const key = 'routed to the user'
+  const countIn = (text) => text.split(key).length - 1
+  assert(countIn(first.contexts[0].text) === 1, `第一遍应当只插入一次改写文案，实际 ${countIn(first.contexts[0].text)} 次`)
+
+  const second = await reg.handler(first, {}, async () => first)
+  assert(second === first, '第二遍没有可改的内容时应当原样返回同一个对象')
+  assert(second.contexts[0] === first.contexts[0], '第二遍不该产出新的 context 条目')
+  assert(
+    countIn(second.contexts[0].text) === 1,
+    `改写过的文本再经过瀑布时不能重复叠加，实际 ${countIn(second.contexts[0].text)} 次`,
+  )
+  // 幂等还有一条容易漏的副作用：第二遍如果把「已经改对了」误报成「上游改了措辞」，
+  // 那条 warn 只报一次，报出去就没了 —— 真正的上游漂移会被它掩盖。
+  assert(
+    !logs.warn.some((m) => m.includes('reason=context-wording-changed')),
+    '幂等的一遍不该记「措辞变了」—— 那会把「我们已经改对了」误报成上游漂移',
+  )
+})
+
 // ── 三、第一级分流（C1-b）────────────────────────────────────────────────────
 console.log('\n--- 3. C1-b：第一级分流的判定与形状 ---')
 

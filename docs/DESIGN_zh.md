@@ -667,6 +667,17 @@ header，那会抛 `session header uses retired policy baseline fields`）。
 记一条 `reason=context-wording-changed` 的 warn —— 上游改了措辞时我们**不猜**，
 宁可少改一次也不写错话。
 
+**改写按内容定位，不按它活在哪个段落。** 一句话不够用：`dsh-user-approval` 的
+`approval:policy` 上下文渲染的是 `NEVER_SENTENCE`，措辞是
+`actions that require approval are rejected automatically`（是 `actions`，不是
+`operations`），于是「按段名挑 + 只认一种措辞」这双重条件让那一处**永远轮不到改写** ——
+桌面端 v3 冒烟里两个互不相干的 worker 都报告了这句话，而它们的调用正被转呈并放行。
+还有一层结构性原因：模型侧 `systemPromptUpdate` 是 `in-history`（`dsh-llm-deepseek`
+就是这么声明的），每次组装把新的 system 文本**追加**成一条新节点、第 0 条原样保留，
+所以早先烘进历史的那句旧话会**永久留在那里**，正确文本只是排在它后面。本次改写改不到
+**已经写进历史**的节点，它能保证的是此后每一次组装都不再在任何位置产出那句假话
+（两种已确认措辞都认），而已经改写过的那段再经过一次瀑布时一个字都不动。
+
 **③ 两级分流与转呈。** 见下两节。
 
 ### 第一级：确定性规则，不是 Auto 审查
