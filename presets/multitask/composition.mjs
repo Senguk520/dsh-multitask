@@ -2284,11 +2284,24 @@ function noOptions() {
  *   2. **没有有效输入时不产生 `modelPolicies` 键** —— 这一行 config 与加入本参数
  *      之前逐字等价（本地回归大量断言无参调用）。
  *
+ * ── 关于可选的 `yieldNativeCompaction`（检测到 billion-context 就让位）──────────
+ *
+ * **只认严格 `=== true`**，其余（缺省、`false`、`1`、`'true'`、undefined）一律当
+ * false —— 老调用方无参调用因此**行为完全不变**。为真时压缩组改成「不再自动压缩、
+ * 不再提供 `/compact`、不写按模型的策略」，但**保留** `compaction-basic` 行
+ * （`auto: false`）、也保留 `tool-result-pruner`。为什么这样切、为什么不是
+ * `disabled: true`，见压缩组上方那段注释。
+ *
+ * 宿主半（`lib/index.js`）探测 billion-context 的闸门服务
+ * `biliBasicCompactionPolicy`，把结果原样传进来；本文件不做任何探测 ——
+ * composition 是纯数据组装，不该知道谁在进程里跑。
+ *
  * @param options - 可选的注入项。
  * @param options.modelMap - `类型键 -> { provider, model, reasoningEffort? }`。
  * @param options.watchdog - `{ stallTimeoutMs, tickMs, mode }`（毫秒）。
  * @param options.compaction - `{ headroomTokens?, maxTokens?, retainTokens?, thresholdRatio?, retainRatio? }`。
  * @param options.modelPolicies - `Array<{ provider, model, contextWindow, defaultMaxTokens? }>`。
+ * @param options.yieldNativeCompaction - 是否让出原生压缩（缺省 false；严格 `=== true` 才生效）。
  * @returns 供 preset 注册表挂载的插件行数组。
  */
 export function buildPlugins(options) {
@@ -2296,6 +2309,9 @@ export function buildPlugins(options) {
   const watchdog = normalizeWatchdog(options?.watchdog)
   const compaction = normalizeCompaction(options?.compaction)
   const modelPolicies = normalizeModelPolicies(options?.modelPolicies)
+  // 让位开关归一化在**函数顶部**做一次：下面每一行都读这个局部量，绝不各自再判一遍
+  // （两处判据一旦漂移，就会出现「关掉了自动压缩、却还在写按模型的策略」这种半让位）。
+  const yieldCompaction = options?.yieldNativeCompaction === true
   return [
     // ── 身份：协调者人格 + Multitask 工作纪律 ─────────────────────────────────
     //
@@ -2412,6 +2428,35 @@ export function buildPlugins(options) {
     // 全局预算照顾不了「1M 窗口本可以写 64k 摘要」这种情况，所以再叠一层按模型的
     // 策略（`normalizeModelPolicies()`）：窗口匹配到策略的模型用自己的预算，没匹配到
     // 的继续用上面的全局缺省。没有有效输入时本行**不出现** `modelPolicies` 键。
+    //
+    // ── 检测到 billion-context 时**让位**（`yieldNativeCompaction`）──────────────
+    //
+    // billion-context 在自己的网关层拦原生 summarize（它把压缩交给自带的闸门服务
+    // `biliBasicCompactionPolicy`），所以在它接管的进程里，本组发出的压缩请求**必然**
+    // 被拒。而 `compaction-basic` 的自动压缩是「步间压力触发」：被拒之后失败记录
+    // **每步一条**，还会随对话变长自我放大 —— 那比不压缩更糟。所以宿主半一旦探测到
+    // 那个服务（`lib/index.js` 的 `nativeCompactionYielded()`），就把
+    // `yieldNativeCompaction: true` 传进来，本组随即只做三件事：
+    //
+    //   1. `compaction-basic` 加 `auto: false` —— 不注册步间自动压缩，于是不再发起
+    //      那条注定被拒的 summarize。**保留这一行**（而不是 `disabled: true`）：
+    //      行在 ⇒ 本 realm 里的 `compaction` 服务仍在，`command-compact` 这类
+    //      `inject: ['commands', 'compaction']` 的插件才不会永远挂起（#3662 的坑：
+    //      被 `disabled` 的行**不提供**服务，只注入它的行就永远等不到，整个组静默
+    //      少一半功能）。
+    //      `compaction.config` 的原有键**不删**：bili 若中途消失，下一份声明仍是
+    //      一份健全的预算，不必等用户重设面板。
+    //   2. **不写** `modelPolicies` —— `auto` 已关、`/compact` 也不再提供，按窗口
+    //      算出来的策略永远用不到，写进去只会让声明多一份随时过期的快照。
+    //   3. `command-compact` 加 `disabled: true` —— `/compact` 命令随之消失，用户
+    //      不会再手动触发一条同样会被拒的压缩。
+    //
+    // `tool-result-pruner` **一个字都不改**：它只 `inject: ['tokenMeter']`，不发起
+    // 任何模型调用，billion-context 不拦它；让位时它仍要工作（长会话里工具结果的
+    // 体积总得有人管）。
+    //
+    // 开关为假 / 缺省时，下面三处条件展开都产出**没有键**的对象，行内容与加入该选项
+    // 之前**逐字相同**（本地回归大量无参调用 `buildPlugins()`）。
     {
       id: 'compaction',
       name: 'cordis:group',
@@ -2423,11 +2468,22 @@ export function buildPlugins(options) {
           name: '@deepseek-ai/dsh-compaction-basic',
           // 始终带 `config`：缺省预算由本包给出（见 `COMPACTION_DEFAULTS`）；
           // `modelPolicies` 在此**叠加**（`normalizeModelPolicies()` 无有效输入时是空对象，
-          // 展开后不产生键，config 与加入该参数之前逐字相同）。
+          // 展开后不产生键，config 与加入该参数之前逐字相同）。让位时两处都换成
+          // 空对象：策略不写（见上面第 2 条），只补一个 `auto: false`。
           ...compaction,
-          config: { ...compaction.config, ...modelPolicies },
+          config: {
+            ...compaction.config,
+            ...(yieldCompaction ? noOptions() : modelPolicies),
+            ...(yieldCompaction ? { auto: false } : noOptions()),
+          },
         },
-        { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
+        {
+          id: 'command-compact',
+          name: '@deepseek-ai/dsh-command-compact',
+          // 让位时整行 `disabled`；**不让位时连这个键都不出现**（不是 `disabled: false`）
+          // —— 行内容必须与加入本选项之前逐字相同。
+          ...(yieldCompaction ? { disabled: true } : noOptions()),
+        },
         {
           id: 'tool-result-pruner',
           name: '@deepseek-ai/dsh-compaction-tool-result-pruner',

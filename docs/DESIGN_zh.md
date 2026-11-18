@@ -163,7 +163,7 @@ clone 本仓库、直接跑工作区里的源码时用这条（改动不经过 n
 | 子代理使用的模型 | `multitask.subagentModels[]`（`subagentType` / `provider` / `model` / `reasoningEffort?`） | 四类 worker **各自的默认模型**，以及该模型的**思考强度**。「所有子代理使用同一个模型」选**是**时，四类一起写成同一条路线；选**否**时每类单独指定，「继承协调者」是默认项。`reasoningEffort` 的档位**只能**取自模型目录（`models[].reasoning.efforts[]`，见 `dsh-api-remotes` 的 `session.modelCatalog`）—— 写死 low / medium / high 会提交上游 `ReasoningEffortId()` 不认的值；模型没公布档位时不画该控件 |
 | 子代理并行数量上限 | `subagent.maxActiveSubagents` | **与「设置 → 通用设置」里的那个值是同一个** —— 两处 UI 编辑同一个字段，所以改一处另一处立刻跟着变。它决定**同一主 Agent 下同时能存活多少个子代理**，对所有模式生效，Multitask 不例外。改完**即刻生效** |
 | 子代理停滞看门狗 | `multitask.watchdog`（`stallTimeoutMs` / `tickMs` / `mode`） | 面板用**秒**、配置存**毫秒**，换算只在控制器里各做一次。它决定「子代理安静多久算卡死」以及卡死之后做什么（只记录 / 停止并唤醒） |
-| 子代理上下文压缩 | `multitask.compaction`（`headroomTokens` / `maxTokens` / …，单位 token） | **默认预算按模型自动推导，`multitask.compaction` 是覆盖入口**。DSH 在应用根把 `compaction-basic` / `command-compact` / `tool-result-pruner` 设为 `disabled: true`，agent 平面由每个 preset 自己提供压缩实例；本 preset 再把压缩放进 `isolate: { compaction: true }` 的组里（双向墙：出去与宿主那一份压缩互不干扰，进来宿主 patch 也进不去）。所以预算由组装层给出：`composition.mjs` 的 `COMPACTION_DEFAULTS`（`headroomTokens: 8192`、`maxTokens: 8192`）无条件写进 `compaction-basic` 那一行 —— 它是**全局兜底**，不是默认值的来源：默认值由**按模型策略**给出，面板与 profile 只是**覆盖入口**。自动模式的实现路径分三段：**① 宿主预取**（`lib/index.js`）—— 首次声明之后异步枚举模型目录（`llm.listProviders()` → `llm.listModels()` → 逐模型 `llm.resolveModelInfo()`），取出每个模型的 `contextWindow` 与可选的 `defaultMaxTokens`，收敛成 `{ provider, model, contextWindow, defaultMaxTokens? }` 快照，`redeclare()` 时作为 `modelPolicies` 交给 `buildPlugins()`；首份声明仍用空快照，所以与加入本功能之前逐字等价。**② 组装层换算**（`normalizeModelPolicies()`）—— `budget = clamp(round(contextWindow / 16), 4096, 65536)`，`headroomTokens` 与 `maxTokens` 都取这个预算；**跳过条件**是 `room = contextWindow − (defaultMaxTokens ?? 0)` 小于 `max(16384, 0.1 × contextWindow)`，命中的模型**不产生**策略、回落到全局的 8192 / 8192，宿主同时打一条 warn（形如 `compaction budget skipped for 2 model(s): providerA/modelX (window=256000, reserve=256000, no-room); providerB/modelY (window=131072, reserve=131072, no-room)`，最多列 20 条）；策略按 provider + model **精确匹配**（不做前缀或子串匹配）、去重、先按 provider 再按 model 排序、最多 256 条。**③ 生效面**—— 目录变化事件 `llm/adapters-updated`、`llm/models-updated` 会触发重新预取；目录拿不到（`llm` 服务缺失、10 秒总超时、某个适配器抛错）时整段**静默回落**，模式照常可用；策略只对**新会话**生效，已有会话不会中途换预算。用户写了 `headroomTokens` 或 `maxTokens` 任一项就是**自定义**：宿主此时**不生成**任何按模型策略（快照清空），那组值对所有模型生效。全局兜底的两个值是**成对**的——上游缺省本来就是 `maxTokens = headroomTokens`：headroom 是「给摘要预留多少空间」，maxTokens 是「摘要最多占多少空间」。把这对拆成「预留 8192、上限 65536」，压缩产出的摘要就可能大过预留空间，压缩完立刻再次越过阈值，落进「压完马上又压」；所以两个值都取 8192。不取上游那组值的依据：上游缺省 headroom 65536 常被归咎于「小窗口」，但条件是**相对的**、不是绝对的：压力预算 `contextWindow − 请求输出预留 − headroomTokens` 恰好在 `O + H ≥ W` 时降到零以下（O = 请求输出预留，H = headroom）—— 也就是说，起决定作用的是「输出预留 + headroom」相对窗口有多大，而不是窗口的绝对值。H 固定为 65536 时，决定因素就是输出预留 O 相对窗口有多大。128000 窗口、O=32768、headroom=65536 时预算仍有 29696 > 0，**不抛** `TargetPressureConfigError`，只是触发点被压到约 23%（过早压缩）；262144 窗口、O=256000、headroom=8192 时预算为 −2048，**照样抛**——这一例跟 headroom 无关，是 O 本身太大。`maxTokens` **不参与**这个公式，早期"`contextWindow − headroom − maxTokens`"的说法是错的。调小 headroom **不总是无影响**：触发点 `min(0.8 × 窗口, 窗口 − 输出预留 − headroom)` 只有在预算项 `窗口 − 输出预留 − headroom` 已经不小于 `0.8 × 窗口` 时才被封顶——也就是仅当 输出预留 + headroom ≤ 0.2 × 窗口（`thresholdRatio` 缺省 0.8）时，调小 headroom 才完全不改变触发点。输出预留最高可达 256k，所以 1M 窗口上也会把触发点往后推（1M 窗口、输出预留 256000、headroom 8192 时约 75%，并非封顶在 80%；只有像 256k 窗口、输出预留 32768 这类情形才封顶在 80%）——这是预期行为，不是故障。面板与 profile 不是修复开关：这张卡现在是**高级卡片、默认折叠**，通常不需要动 —— 要改就在设置页里展开它，或在 profile 里写 `multitask.compaction`。面板上「自动（按模型计算）／自定义」二选一：自动态不画输入框，只说明「概要大小按每个子代理所用模型的上下文窗口自动计算」，并给出风险提示「输出上限接近上下文窗口的模型会回落到默认概要大小」；自定义态才画两个输入框，灰字显示当前生效值。选「自动」= 把 `headroomTokens` 与 `maxTokens` 两个键一起**删掉**（缺席即自动，不是写 0 或默认值） |
+| 子代理上下文压缩 | `multitask.compaction`（`headroomTokens` / `maxTokens` / …，单位 token） | **默认预算按模型自动推导，`multitask.compaction` 是覆盖入口**。DSH 在应用根把 `compaction-basic` / `command-compact` / `tool-result-pruner` 设为 `disabled: true`，agent 平面由每个 preset 自己提供压缩实例；本 preset 再把压缩放进 `isolate: { compaction: true }` 的组里（双向墙：出去与宿主那一份压缩互不干扰，进来宿主 patch 也进不去；⚠️ 但这道墙只管**组装**：在**请求出口**上拒绝 summarize 的外部压缩所有者（如 `billion-context`）在墙的两侧都拦不住，那种情况下本 preset 把整个压缩位让出去，见下文「与外部压缩插件的互操作（`billion-context`）」）。所以预算由组装层给出：`composition.mjs` 的 `COMPACTION_DEFAULTS`（`headroomTokens: 8192`、`maxTokens: 8192`）无条件写进 `compaction-basic` 那一行 —— 它是**全局兜底**，不是默认值的来源：默认值由**按模型策略**给出，面板与 profile 只是**覆盖入口**。自动模式的实现路径分三段：**① 宿主预取**（`lib/index.js`）—— 首次声明之后异步枚举模型目录（`llm.listProviders()` → `llm.listModels()` → 逐模型 `llm.resolveModelInfo()`），取出每个模型的 `contextWindow` 与可选的 `defaultMaxTokens`，收敛成 `{ provider, model, contextWindow, defaultMaxTokens? }` 快照，`redeclare()` 时作为 `modelPolicies` 交给 `buildPlugins()`；首份声明仍用空快照，所以与加入本功能之前逐字等价。**② 组装层换算**（`normalizeModelPolicies()`）—— `budget = clamp(round(contextWindow / 16), 4096, 65536)`，`headroomTokens` 与 `maxTokens` 都取这个预算；**跳过条件**是 `room = contextWindow − (defaultMaxTokens ?? 0)` 小于 `max(16384, 0.1 × contextWindow)`，命中的模型**不产生**策略、回落到全局的 8192 / 8192，宿主同时打一条 warn（形如 `compaction budget skipped for 2 model(s): providerA/modelX (window=256000, reserve=256000, no-room); providerB/modelY (window=131072, reserve=131072, no-room)`，最多列 20 条）；策略按 provider + model **精确匹配**（不做前缀或子串匹配）、去重、先按 provider 再按 model 排序、最多 256 条。**③ 生效面**—— 目录变化事件 `llm/adapters-updated`、`llm/models-updated` 会触发重新预取；目录拿不到（`llm` 服务缺失、10 秒总超时、某个适配器抛错）时整段**静默回落**，模式照常可用；策略只对**新会话**生效，已有会话不会中途换预算。用户写了 `headroomTokens` 或 `maxTokens` 任一项就是**自定义**：宿主此时**不生成**任何按模型策略（快照清空），那组值对所有模型生效。全局兜底的两个值是**成对**的——上游缺省本来就是 `maxTokens = headroomTokens`：headroom 是「给摘要预留多少空间」，maxTokens 是「摘要最多占多少空间」。把这对拆成「预留 8192、上限 65536」，压缩产出的摘要就可能大过预留空间，压缩完立刻再次越过阈值，落进「压完马上又压」；所以两个值都取 8192。不取上游那组值的依据：上游缺省 headroom 65536 常被归咎于「小窗口」，但条件是**相对的**、不是绝对的：压力预算 `contextWindow − 请求输出预留 − headroomTokens` 恰好在 `O + H ≥ W` 时降到零以下（O = 请求输出预留，H = headroom）—— 也就是说，起决定作用的是「输出预留 + headroom」相对窗口有多大，而不是窗口的绝对值。H 固定为 65536 时，决定因素就是输出预留 O 相对窗口有多大。128000 窗口、O=32768、headroom=65536 时预算仍有 29696 > 0，**不抛** `TargetPressureConfigError`，只是触发点被压到约 23%（过早压缩）；262144 窗口、O=256000、headroom=8192 时预算为 −2048，**照样抛**——这一例跟 headroom 无关，是 O 本身太大。`maxTokens` **不参与**这个公式，早期"`contextWindow − headroom − maxTokens`"的说法是错的。调小 headroom **不总是无影响**：触发点 `min(0.8 × 窗口, 窗口 − 输出预留 − headroom)` 只有在预算项 `窗口 − 输出预留 − headroom` 已经不小于 `0.8 × 窗口` 时才被封顶——也就是仅当 输出预留 + headroom ≤ 0.2 × 窗口（`thresholdRatio` 缺省 0.8）时，调小 headroom 才完全不改变触发点。输出预留最高可达 256k，所以 1M 窗口上也会把触发点往后推（1M 窗口、输出预留 256000、headroom 8192 时约 75%，并非封顶在 80%；只有像 256k 窗口、输出预留 32768 这类情形才封顶在 80%）——这是预期行为，不是故障。面板与 profile 不是修复开关：这张卡现在是**高级卡片、默认折叠**，通常不需要动 —— 要改就在设置页里展开它，或在 profile 里写 `multitask.compaction`。面板上「自动（按模型计算）／自定义」二选一：自动态不画输入框，只说明「概要大小按每个子代理所用模型的上下文窗口自动计算」，并给出风险提示「输出上限接近上下文窗口的模型会回落到默认概要大小」；自定义态才画两个输入框，灰字显示当前生效值。选「自动」= 把 `headroomTokens` 与 `maxTokens` 两个键一起**删掉**（缺席即自动，不是写 0 或默认值） |
 
 **「通用设置」页 —— 两行**（与官方的语言 / 外观 / 开发者工具并排）
 
@@ -201,6 +201,68 @@ clone 本仓库、直接跑工作区里的源码时用这条（改动不经过 n
 > 新用户找得到」。理由与取舍写在 `lib/client.js` 的文件头。
 >
 > ⚠️ 改 `lib/client.js` 属于**改源码** —— 按「改源码后如何生效」一节，需要**重启应用**。
+
+### 与外部压缩插件的互操作（`billion-context`）
+
+上面那张压缩卡就是本节要加条件的那一档旋钮。同一个 profile 里可能同时装了两个都想接管压缩的插件：
+`billion-context`（下称 bili）在**请求出口的网关**上无条件拒绝 dsh 原生 summarize ——
+HTTP `422`、包体 `dsh_compaction_refused`、`retryable:false` —— 而本 preset 这一份 realm 内的
+`compaction-basic` **不在** bili 改写的实例之列（它只改四个官方 preset）。于是每一步都留下一条
+失败压缩记录：实测 **60/60 失败、同一 turn 最多 7 次**
+（`Senguk520/dsh-multitask#7`、`ranxianglei/billion-context#7062`）。
+
+**契约是一个冻结的标记服务。** 它由 bili 提供；服务**存在**即表示「bili 拥有 basic compaction」，
+第三方 preset 应当让位。本包只把这个**服务名**当公开互操作契约消费，不依赖 bili 的任何内部实现：
+
+```js
+ctx.reflect?.provide?.('biliBasicCompactionPolicy', Object.freeze({ owner: 'billion-context', issue: '#3354' }))
+// 消费方：strict = false，否则尚未 ACTIVE 的上游 fiber 认不到
+const yielded = ctx?.reflect?.get?.('biliBasicCompactionPolicy', false) !== undefined
+```
+
+**为什么用标记服务而不是版本判断。** 本包从不读 bili 的配置形状、preset id 或内部模块 —— 只问
+「这个服务名能不能解析到」。这样依赖是单向的：bili 可以给私有东西改名、重排它的 overlay、
+甚至整体换实现，本包这一段都不需要跟着改。这也正是本节末尾那条归因的前提。
+
+**让位之后改了什么**（都在 `buildPlugins()`，`presets/multitask/composition.mjs` 里）：
+
+| 行 | bili 在场时 | 为什么恰好是这么改 |
+|---|---|---|
+| `compaction-basic` | **保留**，`config.auto = false` | 上游构造函数是 `if (this.config.auto) this._registerAutomaticCompaction()`，所以步间压力压缩不再注册、失败记录归零。bili 对四个官方 preset 也是这个做法（把 stock 行改成 `auto:false`） |
+| `command-compact` | `disabled: true` | 让位之后 `/compact` 必然 422；把一个结构上不可能成功的命令继续摆在用户面前只会误导人 |
+| `modelPolicies` | **不写** | summarize 到不了上游，按窗口算出来的预算永远不会生效。启动时枚举模型目录的预取也一并跳过（它带 10s 预算） |
+| `tool-result-pruner` | 保持挂载、参数不动 | 它只 `inject: ["tokenMeter"]`、不发起任何模型调用，bili 也从不拦它 —— 没有理由连坐 |
+
+**为什么用 `auto: false` 而不是 `disabled: true`。** 把这一行禁掉会连 realm 内的 `compaction` 服务
+一起带走，而 `command-compact` 声明的是 `inject: ["commands", "compaction"]` —— 它就会永远挂在
+等待态。DSH 上曾有过同类事故：注入闸门没有降级路径，直接把会话创建锁死。保留这一行，就保住了服务。
+
+**检测要「同步快路径 + 迟绑定」两条并存**，因为注册顺序不保证：本包的 `void declare()` 不 await，
+而声明即 eager mount，bili 完全可能比本包晚 `apply()`。
+
+- 同步：`ctx.reflect.get('biliBasicCompactionPolicy', false) !== undefined` —— cordis 的 `reflect`
+  没有 `has`，且只有 `strict = false` 才认得到尚未 `ACTIVE` 的上游 fiber。
+- 迟绑定：`ctx.inject(['biliBasicCompactionPolicy'], cb)` —— 服务出现时执行，变化时卸载重跑。
+- 探测抛异常一律按**「不让位」**处理：宁可少让位，也不能因为探测异常把声明拖垮。
+
+**生效范围：只对新会话。** 检测翻转后走本包已有的重声明管线，而重声明只对**之后新开**的会话生效；
+已经带着失败记录的会话需要重开。
+
+**怎么在真实部署上确认让位生效** —— 两个包都装上、开一个**新会话**，然后核对三件事：
+
+- 声明出去的 `compaction-basic` 行带的是 `auto: false`；
+- `command-compact` 是禁用的，且没有写 `modelPolicies`；
+- 这个会话不再产生 `dsh_compaction_refused` 记录。若还能看到记录，它属于翻转之前开的会话，
+  而不是让位没生效。
+
+> ⚠️ **归因更正 —— 写给后来接手的人。** issue 里把根因写成「运行期注册的 preset 结构上永远不经过
+> 宿主 `internal/config` waterfall」，**不成立**。`internal/config` 是 **Fiber 级** waterfall
+> （`resolveConfig()` → `fiber.context.waterfall("internal/config", fiber, …)`），而 preset 的行由
+> loader 同一个 `Entry` 类创建、走的是普通 Fiber，因此同样会经过它；
+> `dsh-agent-preset-registry` 只把 `internal/commit` 的**写回**做成了空实现，读侧不受影响。
+> 真正的缺口更可能是**加载顺序竞态**（bili 的 overlay 监听注册得晚，这次 resolve 已经错过）
+> 或**匹配器形状限制**。本包的设计前提由此而来：**不以对方的 overlay 会到达我们为前提**，
+> 也不依赖对方改名或改实现。
 
 ### 协调者默认保留什么
 
@@ -1515,9 +1577,10 @@ assistant 发言在字面上都是第一人称。模型没有额外信号能区�
   所以规则是「会触发压缩、或产物本来就不止一个时才切」，而不是「越碎越好」。
 
 **为什么这条只能在人格层。** 插件确实设了压缩的**预算**（就是 `compaction` 那一行和它的
-按模型策略），但它看不到某个 worker 的上下文占了多少，也收不到「这个 worker 被压缩了」
-的事件：一次委派交回的是最终文本、不是完整对话，agent plane 里也没有把压缩决策回报给
-插件的钩子。因此这里没有可写的运行时断言 —— 没有测试能因为「这份任务书太大」而变红，
+按模型策略 —— **前提是没有外部插件接管压缩**：装了 `billion-context` 时这一行不写按模型策略、
+`auto` 也关掉，见上文互操作一节），但它看不到某个 worker 的上下文占了多少，也收不到
+「这个 worker 被压缩了」的事件：一次委派交回的是最终文本、不是完整对话，agent plane 里也
+没有把压缩决策回报给插件的钩子。因此这里没有可写的运行时断言 —— 没有测试能因为「这份任务书太大」而变红，
 也没有计数器能在摘要落地前预警；这个判断只在协调者写任务书的那一刻发生一次。
 于是人格是这条规则唯一能生效的地方 —— 与本包其他守卫同一取向：给人格可判定的规则，
 而不是对判断力的期待；不过这段文本本身已由 `repo-consistency` 的 **M15** 钉住
