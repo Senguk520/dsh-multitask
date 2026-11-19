@@ -2289,8 +2289,12 @@ function noOptions() {
  * **只认严格 `=== true`**，其余（缺省、`false`、`1`、`'true'`、undefined）一律当
  * false —— 老调用方无参调用因此**行为完全不变**。为真时压缩组改成「不再自动压缩、
  * 不再提供 `/compact`、不写按模型的策略」，但**保留** `compaction-basic` 行
- * （`auto: false`）、也保留 `tool-result-pruner`。为什么这样切、为什么不是
- * `disabled: true`，见压缩组上方那段注释。
+ * （`auto: false`）、也保留 `tool-result-pruner`。后者的「保留」只指**行还在**，
+ * 不指它还在干活：`auto: false` 让 `compaction-basic` 的自动压缩 listener 一个都不
+ * 注册，而那是 `pruneSession` 唯一的调用者，于是 pruner 的 `thresholdChars` 永不被
+ * 求值，长工具结果的实际边界退回 harness 的溢出层（~50KB，约 12k token）。
+ * 为什么这样切、为什么不是 `disabled: true`、这个取舍换到了什么、失去了什么，
+ * 见压缩组上方那段注释。
  *
  * 宿主半（`lib/index.js`）探测 billion-context 的闸门服务
  * `biliBasicCompactionPolicy`，把结果原样传进来；本文件不做任何探测 ——
@@ -2451,9 +2455,30 @@ export function buildPlugins(options) {
     //   3. `command-compact` 加 `disabled: true` —— `/compact` 命令随之消失，用户
     //      不会再手动触发一条同样会被拒的压缩。
     //
-    // `tool-result-pruner` **一个字都不改**：它只 `inject: ['tokenMeter']`，不发起
-    // 任何模型调用，billion-context 不拦它；让位时它仍要工作（长会话里工具结果的
-    // 体积总得有人管）。
+    // `tool-result-pruner` 的**行与 `config` 一个字都不改**，但要说清一件事：
+    // **挂着 ≠ 在工作**。让位之后它仍然挂载 —— 行还在，realm 内的 `toolResultPruner`
+    // 服务仍在，第三方插件照样可以显式调它的 `pruneSession`。可在 DSH **自身的调用图**
+    // 上它已经**不可达**：它是纯被动服务（`static inject = ['tokenMeter']`，零个
+    // listener），`pruneSession` 在全 bundle 里只有两个调用点，都在
+    // `@deepseek-ai/dsh-compaction-basic` 里（`compactIfNeeded` 的
+    // `context-overflow` 分支、`compactPressure` 越过阈值之后），而这两个方法的
+    // 唯一入口是 `_registerAutomaticCompaction()` 注册的 5 个 listener ——
+    // 构造函数的闸门是 `if (this.config.auto) …`，`auto: false` 之后一个都不注册。
+    // 于是 `thresholdChars: 8192` 从不被求值，pruner 一次也不会被调用。
+    // bili 确实不拦它（它不发起任何模型调用），但「不被拦」和「会被调用」是两件事。
+    //
+    // 后果：让位后长工具结果的实际边界退回 **harness 自己的溢出层**（~50KB 显示窗口，
+    // 约 12k token；截断标记是 `(Omitted N bytes. …)` 那一路），而不是 pruner 的
+    // `thresholdChars: 8192`。实测佐证：装上 billion-context 之后，14k 字符（已越过
+    // 8192）、4000 行、20000 行的工具结果都原样走溢出层，pruner 自己的
+    // `[... tool result middle pruned ...]` 一次都没出现。
+    //
+    // 这是**取舍，不是疏忽** —— 让位换掉的是「每步一条注定失败的压缩记录 + 一次白跑的
+    // 请求」（实测 60/60 步失败），代价就是丢掉 8KB 级的中间裁剪。这条回退是真实的：
+    // 让位之前（`auto: true`）`compactPressure` 先裁再 summarize，被 422 拒的是后面的
+    // summarize，pruner 本身在干活；让位把它顺带关掉了。
+    // 要让裁剪回来，方向是让 pruner 自己挂 hook（例如请求前），而不是继续借
+    // `compaction-basic` 的自动路径 —— 这是未来方向，不是承诺。
     //
     // 开关为假 / 缺省时，下面三处条件展开都产出**没有键**的对象，行内容与加入该选项
     // 之前**逐字相同**（本地回归大量无参调用 `buildPlugins()`）。
@@ -2487,6 +2512,9 @@ export function buildPlugins(options) {
         {
           id: 'tool-result-pruner',
           name: '@deepseek-ai/dsh-compaction-tool-result-pruner',
+          // 行与参数都不动，让位时也不动 —— 但让位后这行**不再被调用**（它唯一的上游
+          // 是上面那行的自动压缩路径），`thresholdChars` 因此不会生效。别把这一行读成
+          // 「裁剪还在」，详见压缩组上方那段注释。
           config: { thresholdChars: 8192, headChars: 4096, tailChars: 1024 },
         },
       ],
