@@ -231,7 +231,9 @@ const yielded = ctx?.reflect?.get?.('biliBasicCompactionPolicy', false) !== unde
 | `compaction-basic` | **保留**，`config.auto = false` | 上游构造函数是 `if (this.config.auto) this._registerAutomaticCompaction()`，所以步间压力压缩不再注册、失败记录归零。bili 对四个官方 preset 也是这个做法（把 stock 行改成 `auto:false`） |
 | `command-compact` | `disabled: true` | 让位之后 `/compact` 必然 422；把一个结构上不可能成功的命令继续摆在用户面前只会误导人 |
 | `modelPolicies` | **不写** | summarize 到不了上游，按窗口算出来的预算永远不会生效。启动时枚举模型目录的预取也一并跳过（它带 10s 预算） |
-| `tool-result-pruner` | 保持挂载、参数不动 | 它只 `inject: ["tokenMeter"]`、不发起任何模型调用，bili 也从不拦它 —— 没有理由连坐 |
+| `tool-result-pruner` | **保持挂载、参数不动 —— 但已不可达**，因此不再裁剪 | 它只 `inject: ["tokenMeter"]`、不发起任何模型调用，bili 也从不拦它，没有理由连坐。但「挂着」不等于「在干活」：`pruneSession` 在全 bundle 里只有两个调用点，都在 `@deepseek-ai/dsh-compaction-basic` 里（`compactIfNeeded` 的 `context-overflow` 分支、`compactPressure` 越过阈值之后），而这两个方法的唯一入口是 `_registerAutomaticCompaction()` 注册的 5 个 listener，构造函数的闸门是 `if (this.config.auto)`。`auto: false` 之后它们一个都不注册，于是 `thresholdChars: 8192` 从不被求值，DSH **自身的调用图**再也到不了 pruner。长工具结果的实际边界因此退回 harness 自己的 ~50KB 溢出层（约 12k token，标记是 `(Omitted N bytes. …)` 那一路）：在装了 `billion-context` 的部署上实测，14k 字符的结果、4000 行与 20000 行的输出都走这条溢出路径，pruner 自己的 `[... tool result middle pruned ...]` 一次都没出现。行还在、realm 内的 `toolResultPruner` 服务还在，第三方代码仍可显式调用 `pruneSession` —— 只是 DSH 自己不再调了 |
+
+**这个取舍的代价，先读再下结论。** 让位换回来的是真东西（每步一条注定失败的压缩记录 + 背后那次白跑的请求），付出的也是真东西（8KB 级的中间裁剪没了，长工具结果的边界只剩 harness 的溢出层）。这是一处真实回退，不是「本来就不工作」：让位之前（`auto: true`）pruner 是跑的 —— `compactPressure` 先裁再 summarize，被 `422` 拒的是后面的 summarize，不是裁剪那一步。要让裁剪回来，方向是让 `tool-result-pruner` 自己挂 hook（例如请求前），而不是继续借 `compaction-basic` 的自动路径 —— 这是未来方向，不是承诺。
 
 **为什么用 `auto: false` 而不是 `disabled: true`。** 把这一行禁掉会连 realm 内的 `compaction` 服务
 一起带走，而 `command-compact` 声明的是 `inject: ["commands", "compaction"]` —— 它就会永远挂在
@@ -248,12 +250,14 @@ const yielded = ctx?.reflect?.get?.('biliBasicCompactionPolicy', false) !== unde
 **生效范围：只对新会话。** 检测翻转后走本包已有的重声明管线，而重声明只对**之后新开**的会话生效；
 已经带着失败记录的会话需要重开。
 
-**怎么在真实部署上确认让位生效** —— 两个包都装上、开一个**新会话**，然后核对三件事：
+**怎么在真实部署上确认让位生效** —— 两个包都装上、开一个**新会话**，然后核对四件事：
 
 - 声明出去的 `compaction-basic` 行带的是 `auto: false`；
 - `command-compact` 是禁用的，且没有写 `modelPolicies`；
 - 这个会话不再产生 `dsh_compaction_refused` 记录。若还能看到记录，它属于翻转之前开的会话，
-  而不是让位没生效。
+  而不是让位没生效；
+- 长工具结果里**不会**出现 `[... tool result middle pruned ...]` 标记 —— 让位之后这是预期状态，
+  不是故障：pruner 挂着，但调用图不可达（见上表那一行）。
 
 > ⚠️ **归因更正 —— 写给后来接手的人。** issue 里把根因写成「运行期注册的 preset 结构上永远不经过
 > 宿主 `internal/config` waterfall」，**不成立**。`internal/config` 是 **Fiber 级** waterfall
