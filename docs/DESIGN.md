@@ -174,6 +174,21 @@ const yielded = ctx?.reflect?.get?.('biliBasicCompactionPolicy', false) !== unde
 
 **The cost side of that trade — read this before assuming pruning still runs.** Yielding buys back something real (the per-step failed-compaction record and the wasted request behind it) and it costs something real (the 8 KB-class mid-result pruning is gone, and long tool results are bounded only by the harness's spill layer). This is a genuine regression, not a case of "it never worked": before the yield (`auto: true`) the pruner did run — `compactPressure` pruned first and summarized second, and the `422` refused the summary, not the prune. If pruning is to come back, the direction is to have `tool-result-pruner` hang its own hook (for example before a request) instead of borrowing `compaction-basic`'s automatic path — a future direction, not a commitment.
 
+**The marker means "bili is installed", not "bili is compacting" — a known boundary, not a bug.** bili publishes
+`biliBasicCompactionPolicy` **unconditionally**: its gate entry (`src/agent/dsh-compaction-gate.ts`) is deliberately
+always-on and independent of `bili-native`'s state, so the official preset never sits pending forever (bili's `#3662`
+lesson), while whether the overlay actually rewrites a row is decided separately by a process-level verdict. Our
+criterion therefore only ever says **"bili is present"**, which is **not** the same statement as **"bili is compacting"**.
+
+The corollary is a real hole, and a documented one. Install bili yet route the model somewhere bili does not proxy,
+and its `422` gate is not on the request path — native compaction would have worked — but this package still yields by
+default, so **nothing compacts and `/compact` is gone with it**; the symptom reads as "the plugin is broken". That
+combination gets **no runtime fallback**, deliberately: a manual switch would mean a new config key, a new semantic and
+a new test surface for near-zero payoff, so the boundary is written here instead of compensated for in code. Nor is
+bili's verdict used as a second confirmation — that verdict decides whether the **overlay rewrites dsh's rows**, not
+whether bili compacts, so consuming it would make the criterion *less* accurate, not more. If you meet the "nothing
+compacts" state, suspect your model route before the yield: is the request actually going through bili's proxy?
+
 **Why `auto: false` and not `disabled: true`.** Disabling the row would take the realm's `compaction` service down with it, and `command-compact` declares `inject: ["commands", "compaction"]` — it would then hang in its waiting state forever. DSH has already been through that accident shape: an injection gate with no degradation path locks session creation outright. Keeping the row keeps the service.
 
 **Detection is a sync fast path *and* a late binding**, because registration order is not guaranteed: this package's `void declare()` does not await, a declaration is an eager mount, and bili may well `apply()` after us.
@@ -271,7 +286,7 @@ The limit counts "the total subagents **currently live** under one main Agent". 
 Because there is only one enforcement point, hitting the limit shows you that **English** error above (`active child limit: <N>`), not any wording from this plugin. **This is not a fault**, and **this plugin is not broken**:
 
 - it happens **before anything starts** — no subagent is created, and you get a plain error rather than an id;
-- the fix is to **wait for the existing subagents to finish**, or **merge several tasks into one task brief** and hand it to a single subagent;
+- the fix is to **split the fan-out into successive waves** — fire the first batch up to the limit, then dispatch the next batch as those workers report; **merging several briefs into one** is the last resort, not the fix, because it is exactly what makes a single brief too big to survive;
 - retrying the same fan-out unchanged only hits it again.
 
 ---
@@ -1083,12 +1098,12 @@ The section above ends with "split the writing, not the reading", and for the fa
 
 **The criteria that make it decidable** (coordinator persona, `## One brief, one deliverable`):
 
-- **One independently verifiable deliverable per brief** — a single read of the report settles "done" or "not done", and not being able to name the artifact is itself the answer.
+- **One independently verifiable deliverable per brief** — a single read of the report settles "done" or "not done". **Two counts make it more than one brief, and either one is enough:** not being able to name the artifact is one; the other is that reaching it means reading **roughly five or more unrelated files, subsystems or query targets**. Estimate the count from the request alone, **before** dispatching — and "it all ends up in one report" does not keep it in one brief, because the artifact count is not the workload count.
 - **Three hard triggers:** several unrelated files or subsystems to read; several artifacts to produce; a numbered task list that reaches double digits when written out.
 - **Split by artifact, file, section or query target — never by time phase**, because a phase split makes both workers read the same material, which doubles the cost and saves nothing.
 - **The report carries the state** — the previous slice's conclusions become the next brief's `Verified current state`, since the next worker has none of the previous one's context.
 - **One sliced job keeps one key prefix** (`fix-gate-a1` / `fix-gate-a2`), with the slice number and the previous slice's conclusion stated in the brief.
-- **The reverse cost is real** — a fresh worker re-reads every file and rebuilds its context from nothing, so the rule is "split when a brief would trigger compaction, or when there really is more than one deliverable", never "split as fine as possible".
+- **Every split costs a re-read — pay it, do not veto with it** — a fresh worker re-reads every file and rebuilds its context from nothing, so a split trades one clean context for one full re-read: cut on a seam (artifact, file, section or query target), and **default to splitting whenever either count above fires**. Merging only looks cheaper until a brief dies at the output ceiling or is compacted — then the whole re-read is paid anyway, plus every conclusion the compaction dropped.
 
 **Why this can only live at the persona layer.** The plugin does set the compaction *budget* — that is the `compaction` row with its per-model policies, **as long as no external plugin owns compaction**: with `billion-context` present it writes no `modelPolicies` and turns the row's `auto` off (see the interop section) — but it cannot see how full a particular worker's context is, and it gets no event when that worker is compacted: a delegation hands back a final text, not a transcript, and nothing in the agent plane reports a compaction decision back to the plugin. So there is no runtime assertion to write. No test can fail on "this brief was too big", and no counter can warn before the summary lands; the decision is made once, when the coordinator writes the brief. That leaves the persona as the only place the rule can take effect — the same stance as the rest of this bundle, which writes rules as decisions the model can make rather than as hopes about its judgement; the text itself is pinned, though, by **M15** in `repo-consistency` (the section, the four identical worker bullets, and the phrases it depends on).
 

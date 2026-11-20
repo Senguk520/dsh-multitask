@@ -29,7 +29,9 @@
  *   · 没有任务键            → 拒绝（deny），文案要求补 `task: <slug>`
  *   · 有键但文法不合法      → 拒绝，文案给出文法
  *   · 一份 brief 里两个不同的键 → 拒绝（解析不确定 ⇒ fail-closed）
- *   · 有键且该键**在运行中** → 拒绝，文案给出已有 worker 的会话 id 前 8 位与已运行时长
+ *   · 有键且该键**在运行中** → 拒绝，文案给出已有 worker 的会话 id 前 8 位与已运行时长；
+ *     若那个占位**还没和任何子会话配对**（并行派发下的绑定期限制），文案改说这件事，
+ *     并给出两条可执行的出路（换 slug 重派 / 等 TTL 过期），不建议 `interrupt_agent`
  *   · 有键且无冲突          → 登记后放行
  *
  * 其余派遣类工具（`spawn_teammate` / `subagent_preset` / `workflow` 以及任何
@@ -52,6 +54,7 @@
  *
  *     Claim = {
  *       key, slug, tool,
+ *       label: string,                // 本次派发的 `description`（= 子会话 descriptor 的 label）
  *       parentIds: string[],          // 父会话的候选 id（session.id 与 agent.id 去重）
  *       startedAt: number,            // Date.now()，用于算「已运行时长」
  *       ids: string[],                // 子会话的候选 id（空数组 = 还没绑上）
@@ -214,6 +217,78 @@ function idsOf(agent) {
     if (typeof value === 'string' && value !== '' && !out.includes(value)) out.push(value)
   }
   return out
+}
+
+/**
+ * 取该子代理 session 里能看到的事件数组。
+ *
+ * 两个来源都试：`ownEvents()`（本 session 自有的事件，不含 fork 继承的前缀）优先，
+ * 再退到 `snapshotEvents()`（全量）。二者都是**同步**读 —— `agent/created` 是非异步
+ * 窗口，绑不上去就再没有更合适的时机（与 `subagent-mode.mjs` 同一套读法）。
+ *
+ * @param agent - 目标子代理。
+ * @returns 事件数组（可能为空）。
+ */
+function sessionEventsOf(agent) {
+  const session = agent?.session
+  if (session === undefined || session === null) return []
+  for (const method of ['ownEvents', 'snapshotEvents']) {
+    if (typeof session[method] !== 'function') continue
+    try {
+      const events = session[method]()
+      if (Array.isArray(events) && events.length > 0) return events
+    } catch {
+      // 换下一个来源；读不到不是致命错误。
+    }
+  }
+  return []
+}
+
+/**
+ * 读该子代理委派行的**显示标签**（`subagent/descriptor` 的 `data.label`）。
+ *
+ * 为什么绑定只能靠这个字段：`agent/created` 的载荷里**没有** callId / toolCallId /
+ * batchId / requestId，子会话 id 是创建那一刻才 `randomUUID()` 出来的 —— 所以
+ * pre-execute 阶段根本不存在任何能与创建对上的标识。而宿主把
+ * `subagent` 类工具的 `args.description` 原样写进 descriptor 的 `label`
+ * （`dsh-tool-subagent` 的 `label: args.description` → `snapshotSubagentDescriptor`），
+ * 且 descriptor 在 `setup()` 里 append、早于 `announce` —— 这是**唯一**从派发一路带到
+ * 创建现场的字段。
+ *
+ * 只认**第一条** descriptor —— 上游的定性是「first event is authoritative」。
+ *
+ * @param agent - 目标子代理。
+ * @returns label 字符串，或 `undefined`（读不到 ⇒ 调用方不绑，不猜）。
+ */
+function descriptorLabelOf(agent) {
+  for (const event of sessionEventsOf(agent)) {
+    if (event?.type !== 'subagent/descriptor') continue
+    const label = event?.data?.label
+    return typeof label === 'string' && label !== '' ? label : undefined
+  }
+  return undefined
+}
+
+/**
+ * 子会话的创建时间（毫秒），拿不到返回 `undefined`。
+ *
+ * `session.header.createdAt` 优先 —— `dsh-subagent` 的 `establishCatalogChild()` 正是
+ * 按这个名字把 header 的创建时间写进 `subagent/catalog`（`childCreatedAt: child.createdAt`
+ * 的实参是 `child.session.header`），所以这是**已被上游使用过**的字段名，不是猜的。
+ * `agent.createdAt` 只作兜底。
+ *
+ * 用途是**单向剔除**：一个占位不可能比创建它的那次创建更晚登记，所以
+ * `startedAt > 创建时间` 的候选一定不属于这个子会话。拿不到就跳过这一步 ——
+ * 少一层过滤只会退回「按 label 唯一性判定」，不会错绑。
+ *
+ * @param agent - 目标子代理。
+ * @returns 毫秒时间戳，或 `undefined`。
+ */
+function createdAtOf(agent) {
+  for (const value of [agent?.session?.header?.createdAt, agent?.createdAt]) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
 }
 
 /**
@@ -585,6 +660,10 @@ export function apply(ctx, config) {
     table.claims.set(key, {
       key,
       slug: parsed.slug,
+      // 本次派发的 `description`：宿主把它原样写进子会话的 `subagent/descriptor`
+      // （`data.label`），这是**唯一**能把一次派发与一次子会话创建对上号的字段 ——
+      // `agent/created` 的载荷里没有任何 callId / batchId，子会话 id 创建时才生成。
+      label: typeof args?.description === 'string' ? args.description : '',
       tool: typeof exec?.name === 'string' ? exec.name : 'unknown',
       parentIds: callerIds,
       startedAt: now,
@@ -671,9 +750,18 @@ export function apply(ctx, config) {
   // ── 绑定子会话 id ───────────────────────────────────────────────────────────
   //
   // 派发那一刻子会话还不存在（工具还没执行），所以占位先登记、id 后绑。
-  // 只认**无歧义**的绑定：该父会话**恰好一个**未绑定的占位时才绑 ——
-  // 并行派发多份 brief 时宁可不绑（拒绝文案里就说「id 还没拿到」），
-  // 也不要把 A 的 id 记到 B 的任务上。
+  //
+  // 配对**只能靠 label**：`agent/created` 的载荷里没有 callId / toolCallId / batchId，
+  // 子会话 id 是创建时才 `randomUUID()` 出来的，而并行 fan-out 时 N 个
+  // `tools/pre-execute` 会**全部先跑完**（`dsh-tools` 的批量 dispatch 不 await），
+  // 之后才逐个创建子会话 —— 所以「该父会话下恰好一个未绑定占位」这个旧判据在并行
+  // 场景里恒不成立，N 个 slug 全都绑不上。现在按 `claim.label === descriptor.label`
+  // 过滤，再要求过滤后**恰好一条**。
+  //
+  // 三条安全边界，任何一条不满足就**不绑**（退化成老行为，绝不错绑）：
+  //   1. 读不到子会话的 descriptor label        ⇒ 不绑；
+  //   2. 同 label 的未绑定占位 >1（label 撞车） ⇒ 不绑（歧义）；
+  //   3. 占位登记时间晚于子会话创建时间         ⇒ 剔除（不可能属于它）。
   ctx.on('agent/created', (payload) => {
     try {
       const child = payload?.agent
@@ -684,16 +772,26 @@ export function apply(ctx, config) {
       const childIds = idsOf(child)
       if (childIds.length === 0) return
 
+      // 判据 1：拿不到 label 就对不上号，直接不绑（不按顺序猜）。
+      const label = descriptorLabelOf(child)
+      if (label === undefined) return
+
       const table = registryOf()
       if (table === undefined) return
+      const createdAt = createdAtOf(child)
       const candidates = []
       for (const claim of table.claims.values()) {
         if (claim === null || typeof claim !== 'object') continue
         if (Array.isArray(claim.ids) && claim.ids.length > 0) continue
         const parentIds = Array.isArray(claim.parentIds) ? claim.parentIds : []
         if (!parentIds.includes(parentSession)) continue
+        // 判据 2 的前半：只留同一份 description 的占位。
+        if (claim.label !== label) continue
+        // 判据 3：占位不可能比创建它的那次创建更晚登记。
+        if (createdAt !== undefined && typeof claim.startedAt === 'number' && claim.startedAt > createdAt) continue
         candidates.push(claim)
       }
+      // 判据 2 的后半：过滤后仍必须**恰好一条**；>1 是 label 撞车，宁可不绑。
       if (candidates.length !== 1) return
       const claim = candidates[0]
       claim.ids = childIds
@@ -738,10 +836,13 @@ export function apply(ctx, config) {
 /**
  * 组装「这个键已经在跑」的拒绝文案。
  *
- * 三个信息缺一不可，否则协调者无从处置：
- *   1. **谁在跑**（会话 id 前 8 位 + 已运行时长）；
- *   2. 两条出路（等它结束 / 先 `interrupt_agent` 再派）；
- *   3. 为什么 `send_message` 不算「停」—— 它会给目标**新开**一轮，worker 接着跑。
+ * 分两种说法，因为两种情形的**出路完全不同**：
+ *
+ *   · **已绑上子会话** —— 说清谁在跑（id 前 8 位 + 已运行时长），给两条出路
+ *     （等它结束 / 先 `interrupt_agent` 再派），并解释为什么 `send_message` 不算「停」。
+ *   · **还没绑上**（并行派发下占位没能与任何子会话配对）—— 那个 worker 可能早已跑完，
+ *     而且协调者**从来没有过** id（这正是没绑上的原因），所以 `interrupt_agent` 无从下手；
+ *     这里只讲事实 + 两条**可执行**的出路：换 slug 重派，或等 TTL 过期后复用原 slug。
  *
  * @param slug - 冲突的任务键。
  * @param claim - 已有的占位。
@@ -752,13 +853,26 @@ function describeConflict(slug, claim, now) {
   const ids = Array.isArray(claim?.ids) ? claim.ids : []
   const startedAt = typeof claim?.startedAt === 'number' ? claim.startedAt : now
   const elapsed = formatDuration(now - startedAt)
-  const who =
-    ids.length === 0
-      ? `a worker whose session id is not known yet (dispatched ${elapsed} ago — the delegation has not returned its id yet)`
-      : `worker ${String(ids[0]).slice(0, 8)} (running ${elapsed})`
+  const why =
+    'a second dispatch of the same task key is refused: two workers on one job write the same files concurrently and silently overwrite each other. '
+
+  if (ids.length === 0) {
+    return (
+      `Task ${JSON.stringify(slug)} already has a dispatch in this conversation (dispatched ${elapsed} ago) ` +
+      'that was never paired with a child session, so there is no session id to address: ' +
+      'under a parallel fan-out several dispatches are admitted before any child session exists, and the pairing can then be ambiguous, so the placeholder stays unbound on purpose (the safe side — binding it to the wrong session would release the wrong key). ' +
+      why +
+      'The worker it was opened for may well have finished already, and nothing here can be interrupted — there is no id to interrupt. ' +
+      'Two ways out: dispatch the same work again under a DIFFERENT slug (a new dispatch gets its own placeholder and pairs with its own child session), ' +
+      `or wait for this placeholder to expire (${formatDuration(UNBOUND_CLAIM_TTL_MS)} after it was dispatched) and then dispatch ${JSON.stringify(slug)} again. ` +
+      'If this is genuinely a different piece of work, give it a different slug anyway.'
+    )
+  }
+
   return (
-    `Task ${JSON.stringify(slug)} is already being worked on by ${who} in this conversation, ` +
-    'so a second dispatch of the same task key is refused: two workers on one job write the same files concurrently and silently overwrite each other. ' +
+    `Task ${JSON.stringify(slug)} is already being worked on by worker ${String(ids[0]).slice(0, 8)} (running ${elapsed}) in this conversation, ` +
+    'so ' +
+    why +
     'Either wait for that worker to finish, or stop it first with `interrupt_agent` and then dispatch again. ' +
     'Do NOT try to stop it with `send_message`: a message aborts its current turn and opens a NEW one, so the worker keeps running and reads your stop instruction on the next turn — `interrupt_agent` is the only thing that actually stops it. ' +
     'If this is genuinely a different piece of work, give it a different slug (and if it is the same work being taken over, restarted or reassigned, keep this slug and dispatch only after the first worker is stopped).'
